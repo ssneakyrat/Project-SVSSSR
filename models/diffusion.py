@@ -137,15 +137,24 @@ class UNet(nn.Module):
         channels = [model_channels]
         now_channels = model_channels
         
+        # Track input/output channels for each level
+        self.down_channels = []
+        
         for i in range(3):  # 3 levels of downsampling
             channel_mult = 2 ** i
             out_channels = model_channels * channel_mult
+            
+            # Add to channel tracking
+            self.down_channels.append((now_channels, out_channels))
             
             self.downs.append(ConvBlock(now_channels, out_channels, time_dim, num_groups))
             
             # Add cross-attention if needed
             if context_dim is not None and i in attention_levels:
                 self.downs.append(CrossAttention(out_channels, context_dim))
+            else:
+                # Add identity to maintain consistent indexing
+                self.downs.append(nn.Identity())
             
             # Add downsampling
             self.downs.append(nn.Conv2d(out_channels, out_channels, 4, 2, 1))
@@ -163,22 +172,36 @@ class UNet(nn.Module):
         
         # Upsampling
         self.ups = nn.ModuleList([])
+        
+        # Track expected channel sizes after concatenation
+        self.up_channels = []
         for i in reversed(range(3)):  # 3 levels of upsampling
             channel_mult = 2 ** i
             out_channels = model_channels * channel_mult
+            in_channels = now_channels
+            
+            # Calculate skip connection channels from corresponding down block
+            skip_channels = channels[-(i+1)]
+            concat_channels = in_channels + skip_channels
+            
+            # Add to channel tracking
+            self.up_channels.append((in_channels, out_channels, concat_channels))
             
             # Upsample
             self.ups.append(nn.Sequential(
                 nn.Upsample(scale_factor=2, mode='nearest'),
-                nn.Conv2d(now_channels, out_channels, 3, padding=1)
+                nn.Conv2d(in_channels, out_channels, 3, padding=1)
             ))
             
-            # Combine with skip connection
-            self.ups.append(ConvBlock(out_channels * 2, out_channels, time_dim, num_groups))
+            # Combine with skip connection - use concat_channels here
+            self.ups.append(ConvBlock(concat_channels, out_channels, time_dim, num_groups))
             
             # Add cross-attention if needed
             if context_dim is not None and i in attention_levels:
                 self.ups.append(CrossAttention(out_channels, context_dim))
+            else:
+                # Add identity to maintain consistent indexing
+                self.ups.append(nn.Identity())
             
             now_channels = out_channels
         
@@ -212,7 +235,9 @@ class UNet(nn.Module):
         skips = [h]
         
         # Downsample
-        for i, block in enumerate(self.downs):
+        for i in range(len(self.downs)):
+            block = self.downs[i]
+            
             if isinstance(block, ConvBlock):
                 h = block(h, t)
             elif isinstance(block, CrossAttention) and context is not None:
@@ -224,7 +249,12 @@ class UNet(nn.Module):
             else:
                 h = block(h)
                 
-            if i % 3 == 2:  # After each downsampling operation
+            # Store skip connection after each ConvBlock (before downsampling)
+            if i % 3 == 0 and i > 0:  # Skip the first block which is already stored
+                skips.append(h)
+            
+            # After each downsampling operation, store the result for the next level
+            if i % 3 == 2:
                 skips.append(h)
         
         # Middle
@@ -240,9 +270,22 @@ class UNet(nn.Module):
         h = self.mid_block2(h, t)
         
         # Upsample
-        for i, block in enumerate(self.ups):
-            if i % 3 == 0:  # Before each upsampling operation
+        for i in range(len(self.ups)):
+            block = self.ups[i]
+            
+            # Before upsampling, concat with skip connection
+            if i % 3 == 0:
                 skip = skips.pop()
+                
+                # Debug info - uncomment to diagnose dimension issues
+                # print(f"Upsampling level {i//3}, h shape: {h.shape}, skip shape: {skip.shape}")
+                
+                # Ensure spatial dimensions match for concatenation
+                if h.shape[2:] != skip.shape[2:]:
+                    # Resize skip connection to match h's spatial dimensions
+                    skip = F.interpolate(skip, size=h.shape[2:], mode='bilinear', align_corners=False)
+                    # print(f"Resized skip to: {skip.shape}")
+                
                 h = torch.cat([h, skip], dim=1)
                 
             if isinstance(block, ConvBlock):
