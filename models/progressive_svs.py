@@ -139,40 +139,33 @@ class ProgressiveSVS(pl.LightningModule):
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
             mel_pred = mel_pred.squeeze(1)
         
-        # Adjust target resolution based on current stage
-        if self.current_stage <= 2:  # For both stage 1 and 2
-            # Get target dimensions directly from the prediction
-            target_freq_dim = mel_pred.shape[1]
-            target_time_dim = mel_pred.shape[2]
-            
-            # Debug info
-            if batch_idx == 0:
-                print(f"Stage {self.current_stage} - Target dimensions: freq={target_freq_dim}, time={target_time_dim}")
-            
-            # Reshape to [B, 1, C, T] for 2D interpolation
-            b, c, t = mel_specs.shape
-            mel_specs_reshaped = mel_specs.unsqueeze(1)  # [B, 1, C, T]
-            
-            # Use explicit size for interpolation to match prediction dimensions
-            mel_target = torch.nn.functional.interpolate(
-                mel_specs_reshaped,
-                size=(target_freq_dim, target_time_dim),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Squeeze back to [B, C', T']
-            
-            # Also resize mask to match the new time dimension
-            new_mask = torch.nn.functional.interpolate(
-                mask.float().unsqueeze(1),
-                size=(target_time_dim),
-                mode='nearest'
-            ).squeeze(1).bool()
-            mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
-            
-        else:
-            # Full resolution for final stage
-            mel_target = mel_specs
-            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)
+        # FIX: Always resize target to match prediction dimensions, regardless of stage
+        target_freq_dim = mel_pred.shape[1]
+        target_time_dim = mel_pred.shape[2]
+        
+        # Debug info
+        if batch_idx == 0:
+            print(f"Stage {self.current_stage} - Target dimensions: freq={target_freq_dim}, time={target_time_dim}")
+        
+        # Reshape to [B, 1, C, T] for 2D interpolation
+        b, c, t = mel_specs.shape
+        mel_specs_reshaped = mel_specs.unsqueeze(1)  # [B, 1, C, T]
+        
+        # Use explicit size for interpolation to match prediction dimensions
+        mel_target = torch.nn.functional.interpolate(
+            mel_specs_reshaped,
+            size=(target_freq_dim, target_time_dim),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)  # Squeeze back to [B, C', T']
+        
+        # Also resize mask to match the new time dimension
+        new_mask = torch.nn.functional.interpolate(
+            mask.float().unsqueeze(1),
+            size=(target_time_dim),
+            mode='nearest'
+        ).squeeze(1).bool()
+        mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
         
         # Debug info
         if batch_idx == 0:
@@ -224,36 +217,29 @@ class ProgressiveSVS(pl.LightningModule):
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
             mel_pred = mel_pred.squeeze(1)
         
-        # Adjust target resolution based on current stage
-        if self.current_stage <= 2:  # For both stage 1 and 2
-            # Get target dimensions directly from the prediction
-            target_freq_dim = mel_pred.shape[1]
-            target_time_dim = mel_pred.shape[2]
-            
-            # Reshape to [B, 1, C, T] for 2D interpolation
-            b, c, t = mel_specs.shape
-            mel_specs_reshaped = mel_specs.unsqueeze(1)  # [B, 1, C, T]
-            
-            # Use explicit size for interpolation to match prediction dimensions
-            mel_target = torch.nn.functional.interpolate(
-                mel_specs_reshaped,
-                size=(target_freq_dim, target_time_dim),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Squeeze back to [B, C', T']
-            
-            # Also resize mask to match the new time dimension
-            new_mask = torch.nn.functional.interpolate(
-                mask.float().unsqueeze(1),
-                size=(target_time_dim),
-                mode='nearest'
-            ).squeeze(1).bool()
-            mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
-            
-        else:
-            # Full resolution for final stage
-            mel_target = mel_specs
-            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)
+        # FIX: Always resize target to match prediction dimensions, regardless of stage
+        target_freq_dim = mel_pred.shape[1]
+        target_time_dim = mel_pred.shape[2]
+        
+        # Reshape to [B, 1, C, T] for 2D interpolation
+        b, c, t = mel_specs.shape
+        mel_specs_reshaped = mel_specs.unsqueeze(1)  # [B, 1, C, T]
+        
+        # Use explicit size for interpolation to match prediction dimensions
+        mel_target = torch.nn.functional.interpolate(
+            mel_specs_reshaped,
+            size=(target_freq_dim, target_time_dim),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(1)  # Squeeze back to [B, C', T']
+        
+        # Also resize mask to match the new time dimension
+        new_mask = torch.nn.functional.interpolate(
+            mask.float().unsqueeze(1),
+            size=(target_time_dim),
+            mode='nearest'
+        ).squeeze(1).bool()
+        mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
         
         # Debug occasionally
         if batch_idx % 50 == 0:
