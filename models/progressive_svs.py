@@ -65,25 +65,30 @@ class ProgressiveSVS(pl.LightningModule):
         # Progressive stages
         input_dim = self.feature_encoder.f0_embed_dim + self.feature_encoder.phone_embed_dim + self.feature_encoder.midi_embed_dim
         
+        # Calculate frequency dimensions for each stage
+        full_mel_bins = config['model']['mel_bins']
+        low_res_freq_bins = int(full_mel_bins / config['model']['low_res_scale'])
+        mid_res_freq_bins = int(full_mel_bins / config['model']['mid_res_scale'])
+        
         # Stage 1: Low-Resolution Model (20×216)
         self.low_res_model = LowResModel(
             input_dim, 
             config['model']['low_res_channels'], 
-            output_dim=config['model']['mel_bins']
+            output_dim=low_res_freq_bins  # Now using correct dimension
         )
         
         # Stage 2: Mid-Resolution Upsampler (40×432)
         self.mid_res_upsampler = MidResUpsampler(
-            config['model']['mel_bins'], 
+            low_res_freq_bins,  # Input is output of previous stage
             config['model']['mid_res_channels'], 
-            output_dim=config['model']['mel_bins']
+            output_dim=mid_res_freq_bins
         )
         
         # Stage 3: High-Resolution Upsampler (80×864)
         self.high_res_upsampler = HighResUpsampler(
-            config['model']['mel_bins'], 
+            mid_res_freq_bins,  # Input is output of previous stage
             config['model']['high_res_channels'], 
-            output_dim=config['model']['mel_bins']
+            output_dim=full_mel_bins
         )
         
         # Loss function
@@ -124,7 +129,6 @@ class ProgressiveSVS(pl.LightningModule):
         # Create masks for variable length
         max_len = mel_specs.shape[2]
         mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
-        mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
         
         # Adjust target resolution based on current stage
         if self.current_stage == 1:
@@ -132,43 +136,44 @@ class ProgressiveSVS(pl.LightningModule):
             scale_factor = 1/self.config['model']['low_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
+            # Reshape to [B, 1, C, T] for 2D interpolation
+            b, c, t = mel_specs.shape
+            mel_specs_4d = mel_specs.view(b, 1, c, t)
+            
             # Downsample keeping original time dimension
             mel_target = F.interpolate(
-                mel_specs, 
+                mel_specs_4d, 
                 size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            )
+            ).squeeze(1)  # Back to [B, C', T]
             
-            # Downsample mask as well
-            mask = F.interpolate(
-                mask.float(), 
-                size=(freq_dim, mask.shape[2]),
-                mode='nearest'
-            ).bool()
+            # Resize mask to match new frequency dimension
+            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
             
         elif self.current_stage == 2:
             # Downsample ground truth for mid-res stage
             scale_factor = 1/self.config['model']['mid_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
+            # Reshape to [B, 1, C, T] for 2D interpolation
+            b, c, t = mel_specs.shape
+            mel_specs_4d = mel_specs.view(b, 1, c, t)
+            
             mel_target = F.interpolate(
-                mel_specs, 
+                mel_specs_4d, 
                 size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            )
+            ).squeeze(1)  # Back to [B, C', T]
             
-            # Downsample mask as well
-            mask = F.interpolate(
-                mask.float(), 
-                size=(freq_dim, mask.shape[2]),
-                mode='nearest'
-            ).bool()
+            # Resize mask to match new frequency dimension
+            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
             
         else:
             # Full resolution for final stage
             mel_target = mel_specs
+            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
         
         # Handle dimensionality issues
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
@@ -203,7 +208,6 @@ class ProgressiveSVS(pl.LightningModule):
         # Create masks for variable length
         max_len = mel_specs.shape[2]
         mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
-        mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
         
         # Adjust target resolution based on current stage
         if self.current_stage == 1:
@@ -211,42 +215,44 @@ class ProgressiveSVS(pl.LightningModule):
             scale_factor = 1/self.config['model']['low_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
+            # Reshape to [B, 1, C, T] for 2D interpolation
+            b, c, t = mel_specs.shape
+            mel_specs_4d = mel_specs.view(b, 1, c, t)
+            
+            # Downsample keeping original time dimension
             mel_target = F.interpolate(
-                mel_specs, 
+                mel_specs_4d, 
                 size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            )
+            ).squeeze(1)  # Back to [B, C', T]
             
-            # Downsample mask as well
-            mask = F.interpolate(
-                mask.float(), 
-                size=(freq_dim, mask.shape[2]),
-                mode='nearest'
-            ).bool()
+            # Resize mask to match new frequency dimension
+            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
             
         elif self.current_stage == 2:
             # Downsample ground truth for mid-res stage
             scale_factor = 1/self.config['model']['mid_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
+            # Reshape to [B, 1, C, T] for 2D interpolation
+            b, c, t = mel_specs.shape
+            mel_specs_4d = mel_specs.view(b, 1, c, t)
+            
             mel_target = F.interpolate(
-                mel_specs, 
+                mel_specs_4d, 
                 size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            )
+            ).squeeze(1)  # Back to [B, C', T]
             
-            # Downsample mask as well
-            mask = F.interpolate(
-                mask.float(), 
-                size=(freq_dim, mask.shape[2]),
-                mode='nearest'
-            ).bool()
+            # Resize mask to match new frequency dimension
+            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
             
         else:
             # Full resolution for final stage
             mel_target = mel_specs
+            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
         
         # Handle dimensionality issues
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:

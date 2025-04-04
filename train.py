@@ -230,7 +230,8 @@ class SVSDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             drop_last=True,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            persistent_workers=True
         )
         
     def val_dataloader(self):
@@ -240,7 +241,8 @@ class SVSDataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn
+            collate_fn=self.collate_fn,
+            persistent_workers=True
         )
         
     def teardown(self, stage=None):
