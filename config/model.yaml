@@ -38,7 +38,7 @@ model:
   
   # Progressive training
   current_stage: 1
-  stage_epochs: [30, 30, 40]
+  stage_epochs: [500, 200, 100]
 
 train:
   batch_size: 16
