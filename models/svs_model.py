@@ -146,6 +146,108 @@ class SVSModel(pl.LightningModule):
         
         return outputs['loss']
     
+    def _log_diffusion_samples(self, original, f0, phone, duration, midi):
+        """
+        Generate and log samples from the diffusion model during validation
+        
+        Args:
+            original: Original mel spectrograms [batch, 1, freq_bins, time_frames]
+            f0: F0 contour [batch, time_steps]
+            phone: Phone labels [batch, time_steps]
+            duration: Phone durations [batch, time_steps]
+            midi: MIDI note labels [batch, time_steps]
+        """
+        # Take first 4 samples from batch
+        num_samples = min(4, original.size(0))
+        
+        # Generate samples with the diffusion model
+        with torch.no_grad():
+            # Generate mel using just these samples
+            diffusion_output = self.infer(
+                f0[:num_samples], 
+                phone[:num_samples], 
+                duration[:num_samples], 
+                midi[:num_samples]
+            )
+        
+        for i in range(num_samples):
+            # Convert to numpy for plotting
+            orig_mel = original[i, 0].detach().cpu().numpy()
+            diff_mel = diffusion_output[i, 0].detach().cpu().numpy()
+            
+            # Create figure with two subplots
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6))
+            
+            # Plot original
+            im1 = ax1.imshow(orig_mel, aspect='auto', origin='lower', interpolation='none')
+            ax1.set_title("Original Mel-Spectrogram")
+            plt.colorbar(im1, ax=ax1)
+            
+            # Plot diffusion generated output
+            im2 = ax2.imshow(diff_mel, aspect='auto', origin='lower', interpolation='none')
+            ax2.set_title("Diffusion Generated Mel-Spectrogram")
+            plt.colorbar(im2, ax=ax2)
+            
+            plt.tight_layout()
+            
+            # Convert to image
+            buf = BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            
+            # Convert to tensor
+            image = transforms.ToTensor()(Image.open(buf))
+            
+            # Log to tensorboard
+            self.logger.experiment.add_image(f'diffusion_sample_{i}', image, self.global_step)
+            
+            plt.close(fig)
+            
+        # Also create a comparison plot showing original, VAE reconstruction and diffusion output
+        for i in range(num_samples):
+            # Get VAE reconstruction by encoding and decoding the original
+            with torch.no_grad():
+                latent, _, _ = self.vae.encode(original[i:i+1])
+                vae_recon = self.vae.decode(latent)
+                vae_recon_mel = vae_recon[0, 0].detach().cpu().numpy()
+                
+            # Convert to numpy for plotting
+            orig_mel = original[i, 0].detach().cpu().numpy()
+            diff_mel = diffusion_output[i, 0].detach().cpu().numpy()
+            
+            # Create figure with three subplots
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 9))
+            
+            # Plot original
+            im1 = ax1.imshow(orig_mel, aspect='auto', origin='lower', interpolation='none')
+            ax1.set_title("Original Mel-Spectrogram")
+            plt.colorbar(im1, ax=ax1)
+            
+            # Plot VAE reconstruction
+            im2 = ax2.imshow(vae_recon_mel, aspect='auto', origin='lower', interpolation='none')
+            ax2.set_title("VAE Reconstruction")
+            plt.colorbar(im2, ax=ax2)
+            
+            # Plot diffusion generated output
+            im3 = ax3.imshow(diff_mel, aspect='auto', origin='lower', interpolation='none')
+            ax3.set_title("Diffusion Generated (Conditioned)")
+            plt.colorbar(im3, ax=ax3)
+            
+            plt.tight_layout()
+            
+            # Convert to image
+            buf = BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            
+            # Convert to tensor
+            image = transforms.ToTensor()(Image.open(buf))
+            
+            # Log to tensorboard
+            self.logger.experiment.add_image(f'comparison_{i}', image, self.global_step)
+            
+            plt.close(fig)
+            
     def validation_step(self, batch, batch_idx):
         """
         Validation step
@@ -174,9 +276,14 @@ class SVSModel(pl.LightningModule):
         self.log('val_recon_loss', outputs['recon_loss'])
         self.log('val_kl_loss', outputs['kl_loss'])
         
-        # Log sample reconstructions for first batch
-        if batch_idx == 0:
+        # Log sample reconstructions and diffusion outputs for first batch
+        #if batch_idx == 0:
+        if self.current_epoch % 5 == 0:
             self._log_reconstructions(mel, outputs['mel_recon'])
+            
+        # Only run diffusion visualization every 5 epochs to save time
+        #if self.current_epoch % 5 == 0:
+        #    self._log_diffusion_samples(mel, f0, phone, duration, midi)
             
         return outputs['loss']
     

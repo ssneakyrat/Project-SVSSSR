@@ -27,7 +27,7 @@ model:
     decoder_channels: [64, 32, 16]
     latent_channels: 32
     latent_dim: 16
-    kl_weight: 0.001  # Very small to prioritize reconstruction
+    kl_weight: 0.001 #0.001  # Very small to prioritize reconstruction
     
   # Diffusion parameters
   diffusion:
