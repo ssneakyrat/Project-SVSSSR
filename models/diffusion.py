@@ -190,7 +190,7 @@ class UNet(nn.Module):
                 skip_channels = 64   # Based on the initial channel count
             
             # Calculate correct concatenated channel count
-            concat_channels = in_channels + skip_channels
+            concat_channels = out_channels + skip_channels
             
             # Upsample
             self.ups.append(nn.Sequential(
