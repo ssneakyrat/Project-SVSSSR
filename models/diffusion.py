@@ -173,19 +173,15 @@ class UNet(nn.Module):
         # Upsampling
         self.ups = nn.ModuleList([])
         
-        # Track expected channel sizes after concatenation
-        self.up_channels = []
+        # Modify the upsampling section to correctly handle concatenated channels
         for i in reversed(range(3)):  # 3 levels of upsampling
             channel_mult = 2 ** i
             out_channels = model_channels * channel_mult
             in_channels = now_channels
             
             # Calculate skip connection channels from corresponding down block
-            skip_channels = channels[-(i+1)]
+            skip_channels = channels[-(i+2)]  # Fixed indexing for skip connections
             concat_channels = in_channels + skip_channels
-            
-            # Add to channel tracking
-            self.up_channels.append((in_channels, out_channels, concat_channels))
             
             # Upsample
             self.ups.append(nn.Sequential(
@@ -193,7 +189,7 @@ class UNet(nn.Module):
                 nn.Conv2d(in_channels, out_channels, 3, padding=1)
             ))
             
-            # Combine with skip connection - use concat_channels here
+            # Combine with skip connection - explicitly use concat_channels here
             self.ups.append(ConvBlock(concat_channels, out_channels, time_dim, num_groups))
             
             # Add cross-attention if needed
@@ -232,7 +228,7 @@ class UNet(nn.Module):
         h = self.init_conv(x)
         
         # Store skip connections
-        skips = [h]
+        skips = []
         
         # Downsample
         for i in range(len(self.downs)):
@@ -240,6 +236,7 @@ class UNet(nn.Module):
             
             if isinstance(block, ConvBlock):
                 h = block(h, t)
+                skips.append(h)  # Store output of each ConvBlock for skip connections
             elif isinstance(block, CrossAttention) and context is not None:
                 # Reshape for cross-attention: [b,c,h,w] -> [b,h*w,c]
                 b, c, height, width = h.shape
@@ -248,14 +245,6 @@ class UNet(nn.Module):
                 h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
             else:
                 h = block(h)
-                
-            # Store skip connection after each ConvBlock (before downsampling)
-            if i % 3 == 0 and i > 0:  # Skip the first block which is already stored
-                skips.append(h)
-            
-            # After each downsampling operation, store the result for the next level
-            if i % 3 == 2:
-                skips.append(h)
         
         # Middle
         h = self.mid_block1(h, t)
@@ -269,35 +258,39 @@ class UNet(nn.Module):
             
         h = self.mid_block2(h, t)
         
-        # Upsample
-        for i in range(len(self.ups)):
-            block = self.ups[i]
+        # Upsample with correct skip connection handling
+        skip_idx = len(skips) - 1
+        for i in range(0, len(self.ups), 3):
+            # Upsample
+            h = self.ups[i](h)
             
-            # Before upsampling, concat with skip connection
-            if i % 3 == 0:
-                skip = skips.pop()
+            # Get and apply skip connection
+            if skip_idx >= 0:
+                skip = skips[skip_idx]
+                skip_idx -= 1
                 
-                # Debug info - uncomment to diagnose dimension issues
+                # Debug print to diagnose dimension issues (keep commented)
                 # print(f"Upsampling level {i//3}, h shape: {h.shape}, skip shape: {skip.shape}")
                 
                 # Ensure spatial dimensions match for concatenation
                 if h.shape[2:] != skip.shape[2:]:
-                    # Resize skip connection to match h's spatial dimensions
                     skip = F.interpolate(skip, size=h.shape[2:], mode='bilinear', align_corners=False)
-                    # print(f"Resized skip to: {skip.shape}")
                 
+                # Concatenate along channel dimension
                 h = torch.cat([h, skip], dim=1)
-                
-            if isinstance(block, ConvBlock):
-                h = block(h, t)
-            elif isinstance(block, CrossAttention) and context is not None:
+            
+            # Apply ConvBlock after concatenation
+            h = self.ups[i+1](h, t)
+            
+            # Apply CrossAttention or Identity
+            if isinstance(self.ups[i+2], CrossAttention) and context is not None:
                 # Reshape for cross-attention
                 b, c, height, width = h.shape
                 h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
-                h_flat = block(h_flat, context)  # [b, h*w, c]
+                h_flat = self.ups[i+2](h_flat, context)  # [b, h*w, c]
                 h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
             else:
-                h = block(h)
+                h = self.ups[i+2](h)
         
         # Final
         return self.final_conv(h)
