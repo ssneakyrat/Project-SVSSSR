@@ -1,562 +1,936 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 import numpy as np
+from typing import Dict, Any, Tuple, Optional, List, Union, Callable
+from models.base_model import BaseModule
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
-    def __init__(self, dim):
+    """Sinusoidal position embeddings for timestep conditioning."""
+    
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
-    def forward(self, time):
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        """
+        Generate position embeddings for timestep
+        
+        Args:
+            time: Timestep tensor [batch]
+            
+        Returns:
+            Embeddings tensor [batch, dim]
+        """
         device = time.device
         half_dim = self.dim // 2
-        embeddings = np.log(10000) / (half_dim - 1)
+        embeddings = math.log(10000) / (half_dim - 1)
         embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
 
-class CrossAttention(nn.Module):
-    def __init__(self, query_dim, context_dim, heads=4, dim_head=64):
+class ResnetBlock(nn.Module):
+    """Residual block with conditioning and attention."""
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        time_channels: int,
+        dropout: float = 0.0,
+        use_scale_shift_norm: bool = True,
+        up: bool = False,
+        down: bool = False
+    ):
         super().__init__()
-        inner_dim = dim_head * heads
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_out = nn.Linear(inner_dim, query_dim)
-
-    def forward(self, x, context):
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.time_channels = time_channels
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.up = up
+        self.down = down
+        
+        # Normalization and activation
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.act1 = nn.SiLU()
+        
+        # Up/down sampling if needed
+        if up:
+            self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        elif down:
+            self.downsample = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=1)
+        
+        # First convolution
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        
+        # Time projection for conditioning
+        if time_channels > 0:
+            self.time_proj = nn.Linear(time_channels, out_channels * 2 if use_scale_shift_norm else out_channels)
+        
+        # Second normalization and activation
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.act2 = nn.SiLU()
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # Second convolution
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        
+        # Skip connection if in_channels != out_channels
+        if in_channels != out_channels:
+            self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip_connection = nn.Identity()
+        
+    def forward(self, x: torch.Tensor, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
+        Apply residual block with conditioning
+        
         Args:
-            x: Query tensor [batch, seq_len, query_dim]
-            context: Context tensor [batch, context_len, context_dim]
+            x: Input tensor [batch, in_channels, height, width]
+            time_emb: Time embedding [batch, time_channels]
             
         Returns:
-            Attention output [batch, seq_len, query_dim]
+            Output tensor [batch, out_channels, height', width']
+            where height' and width' depend on up/down sampling
         """
-        batch_size, seq_len, _ = x.shape
-        h = self.heads
+        # Save input for skip connection
+        residual = x
         
-        # Project to queries, keys, values
-        q = self.to_q(x)                  # [batch, seq_len, inner_dim]
-        k = self.to_k(context)            # [batch, context_len, inner_dim]
-        v = self.to_v(context)            # [batch, context_len, inner_dim]
+        # First normalization and activation
+        h = self.norm1(x)
+        h = self.act1(h)
         
-        # Reshape for multi-head attention
-        q = q.view(batch_size, seq_len, h, -1).permute(0, 2, 1, 3)      # [batch, heads, seq_len, dim_head]
-        k = k.view(batch_size, -1, h, q.size(-1)).permute(0, 2, 1, 3)   # [batch, heads, context_len, dim_head]
-        v = v.view(batch_size, -1, h, q.size(-1)).permute(0, 2, 1, 3)   # [batch, heads, context_len, dim_head]
+        # Up/down sample if needed
+        if self.up:
+            h = self.upsample(h)
+            residual = self.upsample(residual)
+        elif self.down:
+            h = self.downsample(h)
+            residual = self.downsample(residual)
+        
+        # First convolution
+        h = self.conv1(h)
+        
+        # Apply time conditioning
+        if time_emb is not None:
+            assert self.time_channels > 0
+            
+            # Project time embedding
+            time_emb = self.time_proj(time_emb)
+            
+            if self.use_scale_shift_norm:
+                # Split into scale and shift for normalization
+                scale, shift = torch.chunk(time_emb, 2, dim=1)
+                
+                # Reshape for broadcasting
+                scale = scale.view(-1, self.out_channels, 1, 1)
+                shift = shift.view(-1, self.out_channels, 1, 1)
+                
+                # Apply scale and shift after normalization
+                h = self.norm2(h) * (1 + scale) + shift
+                h = self.act2(h)
+            else:
+                # Add time embedding directly
+                time_emb = time_emb.view(-1, self.out_channels, 1, 1)
+                h = self.norm2(h) + time_emb
+                h = self.act2(h)
+        else:
+            # Regular normalization and activation
+            h = self.norm2(h)
+            h = self.act2(h)
+        
+        # Dropout
+        h = self.dropout(h)
+        
+        # Second convolution
+        h = self.conv2(h)
+        
+        # Skip connection
+        return h + self.skip_connection(residual)
 
-        # Calculate attention scores
-        sim = torch.einsum('b h i d, b h j d -> b h i j', q, k) * self.scale  # [batch, heads, seq_len, context_len]
-        attn = F.softmax(sim, dim=-1)
-        
-        # Apply attention to values
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)   # [batch, heads, seq_len, dim_head]
-        out = out.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, -1)  # [batch, seq_len, inner_dim]
-        
-        return self.to_out(out)
 
-
-class ConvBlock(nn.Module):
-    def __init__(self, dim, dim_out, time_dim=None, groups=8):
+class AttentionBlock(nn.Module):
+    """Self-attention block for spatial dependencies."""
+    
+    def __init__(self, channels: int, num_heads: int = 4):
         super().__init__()
-        self.time_mlp = None
-        if time_dim is not None:
-            self.time_mlp = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(time_dim, dim_out)
-            )
         
-        self.block1 = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, padding=1),
-            nn.GroupNorm(groups, dim_out),
-            nn.SiLU()
-        )
+        self.channels = channels
+        self.num_heads = num_heads
         
-        self.block2 = nn.Sequential(
-            nn.Conv2d(dim_out, dim_out, 3, padding=1),
-            nn.GroupNorm(groups, dim_out),
-            nn.SiLU()
-        )
+        # Normalization
+        self.norm = nn.GroupNorm(32, channels)
         
-        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-    def forward(self, x, time_emb=None):
+        # QKV projection
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        
+        # Output projection
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        
+        # Scale factor for attention
+        self.scale = (channels // num_heads) ** -0.5
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Apply self-attention
+        
         Args:
             x: Input tensor [batch, channels, height, width]
-            time_emb: Time embedding [batch, time_dim]
             
         Returns:
-            Output tensor [batch, dim_out, height, width]
+            Output tensor [batch, channels, height, width]
         """
-        h = self.block1(x)
+        # Save input for skip connection
+        residual = x
         
-        if self.time_mlp and time_emb is not None:
-            time_emb = self.time_mlp(time_emb)
-            h = h + time_emb.reshape(time_emb.shape[0], -1, 1, 1)
+        # Normalization
+        x = self.norm(x)
+        
+        # Get shape
+        batch, channels, height, width = x.shape
+        
+        # Project to QKV
+        qkv = self.qkv(x)
+        
+        # Reshape and split for multi-head attention
+        qkv = qkv.reshape(batch, 3 * channels, height * width)
+        qkv = qkv.reshape(batch, 3, self.num_heads, channels // self.num_heads, height * width)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        
+        # Compute attention scores
+        attn = torch.einsum("bhnc,bhnd->bhcd", q, k) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        
+        # Apply attention to values
+        out = torch.einsum("bhcd,bhnd->bhnc", attn, v)
+        
+        # Reshape back
+        out = out.reshape(batch, channels, height, width)
+        
+        # Output projection
+        out = self.proj(out)
+        
+        # Skip connection
+        return out + residual
+
+
+class CrossAttentionBlock(nn.Module):
+    """Cross-attention for conditioning information."""
+    
+    def __init__(self, query_dim: int, context_dim: int, num_heads: int = 4):
+        super().__init__()
+        
+        self.query_dim = query_dim
+        self.context_dim = context_dim
+        self.num_heads = num_heads
+        self.head_dim = query_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # Normalization
+        self.norm = nn.GroupNorm(32, query_dim)
+        
+        # Query, key, and value projections
+        self.to_q = nn.Conv2d(query_dim, query_dim, kernel_size=1)
+        self.to_k = nn.Linear(context_dim, query_dim)
+        self.to_v = nn.Linear(context_dim, query_dim)
+        
+        # Output projection
+        self.proj = nn.Conv2d(query_dim, query_dim, kernel_size=1)
+        
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """
+        Apply cross-attention
+        
+        Args:
+            x: Query tensor [batch, channels, height, width]
+            context: Context tensor [batch, seq_len, context_dim]
             
-        h = self.block2(h)
-        return h + self.res_conv(x)
+        Returns:
+            Output tensor [batch, channels, height, width]
+        """
+        # Save input for skip connection
+        residual = x
+        
+        # Normalization
+        x = self.norm(x)
+        
+        # Get shape
+        batch, channels, height, width = x.shape
+        
+        # Project query
+        q = self.to_q(x)
+        q = q.reshape(batch, self.num_heads, self.head_dim, height * width)
+        q = q.permute(0, 1, 3, 2)  # [batch, num_heads, hw, head_dim]
+        
+        # Project key and value
+        k = self.to_k(context)
+        v = self.to_v(context)
+        
+        k = k.reshape(batch, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+        v = v.reshape(batch, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [batch, num_heads, seq_len, head_dim]
+        
+        # Compute attention scores
+        attn = torch.einsum("bihd,bjhd->bijh", q, k) * self.scale
+        attn = F.softmax(attn, dim=2)
+        
+        # Apply attention to values
+        out = torch.einsum("bijh,bjhd->bihd", attn, v)
+        
+        # Reshape back
+        out = out.permute(0, 1, 3, 2).reshape(batch, channels, height, width)
+        
+        # Output projection
+        out = self.proj(out)
+        
+        # Skip connection
+        return out + residual
 
 
 class UNet(nn.Module):
-    def __init__(self, 
-            in_channels=32, 
-            model_channels=128, 
-            out_channels=32,
-            time_dim=256,
-            context_dim=None,
-            attention_levels=[1, 2],
-            num_groups=8):
+    """UNet architecture for diffusion model."""
+    
+    def __init__(self, config: Dict[str, Any]):
         super().__init__()
         
-        self.time_dim = time_dim
-        self.context_dim = context_dim
-        self.out_channels = out_channels  # Store this as an attribute
-
-        # Time embedding
-        self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(time_dim // 4),
-            nn.Linear(time_dim // 4, time_dim),
+        # Get configuration
+        unet_config = config["unet"]
+        
+        # Model dimensions
+        self.in_channels = config.get("in_channels", 1)
+        self.base_channels = unet_config["base_channels"]
+        self.channel_multipliers = unet_config["channel_multipliers"]
+        self.num_res_blocks = unet_config["num_res_blocks"]
+        self.attention_levels = unet_config["attention_levels"]
+        self.num_heads = unet_config["num_heads"]
+        self.use_scale_shift_norm = unet_config["use_scale_shift_norm"]
+        self.dropout = unet_config["dropout"]
+        
+        # Conditioning
+        self.context_dim = config.get("context_dim", None)
+        self.time_dim = self.base_channels * 4
+        
+        # Build time embedding network
+        self.time_embed = nn.Sequential(
+            SinusoidalPositionEmbeddings(self.base_channels),
+            nn.Linear(self.base_channels, self.time_dim),
             nn.SiLU(),
-            nn.Linear(time_dim, time_dim)
+            nn.Linear(self.time_dim, self.time_dim)
         )
         
-        # Initial projection
-        self.init_conv = nn.Conv2d(in_channels, model_channels, 3, padding=1)
+        # Input projection
+        self.input_projection = nn.Conv2d(self.in_channels, self.base_channels, kernel_size=3, padding=1)
         
-        # Downsampling
-        self.downs = nn.ModuleList([])
-        channels = [model_channels]
-        now_channels = model_channels
+        # Down blocks
+        self.down_blocks = nn.ModuleList()
         
         # Track input/output channels for each level
-        self.down_channels = []
+        input_channels = self.base_channels
+        channels_list = [input_channels]
         
-        for i in range(3):  # 3 levels of downsampling
-            channel_mult = 2 ** i
-            out_channels = model_channels * channel_mult
+        # For each level in the UNet
+        for i, mult in enumerate(self.channel_multipliers):
+            output_channels = self.base_channels * mult
             
-            # Add to channel tracking
-            self.down_channels.append((now_channels, out_channels))
-            
-            self.downs.append(ConvBlock(now_channels, out_channels, time_dim, num_groups))
-            
-            # Add cross-attention if needed
-            if context_dim is not None and i in attention_levels:
-                self.downs.append(CrossAttention(out_channels, context_dim))
-            else:
-                # Add identity to maintain consistent indexing
-                self.downs.append(nn.Identity())
-            
-            # Add downsampling
-            self.downs.append(nn.Conv2d(out_channels, out_channels, 4, 2, 1))
-            
-            now_channels = out_channels
-            channels.append(now_channels)
+            # For each residual block at this level
+            for j in range(self.num_res_blocks):
+                # Add residual block
+                self.down_blocks.append(
+                    ResnetBlock(
+                        input_channels,
+                        output_channels,
+                        time_channels=self.time_dim,
+                        dropout=self.dropout,
+                        use_scale_shift_norm=self.use_scale_shift_norm,
+                        down=(j == 0 and i > 0)  # Downsample on first block except level 0
+                    )
+                )
+                
+                input_channels = output_channels
+                channels_list.append(input_channels)
+                
+                # Add attention if needed
+                if i in self.attention_levels:
+                    # Self-attention
+                    self.down_blocks.append(
+                        AttentionBlock(
+                            input_channels,
+                            num_heads=self.num_heads
+                        )
+                    )
+                    
+                    # Cross-attention if context is provided
+                    if self.context_dim is not None:
+                        self.down_blocks.append(
+                            CrossAttentionBlock(
+                                input_channels,
+                                self.context_dim,
+                                num_heads=self.num_heads
+                            )
+                        )
         
-        # Middle block
-        self.mid_block1 = ConvBlock(now_channels, now_channels, time_dim, num_groups)
+        # Middle blocks
+        self.middle_blocks = nn.ModuleList([
+            ResnetBlock(
+                input_channels,
+                input_channels,
+                time_channels=self.time_dim,
+                dropout=self.dropout,
+                use_scale_shift_norm=self.use_scale_shift_norm
+            ),
+            AttentionBlock(
+                input_channels,
+                num_heads=self.num_heads
+            )
+        ])
         
-        if context_dim is not None:
-            self.mid_attn = CrossAttention(now_channels, context_dim)
+        # Cross-attention in middle if context is provided
+        if self.context_dim is not None:
+            self.middle_blocks.append(
+                CrossAttentionBlock(
+                    input_channels,
+                    self.context_dim,
+                    num_heads=self.num_heads
+                )
+            )
             
-        self.mid_block2 = ConvBlock(now_channels, now_channels, time_dim, num_groups)
-        
-        # Upsampling
-        self.ups = nn.ModuleList([])
-
-        # Correct channel dimensions for each upsampling stage
-        # Based on the debug prints showing the actual dimensions
-        for i in reversed(range(3)):  # 3 levels of upsampling
-            channel_mult = 2 ** i
-            out_channels = model_channels * channel_mult
-            in_channels = now_channels
-            
-            # Calculate skip connection channels from corresponding down block
-            # The debug prints show that the first skip connection has 256 channels
-            if i == 2:  # First upsampling level
-                skip_channels = 256  # From debugs: "Up 0, skip connection shape: torch.Size([10, 256, 5, 53])"
-            elif i == 1:  # Second upsampling level
-                skip_channels = 128  # Based on the channel progression in the downsampling path
-            else:  # Third upsampling level
-                skip_channels = 64   # Based on the initial channel count
-            
-            # Calculate correct concatenated channel count
-            concat_channels = out_channels + skip_channels
-            
-            # Upsample
-            self.ups.append(nn.Sequential(
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-                nn.Conv2d(in_channels, out_channels, 3, padding=1)
-            ))
-            
-            # Create ConvBlock with correct input channel count
-            self.ups.append(ConvBlock(concat_channels, out_channels, time_dim, num_groups))
-            
-            # Add cross-attention if needed
-            if context_dim is not None and i in attention_levels:
-                self.ups.append(CrossAttention(out_channels, context_dim))
-            else:
-                # Add identity to maintain consistent indexing
-                self.ups.append(nn.Identity())
-            
-            now_channels = out_channels
-        
-        # Final block
-        self.final_conv = nn.Sequential(
-            nn.GroupNorm(num_groups, now_channels),
-            nn.SiLU(),
-            nn.Conv2d(now_channels, out_channels, 3, padding=1)
+        self.middle_blocks.append(
+            ResnetBlock(
+                input_channels,
+                input_channels,
+                time_channels=self.time_dim,
+                dropout=self.dropout,
+                use_scale_shift_norm=self.use_scale_shift_norm
+            )
         )
         
-        # Add interpolation layer to ensure output matches input dimensions
-        self.output_interpolate = True
-    
-    def fix_output_channels(self, x, out_channels):
+        # Up blocks
+        self.up_blocks = nn.ModuleList()
+        
+        # For each level in the UNet (reversed)
+        for i, mult in reversed(list(enumerate(self.channel_multipliers))):
+            output_channels = self.base_channels * mult
+            
+            # For each residual block at this level
+            for j in range(self.num_res_blocks + 1):
+                # Get skip connection channels
+                skip_channels = channels_list.pop()
+                
+                # Add residual block with skip connection
+                self.up_blocks.append(
+                    ResnetBlock(
+                        skip_channels + input_channels,
+                        output_channels,
+                        time_channels=self.time_dim,
+                        dropout=self.dropout,
+                        use_scale_shift_norm=self.use_scale_shift_norm,
+                        up=(j == self.num_res_blocks and i > 0)  # Upsample on last block except level 0
+                    )
+                )
+                
+                input_channels = output_channels
+                
+                # Add attention if needed
+                if i in self.attention_levels:
+                    # Self-attention
+                    self.up_blocks.append(
+                        AttentionBlock(
+                            input_channels,
+                            num_heads=self.num_heads
+                        )
+                    )
+                    
+                    # Cross-attention if context is provided
+                    if self.context_dim is not None:
+                        self.up_blocks.append(
+                            CrossAttentionBlock(
+                                input_channels,
+                                self.context_dim,
+                                num_heads=self.num_heads
+                            )
+                        )
+        
+        # Output projection
+        self.output_projection = nn.Sequential(
+            nn.GroupNorm(32, input_channels),
+            nn.SiLU(),
+            nn.Conv2d(input_channels, self.in_channels, kernel_size=3, padding=1)
+        )
+        
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        time: torch.Tensor, 
+        context: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
-        Ensure the output tensor has the correct number of channels
+        Forward pass through UNet
         
         Args:
             x: Input tensor [batch, in_channels, height, width]
-            out_channels: Target number of output channels
-            
-        Returns:
-            Tensor with corrected number of channels [batch, out_channels, height, width]
-        """
-        if x.shape[1] == out_channels:
-            return x
-            
-        # If we have too many channels, slice to the desired number
-        if x.shape[1] > out_channels:
-            return x[:, :out_channels, :, :]
-            
-        # If we have too few channels, use a 1x1 conv to project to the desired number
-        projection = nn.Conv2d(x.shape[1], out_channels, kernel_size=1).to(x.device)
-        return projection(x)
-
-    def forward(self, x, t, context=None):
-        """
-        Forward pass through UNet with debug prints
-        
-        Args:
-            x: Input tensor [batch, in_channels, height, width]
-            t: Timestep tensor [batch]
+            time: Timestep tensor [batch]
             context: Optional conditioning [batch, seq_len, context_dim]
             
         Returns:
-            Output tensor [batch, out_channels, height, width]
+            Output tensor [batch, in_channels, height, width]
         """
-        # Store original dimensions for final resize
-        original_shape = x.shape
-
         # Time embedding
-        t = t.to(torch.float32)
-        t = self.time_mlp(t)
+        time_emb = self.time_embed(time)
         
-        # Initial convolution
-        h = self.init_conv(x)
-        #print(f"Initial h shape: {h.shape}")
+        # Initial projection
+        h = self.input_projection(x)
         
         # Store skip connections
-        skips = []
+        skips = [h]
         
-        # Downsample
-        for i, block in enumerate(self.downs):
-            if isinstance(block, ConvBlock):
-                h = block(h, t)
-                skips.append(h)  # Store output of each ConvBlock for skip connections
-                #print(f"Down {i//3}, stage {i%3}, after ConvBlock: {h.shape}")
-            elif isinstance(block, CrossAttention) and context is not None:
-                # Reshape for cross-attention: [b,c,h,w] -> [b,h*w,c]
-                b, c, height, width = h.shape
-                h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
-                h_flat = block(h_flat, context)  # [b, h*w, c]
-                h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
-                #print(f"Down {i//3}, stage {i%3}, after CrossAttention: {h.shape}")
-            else:
+        # Down blocks
+        for i, block in enumerate(self.down_blocks):
+            if isinstance(block, ResnetBlock):
+                h = block(h, time_emb)
+                skips.append(h)
+            elif isinstance(block, AttentionBlock):
                 h = block(h)
-                #print(f"Down {i//3}, stage {i%3}, after other block: {h.shape}")
+            elif isinstance(block, CrossAttentionBlock) and context is not None:
+                h = block(h, context)
         
-        # Middle
-        h = self.mid_block1(h, t)
-        #print(f"After mid_block1: {h.shape}")
+        # Middle blocks
+        for i, block in enumerate(self.middle_blocks):
+            if isinstance(block, ResnetBlock):
+                h = block(h, time_emb)
+            elif isinstance(block, AttentionBlock):
+                h = block(h)
+            elif isinstance(block, CrossAttentionBlock) and context is not None:
+                h = block(h, context)
         
-        if hasattr(self, 'mid_attn') and context is not None:
-            # Reshape for cross-attention
-            b, c, height, width = h.shape
-            h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
-            h_flat = self.mid_attn(h_flat, context)  # [b, h*w, c]
-            h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
-            #print(f"After mid_attn: {h.shape}")
-            
-        h = self.mid_block2(h, t)
-        #print(f"After mid_block2: {h.shape}")
-        
-        # Upsample with correct skip connection handling
-        skip_idx = len(skips) - 1
-        for i in range(0, len(self.ups), 3):
-            # Upsample
-            h_before_up = h.shape
-            h = self.ups[i](h)
-            #print(f"Up {i//3}, after upsample: {h.shape} (was {h_before_up})")
-            
-            # Get and apply skip connection
-            if skip_idx >= 0:
-                skip = skips[skip_idx]
-                #print(f"Up {i//3}, skip connection shape: {skip.shape}")
-                skip_idx -= 1
+        # Up blocks
+        for i, block in enumerate(self.up_blocks):
+            if isinstance(block, ResnetBlock):
+                # Get skip connection
+                skip = skips.pop()
                 
-                # Resize h to match skip's spatial dimensions exactly instead of the other way around
-                if h.shape[2:] != skip.shape[2:]:
-                    h = F.interpolate(h, size=skip.shape[2:], mode='bilinear', align_corners=True)
-                    #print(f"Up {i//3}, interpolated upsampled output to: {h.shape}")
+                # Align shapes if needed
+                if h.shape[-2:] != skip.shape[-2:]:
+                    h = F.interpolate(
+                        h, size=skip.shape[-2:], mode='bilinear', align_corners=True
+                    )
                 
-                # Concatenate along channel dimension
-                h_before_cat = h.shape
+                # Concatenate skip connection
                 h = torch.cat([h, skip], dim=1)
-                #print(f"Up {i//3}, after concatenation: {h.shape} (was {h_before_cat})")
-            
-            # Apply ConvBlock after concatenation
-            h_before_conv = h.shape
-            h = self.ups[i+1](h, t)
-            #print(f"Up {i//3}, after ConvBlock: {h.shape} (was {h_before_conv})")
-            
-            # Apply CrossAttention or Identity
-            if isinstance(self.ups[i+2], CrossAttention) and context is not None:
-                # Reshape for cross-attention
-                b, c, height, width = h.shape
-                h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
-                h_flat = self.ups[i+2](h_flat, context)  # [b, h*w, c]
-                h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
-                #print(f"Up {i//3}, after CrossAttention: {h.shape}")
-            else:
-                h = self.ups[i+2](h)
-                #print(f"Up {i//3}, after Identity: {h.shape}")
+                
+                # Apply block
+                h = block(h, time_emb)
+            elif isinstance(block, AttentionBlock):
+                h = block(h)
+            elif isinstance(block, CrossAttentionBlock) and context is not None:
+                h = block(h, context)
         
-        # Final convolution
-        h = self.final_conv(h)
-    
-        # Ensure output dimensions match input dimensions
-        if self.output_interpolate and h.shape[2:] != original_shape[2:]:
-            h = F.interpolate(h, size=original_shape[2:], mode='bilinear', align_corners=True)
+        # Output projection
+        h = self.output_projection(h)
         
-        # Ensure output channels match the expected out_channels
-        h = self.fix_output_channels(h, self.out_channels)  # Add this line
-        
-        #print(f"Final output shape: {h.shape}")
         return h
 
 
-class DiffusionModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
+class DiffusionModel(BaseModule):
+    """
+    Diffusion model for latent space generation with conditioning.
+    """
+    
+    def _build_model(self):
+        """Build the diffusion model architecture."""
+        config = self.config
         
         # Diffusion parameters
-        diffusion_config = config['model']['diffusion']
-        self.num_timesteps = diffusion_config['diffusion_steps']
-        self.beta_start = diffusion_config['beta_start']
-        self.beta_end = diffusion_config['beta_end']
+        self.diffusion_steps = config["diffusion_steps"]
+        self.beta_start = config["beta_start"]
+        self.beta_end = config["beta_end"]
+        self.diffusion_schedule = config["diffusion_schedule"]
         
-        # Register buffer for betas, alphas etc.
-        if diffusion_config['beta_schedule'] == 'linear':
-            self.register_buffer('betas', torch.linspace(self.beta_start, self.beta_end, self.num_timesteps))
-        elif diffusion_config['beta_schedule'] == 'cosine':
-            self.register_buffer('betas', self._cosine_beta_schedule(self.num_timesteps))
+        # Model parameters
+        self.prediction_type = config.get("prediction_type", "epsilon")
+        assert self.prediction_type in ["epsilon", "x0", "v"], f"Unknown prediction type: {self.prediction_type}"
         
-        self.register_buffer('alphas', 1. - self.betas)
-        self.register_buffer('alphas_cumprod', torch.cumprod(self.alphas, dim=0))
-        self.register_buffer('alphas_cumprod_prev', F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.))
-        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(self.alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - self.alphas_cumprod))
-        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1. / self.alphas))
+        # Conditioning parameters
+        self.conditioning_mode = config.get("conditioning_mode", "cross_attention")
         
-        # Calculate posterior variance (important for sampling)
-        posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
-        self.register_buffer('posterior_variance', posterior_variance)
-        self.register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
-        self.register_buffer('posterior_mean_coef1', self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod))
-        self.register_buffer('posterior_mean_coef2', (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod))
+        # Register diffusion schedule parameters
+        self._setup_diffusion_schedule()
         
-        # Model dimensions
-        self.latent_channels = config['model']['vae']['latent_channels']
-        self.context_dim = config['model']['conditioning']['condition_channels']
+        # Create UNet for noise prediction
+        self.model = UNet({
+            "in_channels": config.get("in_channels", 1),
+            "context_dim": config.get("context_dim", None),
+            "unet": config["unet"]
+        })
         
-        # Noise prediction model
-        self.model = UNet(
-            in_channels=self.latent_channels,
-            model_channels=self.latent_channels * 2,
-            out_channels=self.latent_channels,
-            time_dim=256,
-            context_dim=self.context_dim
-        )
-    
-    def _cosine_beta_schedule(self, timesteps, s=0.008):
-        """
-        Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
-        """
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
-    
-    def q_sample(self, x_start, t, noise=None):
-        """
-        Forward diffusion: sample from q(x_t | x_0)
-        
-        Args:
-            x_start: Initial sample [batch, channels, height, width]
-            t: Timestep [batch]
-            noise: Optional noise to add [batch, channels, height, width]
-            
-        Returns:
-            Noisy sample at timestep t [batch, channels, height, width]
-        """
-        if noise is None:
-            noise = torch.randn_like(x_start)
-            
-        sqrt_alphas_cumprod_t = self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-        
-        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-    
-    def _extract_into_tensor(self, a, t, broadcast_shape):
-        """
-        Extract values from a 1-D torch tensor for a batch of indices.
-        """
-        t = t.long()
-        out = a.gather(-1, t).reshape(-1, 1, 1, 1)
-        return out.expand(broadcast_shape)
-    
-    def p_losses(self, x_start, t, context=None, noise=None):
-        """
-        Training loss calculation
-        
-        Args:
-            x_start: Initial sample [batch, channels, height, width]
-            t: Timestep [batch]
-            context: Conditioning information [batch, seq_len, channels]
-            noise: Optional noise to add [batch, channels, height, width]
-            
-        Returns:
-            Loss scalar
-        """
-        if noise is None:
-            noise = torch.randn_like(x_start)
-            
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        predicted_noise = self.model(x_noisy, t, context)
-        
-        # Handle channel dimension mismatch
-        if predicted_noise.shape[1] != noise.shape[1]:
-            # If predicted has more channels than noise, truncate to match
-            if predicted_noise.shape[1] > noise.shape[1]:
-                predicted_noise = predicted_noise[:, :noise.shape[1], :, :]
-            # If predicted has fewer channels than noise, replicate to match
-            else:
-                repeats = math.ceil(noise.shape[1] / predicted_noise.shape[1])
-                predicted_noise = predicted_noise.repeat(1, repeats, 1, 1)[:, :noise.shape[1], :, :]
-        
-        # Ensure spatial dimensions match
-        if predicted_noise.shape[2:] != noise.shape[2:]:
-            predicted_noise = F.interpolate(
-                predicted_noise, 
-                size=noise.shape[2:], 
-                mode='bilinear', 
-                align_corners=True
+    def _setup_diffusion_schedule(self):
+        """Set up diffusion schedule parameters."""
+        # Create beta schedule
+        if self.diffusion_schedule == "linear":
+            self.betas = torch.linspace(
+                self.beta_start, 
+                self.beta_end, 
+                self.diffusion_steps
             )
-            
-        loss = F.mse_loss(predicted_noise, noise)
-        return loss
+        elif self.diffusion_schedule == "cosine":
+            # Cosine schedule as proposed in https://arxiv.org/abs/2102.09672
+            steps = self.diffusion_steps + 1
+            x = torch.linspace(0, self.diffusion_steps, steps)
+            alphas_cumprod = torch.cos(((x / self.diffusion_steps) + 0.008) / 1.008 * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            self.betas = torch.clip(betas, 0.0001, 0.9999)
+        elif self.diffusion_schedule == "quadratic":
+            # Quadratic schedule
+            self.betas = torch.linspace(
+                self.beta_start ** 0.5, 
+                self.beta_end ** 0.5, 
+                self.diffusion_steps
+            ) ** 2
+        else:
+            raise ValueError(f"Unknown diffusion schedule: {self.diffusion_schedule}")
+        
+        # Calculate related constants
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+        
+        # Constants for sampling
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.log_one_minus_alphas_cumprod = torch.log(1.0 - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1)
+        
+        # Posterior variance
+        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        self.posterior_log_variance_clipped = torch.log(torch.maximum(
+            self.posterior_variance, torch.tensor(1e-20)
+        ))
+        self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod)
     
-    def p_sample(self, x, t, context=None):
+    def _extract(self, a: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
         """
-        Reverse diffusion: sample from p(x_{t-1} | x_t)
+        Extract values at timesteps and reshape to match x_shape
         
         Args:
-            x: Current sample [batch, channels, height, width]
-            t: Current timestep [batch]
-            context: Conditioning information [batch, seq_len, channels]
+            a: Source tensor [diffusion_steps] to extract from
+            t: Timestep indices [batch]
+            x_shape: Target shape
+            
+        Returns:
+            Extracted values broadcasted to x_shape
+        """
+        batch_size = t.shape[0]
+        out = a.gather(-1, t.cpu()).to(t.device)
+        
+        # Reshape to match target shape
+        return out.reshape(batch_size, *([1] * (len(x_shape) - 1)))
+    
+    def q_sample(
+        self, 
+        x_start: torch.Tensor, 
+        t: torch.Tensor, 
+        noise: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward diffusion process: sample from q(x_t | x_0)
+        
+        Args:
+            x_start: Initial clean sample [batch, channels, height, width]
+            t: Timestep indices [batch]
+            noise: Optional pre-generated noise
+            
+        Returns:
+            Tuple of (noisy_sample, noise)
+        """
+        if noise is None:
+            noise = torch.randn_like(x_start)
+            
+        # Extract coefficients for this timestep
+        sqrt_alphas_cumprod_t = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+        
+        # Add noise
+        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise, noise
+    
+    def predict_start_from_noise(
+        self, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor, 
+        noise: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Predict x_0 from x_t and predicted noise
+        
+        Args:
+            x_t: Noisy sample at timestep t [batch, channels, height, width]
+            t: Timestep indices [batch]
+            noise: Predicted noise [batch, channels, height, width]
+            
+        Returns:
+            Predicted x_0 [batch, channels, height, width]
+        """
+        # Extract coefficients for this timestep
+        sqrt_recip_alphas_cumprod_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape)
+        sqrt_recipm1_alphas_cumprod_t = self._extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        
+        # Predict x_0
+        return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
+    
+    def q_posterior(
+        self, 
+        x_start: torch.Tensor, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute posterior q(x_{t-1} | x_t, x_0)
+        
+        Args:
+            x_start: Predicted x_0 [batch, channels, height, width]
+            x_t: Current noisy sample x_t [batch, channels, height, width]
+            t: Current timestep indices [batch]
+            
+        Returns:
+            Tuple of (posterior_mean, posterior_variance, posterior_log_variance_clipped)
+        """
+        # Extract coefficients for this timestep
+        posterior_mean_coef1_t = self._extract(self.posterior_mean_coef1, t, x_t.shape)
+        posterior_mean_coef2_t = self._extract(self.posterior_mean_coef2, t, x_t.shape)
+        
+        # Compute posterior mean
+        posterior_mean = posterior_mean_coef1_t * x_start + posterior_mean_coef2_t * x_t
+        
+        # Extract posterior variance and log variance
+        posterior_variance_t = self._extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped_t = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        
+        return posterior_mean, posterior_variance_t, posterior_log_variance_clipped_t
+    
+    def p_mean_variance(
+        self, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor, 
+        context: Optional[torch.Tensor] = None,
+        clip_denoised: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute mean and variance for the denoising step
+        
+        Args:
+            x_t: Current noisy sample [batch, channels, height, width]
+            t: Current timestep indices [batch]
+            context: Conditioning information [batch, seq_len, context_dim]
+            clip_denoised: Whether to clip predicted x_0 to [-1, 1]
+            
+        Returns:
+            Tuple of (posterior_mean, posterior_variance, posterior_log_variance)
+        """
+        # Predict noise or x_0 based on mode
+        model_output = self.model(x_t, t, context)
+        
+        if self.prediction_type == "epsilon":
+            # Model predicts noise
+            predicted_noise = model_output
+            x_start = self.predict_start_from_noise(x_t, t, predicted_noise)
+        elif self.prediction_type == "x0":
+            # Model directly predicts x_0
+            x_start = model_output
+        else:  # v-prediction
+            # Model predicts v = alpha * noise - sigma * x0
+            v = model_output
+            alpha_t = self._extract(self.alphas_cumprod, t, x_t.shape)
+            sigma_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+            
+            # Derive x_0: (x_t - sigma_t * v) / alpha_t
+            x_start = (x_t - sigma_t * v) / alpha_t
+        
+        # Clip x_0 prediction if requested
+        if clip_denoised:
+            x_start = torch.clamp(x_start, -1.0, 1.0)
+        
+        # Get posterior parameters
+        posterior_mean, posterior_variance, posterior_log_variance = self.q_posterior(
+            x_start=x_start, 
+            x_t=x_t, 
+            t=t
+        )
+        
+        return posterior_mean, posterior_variance, posterior_log_variance
+    
+    def p_sample(
+        self, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor, 
+        context: Optional[torch.Tensor] = None,
+        clip_denoised: bool = True
+    ) -> torch.Tensor:
+        """
+        Sample from p(x_{t-1} | x_t)
+        
+        Args:
+            x_t: Current noisy sample [batch, channels, height, width]
+            t: Current timestep indices [batch]
+            context: Conditioning information [batch, seq_len, context_dim]
+            clip_denoised: Whether to clip predicted x_0 to [-1, 1]
             
         Returns:
             Sample at timestep t-1 [batch, channels, height, width]
         """
-        model_output = self.model(x, t, context)
+        # Get posterior mean and variance
+        posterior_mean, posterior_variance, posterior_log_variance = self.p_mean_variance(
+            x_t, t, context, clip_denoised
+        )
         
-        # Ensure model_output has the same shape as x
-        if model_output.shape != x.shape:
-            model_output = F.interpolate(
-                model_output, 
-                size=x.shape[2:], 
-                mode='bilinear', 
-                align_corners=True
-            )
+        # Sample from posterior
+        noise = torch.randn_like(x_t)
         
-        # Get posterior parameters
-        posterior_variance = self._extract_into_tensor(self.posterior_variance, t, x.shape)
-        posterior_log_variance_clipped = self._extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
-        posterior_mean_coef1 = self._extract_into_tensor(self.posterior_mean_coef1, t, x.shape)
-        posterior_mean_coef2 = self._extract_into_tensor(self.posterior_mean_coef2, t, x.shape)
+        # Don't add noise for t=0
+        nonzero_mask = (t > 0).float().reshape(-1, *([1] * (len(x_t.shape) - 1)))
         
-        # Calculate posterior mean
-        posterior_mean = posterior_mean_coef1 * x + posterior_mean_coef2 * model_output
-        
-        # Sample
-        noise = torch.randn_like(x)
-        nonzero_mask = (t > 0).float().reshape(-1, 1, 1, 1)
-        
-        return posterior_mean + nonzero_mask * torch.exp(0.5 * posterior_log_variance_clipped) * noise
+        return posterior_mean + nonzero_mask * torch.exp(0.5 * posterior_log_variance) * noise
     
-    def p_sample_loop(self, shape, context=None):
+    def p_sample_loop(
+        self, 
+        shape: Tuple[int, ...], 
+        context: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
+        clip_denoised: bool = True,
+        progress: bool = True
+    ) -> torch.Tensor:
         """
         Full sampling loop for inference
         
         Args:
             shape: Output shape [batch, channels, height, width]
-            context: Conditioning information [batch, seq_len, channels]
+            context: Conditioning information [batch, seq_len, context_dim]
+            noise: Initial noise (if None, random noise is used)
+            clip_denoised: Whether to clip predicted x_0 to [-1, 1]
+            progress: Whether to show progress bar
             
         Returns:
             Generated sample [batch, channels, height, width]
         """
         device = self.betas.device
-        b = shape[0]
+        batch_size = shape[0]
         
-        # Start with random noise
-        img = torch.randn(shape, device=device)
+        # Start with random noise or provided noise
+        img = noise if noise is not None else torch.randn(shape, device=device)
         
-        # Iteratively denoise
-        for i in reversed(range(self.num_timesteps)):
-            t = torch.full((b,), i, device=device, dtype=torch.long)
-            img = self.p_sample(img, t, context)
+        # Setup progress range
+        progress_fn = tqdm if progress else lambda x: x
+        time_range = list(reversed(range(self.diffusion_steps)))
+        
+        # Iterative denoising
+        for i in progress_fn(time_range):
+            timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long)
+            img = self.p_sample(img, timesteps, context, clip_denoised)
             
         return img
     
-    def forward(self, x, context=None):
+    def p_losses(
+        self, 
+        x_start: torch.Tensor, 
+        t: torch.Tensor, 
+        context: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Forward pass: calculate loss for training
+        Training loss calculation
         
         Args:
-            x: Input tensor [batch, channels, height, width] 
-            context: Conditioning information [batch, seq_len, channels]
+            x_start: Initial clean sample [batch, channels, height, width]
+            t: Timestep indices [batch]
+            context: Conditioning information [batch, seq_len, context_dim]
+            noise: Optional pre-generated noise
             
         Returns:
-            Loss scalar
+            Tuple of (loss, metrics)
         """
-        b, c, h, w = x.shape
+        # Generate noise
+        if noise is None:
+            noise = torch.randn_like(x_start)
+            
+        # Forward diffusion to get x_t
+        x_noisy, _ = self.q_sample(x_start, t, noise)
+        
+        # Predict noise or x_0
+        model_output = self.model(x_noisy, t, context)
+        
+        # Calculate loss based on prediction type
+        if self.prediction_type == "epsilon":
+            # MSE to noise
+            target = noise
+        elif self.prediction_type == "x0":
+            # MSE to x_0
+            target = x_start
+        else:  # v-prediction
+            # v = alpha * noise - sigma * x0
+            alpha_t = self._extract(self.alphas_cumprod, t, x_start.shape)
+            sigma_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+            target = alpha_t * noise - sigma_t * x_start
+        
+        # Calculate loss
+        loss = F.mse_loss(model_output, target)
+        
+        # Return metrics
+        metrics = {
+            "loss": loss,
+            "x_start_mean": x_start.mean().item(),
+            "x_start_std": x_start.std().item(),
+            "x_noisy_mean": x_noisy.mean().item(),
+            "x_noisy_std": x_noisy.std().item(),
+            "pred_mean": model_output.mean().item(),
+            "pred_std": model_output.std().item(),
+        }
+        
+        return loss, metrics
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        context: Optional[torch.Tensor] = None,
+        condition_dropout_prob: float = 0.0
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Forward pass: calculate loss for training with optional classifier-free guidance support
+        
+        Args:
+            x: Input tensor [batch, channels, height, width]
+            context: Conditioning information [batch, seq_len, context_dim]
+            condition_dropout_prob: Probability of dropping conditioning for classifier-free guidance
+            
+        Returns:
+            Tuple of (loss, metrics)
+        """
         device = x.device
+        b = x.shape[0]
         
-        # Sample random timesteps for each image in the batch
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        # Sample random timesteps for each item in batch
+        t = torch.randint(0, self.diffusion_steps, (b,), device=device).long()
         
+        # Apply conditioning dropout for classifier-free guidance
+        if context is not None and condition_dropout_prob > 0.0:
+            context_mask = torch.rand(b, device=device) >= condition_dropout_prob
+            if not context_mask.all():
+                # For items where conditioning is dropped, set context to None
+                context_masked = []
+                for i in range(b):
+                    if context_mask[i]:
+                        context_masked.append(context[i:i+1])
+                    else:
+                        # Create empty context with same shape
+                        empty_context = torch.zeros_like(context[0:1])
+                        context_masked.append(empty_context)
+                
+                context = torch.cat(context_masked, dim=0)
+        
+        # Calculate loss
         return self.p_losses(x, t, context)

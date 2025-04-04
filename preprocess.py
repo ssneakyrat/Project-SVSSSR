@@ -318,7 +318,7 @@ def save_to_h5(output_path, file_data, phone_map, config, data_key='mel_spectrog
 
 def main():
     parser = argparse.ArgumentParser(description='Preprocess audio and label data for SVS training')
-    parser.add_argument('--config', type=str, default='config/diffusion_model.yaml', help='Path to configuration file')
+    parser.add_argument('--config', type=str, default='config/svs_model.yaml', help='Path to configuration file')
     parser.add_argument('--raw_dir', type=str, help='Raw directory path (overrides config)')
     parser.add_argument('--output', type=str, help='Path for the output H5 file (overrides config)')
     parser.add_argument('--min_phonemes', type=int, default=5, help='Minimum phonemes required per file')
