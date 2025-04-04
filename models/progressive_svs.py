@@ -115,85 +115,6 @@ class ProgressiveSVS(pl.LightningModule):
         
         return high_res_output
     
-    def training_step(self, batch, batch_idx):
-        mel_specs = batch['mel_spec']
-        f0 = batch['f0']
-        phone_label = batch['phone_label']
-        phone_duration = batch['phone_duration']
-        midi_label = batch['midi_label']
-        lengths = batch['length']
-        
-        # Forward pass
-        mel_pred = self(f0, phone_label, phone_duration, midi_label)
-        
-        # Create masks for variable length
-        max_len = mel_specs.shape[2]
-        mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
-        
-        # Adjust target resolution based on current stage
-        if self.current_stage == 1:
-            # Downsample ground truth for low-res stage
-            scale_factor = 1/self.config['model']['low_res_scale']
-            freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            
-            # Reshape to [B, 1, C, T] for 2D interpolation
-            b, c, t = mel_specs.shape
-            mel_specs_4d = mel_specs.view(b, 1, c, t)
-            
-            # Downsample keeping original time dimension
-            mel_target = F.interpolate(
-                mel_specs_4d, 
-                size=(freq_dim, mel_specs.shape[2]),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Back to [B, C', T]
-            
-            # Resize mask to match new frequency dimension
-            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
-            
-        elif self.current_stage == 2:
-            # Downsample ground truth for mid-res stage
-            scale_factor = 1/self.config['model']['mid_res_scale']
-            freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            
-            # Reshape to [B, 1, C, T] for 2D interpolation
-            b, c, t = mel_specs.shape
-            mel_specs_4d = mel_specs.view(b, 1, c, t)
-            
-            mel_target = F.interpolate(
-                mel_specs_4d, 
-                size=(freq_dim, mel_specs.shape[2]),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Back to [B, C', T]
-            
-            # Resize mask to match new frequency dimension
-            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
-            
-        else:
-            # Full resolution for final stage
-            mel_target = mel_specs
-            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
-        
-        # Handle dimensionality issues
-        if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
-            mel_pred = mel_pred.squeeze(1)
-            
-        if mel_target.dim() == 3 and mel_pred.dim() == 2:
-            mel_pred = mel_pred.unsqueeze(0)
-        
-        # Compute masked loss
-        loss = self.loss_fn(mel_pred, mel_target)
-        
-        # Apply mask to loss - only consider valid timesteps
-        loss = loss * mask.float()
-        
-        # Normalize by actual lengths
-        loss = loss.sum() / (mask.sum() + 1e-8)
-        
-        self.log('train_loss', loss, prog_bar=True)
-        return loss
-    
     def validation_step(self, batch, batch_idx):
         mel_specs = batch['mel_spec']
         f0 = batch['f0']
@@ -209,57 +130,54 @@ class ProgressiveSVS(pl.LightningModule):
         max_len = mel_specs.shape[2]
         mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
         
+        # Debug info
+        if batch_idx == 0:
+            print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
+            print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
+        
+        # Handle dimensionality issues (in case prediction is 4D)
+        if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
+            mel_pred = mel_pred.squeeze(1)
+        
         # Adjust target resolution based on current stage
-        if self.current_stage == 1:
-            # Downsample ground truth for low-res stage
-            scale_factor = 1/self.config['model']['low_res_scale']
-            freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
+        if self.current_stage <= 2:  # For both stage 1 and 2
+            # Get target dimensions directly from the prediction
+            target_freq_dim = mel_pred.shape[1]
+            target_time_dim = mel_pred.shape[2]
+            
+            # Debug info
+            if batch_idx == 0:
+                print(f"Stage {self.current_stage} - Target dimensions: freq={target_freq_dim}, time={target_time_dim}")
             
             # Reshape to [B, 1, C, T] for 2D interpolation
             b, c, t = mel_specs.shape
-            mel_specs_4d = mel_specs.view(b, 1, c, t)
+            mel_specs_reshaped = mel_specs.unsqueeze(1)  # [B, 1, C, T]
             
-            # Downsample keeping original time dimension
-            mel_target = F.interpolate(
-                mel_specs_4d, 
-                size=(freq_dim, mel_specs.shape[2]),
+            # Use explicit size for interpolation to match prediction dimensions
+            mel_target = torch.nn.functional.interpolate(
+                mel_specs_reshaped,
+                size=(target_freq_dim, target_time_dim),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to [B, C', T]
+            ).squeeze(1)  # Squeeze back to [B, C', T']
             
-            # Resize mask to match new frequency dimension
-            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
-            
-        elif self.current_stage == 2:
-            # Downsample ground truth for mid-res stage
-            scale_factor = 1/self.config['model']['mid_res_scale']
-            freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            
-            # Reshape to [B, 1, C, T] for 2D interpolation
-            b, c, t = mel_specs.shape
-            mel_specs_4d = mel_specs.view(b, 1, c, t)
-            
-            mel_target = F.interpolate(
-                mel_specs_4d, 
-                size=(freq_dim, mel_specs.shape[2]),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Back to [B, C', T]
-            
-            # Resize mask to match new frequency dimension
-            mask = mask.unsqueeze(1).expand(-1, freq_dim, -1)  # Expand to [B, C', T]
+            # Also resize mask to match the new time dimension
+            new_mask = torch.nn.functional.interpolate(
+                mask.float().unsqueeze(1),
+                size=(target_time_dim),
+                mode='nearest'
+            ).squeeze(1).bool()
+            mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
             
         else:
             # Full resolution for final stage
             mel_target = mel_specs
-            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
+            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)
         
-        # Handle dimensionality issues
-        if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
-            mel_pred = mel_pred.squeeze(1)
-            
-        if mel_target.dim() == 3 and mel_pred.dim() == 2:
-            mel_pred = mel_pred.unsqueeze(0)
+        # Debug info
+        if batch_idx == 0:
+            print(f"Stage {self.current_stage} - Target shape after interpolation: {mel_target.shape}")
+            print(f"Stage {self.current_stage} - Mask shape: {mask.shape}")
         
         # Compute masked loss
         loss = self.loss_fn(mel_pred, mel_target)
@@ -274,13 +192,83 @@ class ProgressiveSVS(pl.LightningModule):
         
         # Visualize first sample in batch at appropriate intervals
         if batch_idx == 0 and self.current_epoch % 5 == 0:
-            # Get the actual length
-            length = lengths[0].item()
+            # Use shape from prediction for visualization
             self._log_mel_comparison(
-                mel_pred[0, :, :length].detach().cpu(), 
-                mel_target[0, :, :length].detach().cpu()
+                mel_pred[0].detach().cpu(), 
+                mel_target[0].detach().cpu()
             )
         
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        mel_specs = batch['mel_spec']
+        f0 = batch['f0']
+        phone_label = batch['phone_label']
+        phone_duration = batch['phone_duration']
+        midi_label = batch['midi_label']
+        lengths = batch['length']
+        
+        # Forward pass
+        mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        
+        # Create masks for variable length
+        max_len = mel_specs.shape[2]
+        mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
+        
+        # Print debug info occasionally
+        if batch_idx % 50 == 0:
+            print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
+            print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
+        
+        # Handle dimensionality issues (in case prediction is 4D)
+        if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
+            mel_pred = mel_pred.squeeze(1)
+        
+        # Adjust target resolution based on current stage
+        if self.current_stage <= 2:  # For both stage 1 and 2
+            # Get target dimensions directly from the prediction
+            target_freq_dim = mel_pred.shape[1]
+            target_time_dim = mel_pred.shape[2]
+            
+            # Reshape to [B, 1, C, T] for 2D interpolation
+            b, c, t = mel_specs.shape
+            mel_specs_reshaped = mel_specs.unsqueeze(1)  # [B, 1, C, T]
+            
+            # Use explicit size for interpolation to match prediction dimensions
+            mel_target = torch.nn.functional.interpolate(
+                mel_specs_reshaped,
+                size=(target_freq_dim, target_time_dim),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)  # Squeeze back to [B, C', T']
+            
+            # Also resize mask to match the new time dimension
+            new_mask = torch.nn.functional.interpolate(
+                mask.float().unsqueeze(1),
+                size=(target_time_dim),
+                mode='nearest'
+            ).squeeze(1).bool()
+            mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
+            
+        else:
+            # Full resolution for final stage
+            mel_target = mel_specs
+            mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)
+        
+        # Debug occasionally
+        if batch_idx % 50 == 0:
+            print(f"Stage {self.current_stage} - Target shape after interpolation: {mel_target.shape}")
+        
+        # Compute masked loss
+        loss = self.loss_fn(mel_pred, mel_target)
+        
+        # Apply mask to loss - only consider valid timesteps
+        loss = loss * mask.float()
+        
+        # Normalize by actual lengths
+        loss = loss.sum() / (mask.sum() + 1e-8)
+        
+        self.log('train_loss', loss, prog_bar=True)
         return loss
     
     def _log_mel_comparison(self, pred_mel, target_mel):
