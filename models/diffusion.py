@@ -121,7 +121,7 @@ class UNet(nn.Module):
         self.time_dim = time_dim
         self.context_dim = context_dim
         self.out_channels = out_channels  # Store this as an attribute
-        
+
         # Time embedding
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_dim // 4),
@@ -264,7 +264,7 @@ class UNet(nn.Module):
         
         # Initial convolution
         h = self.init_conv(x)
-        print(f"Initial h shape: {h.shape}")
+        #print(f"Initial h shape: {h.shape}")
         
         # Store skip connections
         skips = []
@@ -274,21 +274,21 @@ class UNet(nn.Module):
             if isinstance(block, ConvBlock):
                 h = block(h, t)
                 skips.append(h)  # Store output of each ConvBlock for skip connections
-                print(f"Down {i//3}, stage {i%3}, after ConvBlock: {h.shape}")
+                #print(f"Down {i//3}, stage {i%3}, after ConvBlock: {h.shape}")
             elif isinstance(block, CrossAttention) and context is not None:
                 # Reshape for cross-attention: [b,c,h,w] -> [b,h*w,c]
                 b, c, height, width = h.shape
                 h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
                 h_flat = block(h_flat, context)  # [b, h*w, c]
                 h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
-                print(f"Down {i//3}, stage {i%3}, after CrossAttention: {h.shape}")
+                #print(f"Down {i//3}, stage {i%3}, after CrossAttention: {h.shape}")
             else:
                 h = block(h)
-                print(f"Down {i//3}, stage {i%3}, after other block: {h.shape}")
+                #print(f"Down {i//3}, stage {i%3}, after other block: {h.shape}")
         
         # Middle
         h = self.mid_block1(h, t)
-        print(f"After mid_block1: {h.shape}")
+        #print(f"After mid_block1: {h.shape}")
         
         if hasattr(self, 'mid_attn') and context is not None:
             # Reshape for cross-attention
@@ -296,10 +296,10 @@ class UNet(nn.Module):
             h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
             h_flat = self.mid_attn(h_flat, context)  # [b, h*w, c]
             h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
-            print(f"After mid_attn: {h.shape}")
+            #print(f"After mid_attn: {h.shape}")
             
         h = self.mid_block2(h, t)
-        print(f"After mid_block2: {h.shape}")
+        #print(f"After mid_block2: {h.shape}")
         
         # Upsample with correct skip connection handling
         skip_idx = len(skips) - 1
@@ -307,28 +307,28 @@ class UNet(nn.Module):
             # Upsample
             h_before_up = h.shape
             h = self.ups[i](h)
-            print(f"Up {i//3}, after upsample: {h.shape} (was {h_before_up})")
+            #print(f"Up {i//3}, after upsample: {h.shape} (was {h_before_up})")
             
             # Get and apply skip connection
             if skip_idx >= 0:
                 skip = skips[skip_idx]
-                print(f"Up {i//3}, skip connection shape: {skip.shape}")
+                #print(f"Up {i//3}, skip connection shape: {skip.shape}")
                 skip_idx -= 1
                 
                 # Resize h to match skip's spatial dimensions exactly instead of the other way around
                 if h.shape[2:] != skip.shape[2:]:
                     h = F.interpolate(h, size=skip.shape[2:], mode='bilinear', align_corners=True)
-                    print(f"Up {i//3}, interpolated upsampled output to: {h.shape}")
+                    #print(f"Up {i//3}, interpolated upsampled output to: {h.shape}")
                 
                 # Concatenate along channel dimension
                 h_before_cat = h.shape
                 h = torch.cat([h, skip], dim=1)
-                print(f"Up {i//3}, after concatenation: {h.shape} (was {h_before_cat})")
+                #print(f"Up {i//3}, after concatenation: {h.shape} (was {h_before_cat})")
             
             # Apply ConvBlock after concatenation
             h_before_conv = h.shape
             h = self.ups[i+1](h, t)
-            print(f"Up {i//3}, after ConvBlock: {h.shape} (was {h_before_conv})")
+            #print(f"Up {i//3}, after ConvBlock: {h.shape} (was {h_before_conv})")
             
             # Apply CrossAttention or Identity
             if isinstance(self.ups[i+2], CrossAttention) and context is not None:
@@ -337,10 +337,10 @@ class UNet(nn.Module):
                 h_flat = h.reshape(b, c, -1).permute(0, 2, 1)  # [b, h*w, c]
                 h_flat = self.ups[i+2](h_flat, context)  # [b, h*w, c]
                 h = h_flat.permute(0, 2, 1).reshape(b, c, height, width)  # [b, c, h, w]
-                print(f"Up {i//3}, after CrossAttention: {h.shape}")
+                #print(f"Up {i//3}, after CrossAttention: {h.shape}")
             else:
                 h = self.ups[i+2](h)
-                print(f"Up {i//3}, after Identity: {h.shape}")
+                #print(f"Up {i//3}, after Identity: {h.shape}")
         
         # Final convolution
         h = self.final_conv(h)
@@ -352,7 +352,7 @@ class UNet(nn.Module):
         # Ensure output channels match the expected out_channels
         h = self.fix_output_channels(h, self.out_channels)  # Add this line
         
-        print(f"Final output shape: {h.shape}")
+        #print(f"Final output shape: {h.shape}")
         return h
 
 
