@@ -6,6 +6,8 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from pytorch_lightning.loggers import TensorBoardLogger
 import h5py
 import sys
+import torch.multiprocessing as mp
+from torch.utils.data import DataLoader
 
 # Add current directory to path if needed
 sys.path.append('.')
@@ -27,13 +29,27 @@ class H5FileManager:
         self.h5_files = {}
     
     def get_file(self, file_path):
-        if file_path not in self.h5_files:
-            self.h5_files[file_path] = h5py.File(file_path, 'r')
-        return self.h5_files[file_path]
+        # Create a process-specific identifier for the file
+        import os
+        pid = os.getpid()
+        file_key = f"{pid}_{file_path}"
+        
+        if file_key not in self.h5_files:
+            import h5py
+            self.h5_files[file_key] = h5py.File(file_path, 'r')
+        return self.h5_files[file_key]
     
     def close_all(self):
         for file in self.h5_files.values():
             file.close()
+        self.h5_files = {}
+        
+    def __getstate__(self):
+        # Return a state for pickling
+        return {'initialized': True}
+    
+    def __setstate__(self, state):
+        # Restore instance when unpickling
         self.h5_files = {}
 
 # Dataset and DataModule classes (copied from updated dataset.py)
@@ -49,74 +65,81 @@ class SVSDataset(Dataset):
         self.data_key = data_key
         self.lazy_load = lazy_load
         
-        if lazy_load:
-            h5_manager = H5FileManager.get_instance()
-            h5_file = h5_manager.get_file(h5_path)
-        else:
-            h5_file = h5py.File(h5_path, 'r')
+        # Open the file once to get metadata, then close it
+        with h5py.File(h5_path, 'r') as h5_file:
+            if data_key in h5_file:
+                self.length = len(h5_file[data_key])
+                self.data_shape = h5_file[data_key].shape[1:]
+                self.variable_length = h5_file[data_key].attrs.get('variable_length', False)
+            else:
+                raise KeyError(f"Data key '{data_key}' not found in {h5_path}")
             
-        if data_key in h5_file:
-            self.length = len(h5_file[data_key])
-            self.data_shape = h5_file[data_key].shape[1:]
-        else:
-            raise KeyError(f"Data key '{data_key}' not found in {h5_path}")
-            
-        self.variable_length = h5_file[data_key].attrs.get('variable_length', False)
-        
-        if not lazy_load:
-            self.data = h5_file[data_key][:]
-            if 'lengths' in h5_file:
-                self.lengths = h5_file['lengths'][:]
-            h5_file.close()
+            # If not using lazy loading, load all data into memory
+            if not lazy_load:
+                self.data = h5_file[data_key][:]
+                if 'lengths' in h5_file:
+                    self.lengths = h5_file['lengths'][:]
     
     def __len__(self):
         return self.length
     
     def __getitem__(self, idx):
-        h5_manager = H5FileManager.get_instance()
-        h5_file = h5_manager.get_file(self.h5_path)
-        
-        # Get mel spectrogram (target)
-        mel_spec = h5_file[self.data_key][idx]
-        mel_spec = torch.from_numpy(mel_spec).float()
-        
-        # Get actual length if variable length mode
-        if self.variable_length and 'lengths' in h5_file:
-            length = h5_file['lengths'][idx]
+        if not self.lazy_load and hasattr(self, 'data'):
+            # Use preloaded data if available
+            mel_spec = torch.from_numpy(self.data[idx]).float()
+            length = self.lengths[idx] if hasattr(self, 'lengths') else mel_spec.shape[1]
+            
+            # Need to reopen file for other attributes
+            with h5py.File(self.h5_path, 'r') as h5_file:
+                # Get other required data
+                f0 = torch.from_numpy(h5_file['f0'][idx] if 'f0' in h5_file else np.zeros(mel_spec.shape[1])).float()
+                phone_label = torch.from_numpy(h5_file['phone_label'][idx] if 'phone_label' in h5_file else np.zeros(mel_spec.shape[1], dtype=np.int64)).long()
+                phone_duration = torch.from_numpy(h5_file['phone_duration'][idx] if 'phone_duration' in h5_file else np.ones(1, dtype=np.float32)).float()
+                midi_label = torch.from_numpy(h5_file['midi_label'][idx] if 'midi_label' in h5_file else np.zeros(mel_spec.shape[1], dtype=np.int64) + 60).long()
         else:
-            length = mel_spec.shape[1]  # Assume full length if not specified
-        
-        # Get F0 contour
-        f0 = None
-        if 'f0' in h5_file:
-            f0 = h5_file['f0'][idx]
-            f0 = torch.from_numpy(f0).float()
-        else:
-            f0 = torch.zeros(mel_spec.shape[1])
-        
-        # Get phone labels
-        phone_label = None
-        if 'phone_label' in h5_file:
-            phone_label = h5_file['phone_label'][idx]
-            phone_label = torch.from_numpy(phone_label).long()
-        else:
-            phone_label = torch.zeros(mel_spec.shape[1], dtype=torch.long)
-        
-        # Get phone durations - optional
-        phone_duration = None
-        if 'phone_duration' in h5_file:
-            phone_duration = h5_file['phone_duration'][idx]
-            phone_duration = torch.from_numpy(phone_duration).float()
-        else:
-            phone_duration = torch.ones(1, dtype=torch.float)  # Default duration
-        
-        # Get MIDI labels - optional
-        midi_label = None
-        if 'midi_label' in h5_file:
-            midi_label = h5_file['midi_label'][idx]
-            midi_label = torch.from_numpy(midi_label).long()
-        else:
-            midi_label = torch.zeros(mel_spec.shape[1], dtype=torch.long) + 60  # Default to middle C
+            # Lazy loading - open file each time
+            with h5py.File(self.h5_path, 'r') as h5_file:
+                # Get mel spectrogram (target)
+                mel_spec = h5_file[self.data_key][idx]
+                mel_spec = torch.from_numpy(mel_spec).float()
+                
+                # Get actual length if variable length mode
+                if self.variable_length and 'lengths' in h5_file:
+                    length = h5_file['lengths'][idx]
+                else:
+                    length = mel_spec.shape[1]  # Assume full length if not specified
+                
+                # Get F0 contour
+                f0 = None
+                if 'f0' in h5_file:
+                    f0 = h5_file['f0'][idx]
+                    f0 = torch.from_numpy(f0).float()
+                else:
+                    f0 = torch.zeros(mel_spec.shape[1])
+                
+                # Get phone labels
+                phone_label = None
+                if 'phone_label' in h5_file:
+                    phone_label = h5_file['phone_label'][idx]
+                    phone_label = torch.from_numpy(phone_label).long()
+                else:
+                    phone_label = torch.zeros(mel_spec.shape[1], dtype=torch.long)
+                
+                # Get phone durations - optional
+                phone_duration = None
+                if 'phone_duration' in h5_file:
+                    phone_duration = h5_file['phone_duration'][idx]
+                    phone_duration = torch.from_numpy(phone_duration).float()
+                else:
+                    phone_duration = torch.ones(1, dtype=torch.float)  # Default duration
+                
+                # Get MIDI labels - optional
+                midi_label = None
+                if 'midi_label' in h5_file:
+                    midi_label = h5_file['midi_label'][idx]
+                    midi_label = torch.from_numpy(midi_label).long()
+                else:
+                    midi_label = torch.zeros(mel_spec.shape[1], dtype=torch.long) + 60  # Default to middle C
         
         return {
             'mel_spec': mel_spec,
@@ -171,7 +194,8 @@ class SVSDataModule(pl.LightningDataModule):
             generator=generator
         )
     
-    def collate_fn(self, batch):
+    @staticmethod
+    def collate_fn(batch):
         # Handle variable length sequences
         batch_size = len(batch)
         
@@ -231,7 +255,7 @@ class SVSDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=True,
             collate_fn=self.collate_fn,
-            persistent_workers=True
+            persistent_workers=True if self.num_workers > 0 else False
         )
         
     def val_dataloader(self):
@@ -242,7 +266,7 @@ class SVSDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=self.collate_fn,
-            persistent_workers=True
+            persistent_workers=True if self.num_workers > 0 else False
         )
         
     def teardown(self, stage=None):
@@ -283,6 +307,61 @@ def check_dataset(h5_path, variable_length=True):
         
     return True
 
+def worker_init_fn(worker_id):
+    """
+    Initialize each worker process properly.
+    This function runs in each worker process when it starts.
+    """
+    # Initialize worker seed for reproducibility
+    import numpy as np
+    import random
+    import torch
+    
+    # Calculate a seed based on the worker_id
+    base_seed = 42
+    worker_seed = base_seed + worker_id
+    
+    # Set random seeds for reproducibility in this worker
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+    
+    # Ensure file handles in this worker are separate
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        # Reset any global state in the worker
+        dataset = worker_info.dataset
+        
+        # If dataset has an h5 file handle, make sure it's closed and reset
+        if hasattr(dataset, '_h5_file') and dataset._h5_file is not None:
+            try:
+                dataset._h5_file.close()
+            except:
+                pass
+            finally:
+                dataset._h5_file = None
+
+# 3. Add the multiprocessing fix function:
+def fix_multiprocessing():
+    """
+    Set up proper multiprocessing support for DataLoader to work with persistent_workers=True
+    """
+    # Set multiprocessing start method to 'spawn' for better Windows compatibility
+    try:
+        if mp.get_start_method(allow_none=True) != 'spawn':
+            mp.set_start_method('spawn', force=True)
+            print("Set multiprocessing start method to 'spawn' for better compatibility")
+    except RuntimeError:
+        print("Could not set multiprocessing start method to 'spawn'")
+    
+    # Set proper sharing strategy for CUDA tensors
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
+    # Disable the use of pinned memory on Windows as it can cause issues
+    import platform
+    if platform.system() == 'Windows':
+        print("Windows detected, but keeping pinned memory as requested")
+
 def main():
     parser = argparse.ArgumentParser(description='Train Progressive SVS Model')
     parser.add_argument('--config', type=str, default='config/model.yaml', help='Path to configuration file')
@@ -298,6 +377,8 @@ def main():
     
     config = load_config(args.config)
     
+    fix_multiprocessing()
+
     # Override current stage if specified
     if args.stage:
         config['model']['current_stage'] = args.stage
