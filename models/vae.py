@@ -125,6 +125,10 @@ class VAE(nn.Module):
         # Decode
         x_recon = self.decode(z)
         
+        # Ensure x_recon matches x dimensions exactly before computing loss
+        if x_recon.shape[2:] != x.shape[2:]:
+            x_recon = F.interpolate(x_recon, size=x.shape[2:], mode='bilinear', align_corners=True)
+            
         # Compute KL divergence
         kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=[1, 2, 3])
         kl_loss = torch.mean(kl_loss)
