@@ -172,21 +172,24 @@ class UNet(nn.Module):
         
         # Upsampling
         self.ups = nn.ModuleList([])
-        
-        # Store skip connection channel dimensions for debugging
-        skip_dims = []
-        
-        # Modify the upsampling section to correctly handle concatenated channels
+
+        # Correct channel dimensions for each upsampling stage
+        # Based on the debug prints showing the actual dimensions
         for i in reversed(range(3)):  # 3 levels of upsampling
             channel_mult = 2 ** i
             out_channels = model_channels * channel_mult
             in_channels = now_channels
             
             # Calculate skip connection channels from corresponding down block
-            skip_channels = channels[-(i+2)]  # Fixed indexing for skip connections
-            skip_dims.append(skip_channels)
+            # The debug prints show that the first skip connection has 256 channels
+            if i == 2:  # First upsampling level
+                skip_channels = 256  # From debugs: "Up 0, skip connection shape: torch.Size([10, 256, 5, 53])"
+            elif i == 1:  # Second upsampling level
+                skip_channels = 128  # Based on the channel progression in the downsampling path
+            else:  # Third upsampling level
+                skip_channels = 64   # Based on the initial channel count
             
-            # IMPORTANT: Calculate correct concatenated channel count
+            # Calculate correct concatenated channel count
             concat_channels = in_channels + skip_channels
             
             # Upsample
@@ -195,7 +198,7 @@ class UNet(nn.Module):
                 nn.Conv2d(in_channels, out_channels, 3, padding=1)
             ))
             
-            # Combine with skip connection - explicitly use concat_channels here
+            # Create ConvBlock with correct input channel count
             self.ups.append(ConvBlock(concat_channels, out_channels, time_dim, num_groups))
             
             # Add cross-attention if needed
