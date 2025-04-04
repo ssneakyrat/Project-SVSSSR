@@ -224,8 +224,8 @@ def save_to_h5(output_path, file_data, phone_map, config, data_key='mel_spectrog
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    mel_bins = config['model'].get('mel_bins', 80)
-    time_frames = config['model'].get('time_frames', 432)  # Default ~5 seconds at 22050Hz/256 hop
+    mel_bins = config['audio'].get('n_mels', 80)
+    time_frames = config['model'].get('max_frames', 432)  # Default ~5 seconds at 22050Hz/256 hop
     
     # Count valid items
     valid_items = sum(1 for file_info in file_data.values() 
@@ -284,6 +284,14 @@ def save_to_h5(output_path, file_data, phone_map, config, data_key='mel_spectrog
         mel_dataset.attrs['hop_length'] = config['audio']['hop_length']
         mel_dataset.attrs['n_mels'] = config['audio']['n_mels']
         
+        # Helper function to pad or truncate arrays
+        def pad_or_truncate(arr, target_length):
+            if len(arr) > target_length:
+                return arr[:target_length]  # Truncate
+            elif len(arr) < target_length:
+                return np.pad(arr, (0, target_length - len(arr)), mode='constant')  # Pad with zeros
+            return arr
+        
         # Store data
         idx = 0
         with tqdm(total=len(file_data), desc="Saving to H5", unit="file") as pbar:
@@ -301,12 +309,37 @@ def save_to_h5(output_path, file_data, phone_map, config, data_key='mel_spectrog
                         padded[:, :mel_spec.shape[1]] = mel_spec
                         mel_spec = padded
                     
-                    # Store data
+                    # Store data with padding/truncation to ensure correct dimensions
                     mel_dataset[idx] = mel_spec
-                    f0_dataset[idx] = file_info['F0'][:time_frames] if 'F0' in file_info else np.zeros(time_frames)
-                    phone_dataset[idx] = file_info['PHONE_IDS'][:time_frames] if 'PHONE_IDS' in file_info else np.zeros(time_frames)
-                    duration_dataset[idx] = file_info['DURATIONS'][:time_frames] if 'DURATIONS' in file_info else np.zeros(time_frames)
-                    midi_dataset[idx] = file_info['MIDI'][:time_frames] if 'MIDI' in file_info else np.zeros(time_frames)
+                    
+                    # Process and store F0
+                    if 'F0' in file_info:
+                        f0 = pad_or_truncate(file_info['F0'], time_frames)
+                    else:
+                        f0 = np.zeros(time_frames)
+                    f0_dataset[idx] = f0
+                    
+                    # Process and store phone IDs
+                    if 'PHONE_IDS' in file_info:
+                        phone_ids = pad_or_truncate(file_info['PHONE_IDS'], time_frames)
+                    else:
+                        phone_ids = np.zeros(time_frames, dtype=np.int32)
+                    phone_dataset[idx] = phone_ids
+                    
+                    # Process and store durations
+                    if 'DURATIONS' in file_info:
+                        durations = pad_or_truncate(file_info['DURATIONS'], time_frames)
+                    else:
+                        durations = np.zeros(time_frames)
+                    duration_dataset[idx] = durations
+                    
+                    # Process and store MIDI values
+                    if 'MIDI' in file_info:
+                        midi_values = pad_or_truncate(file_info['MIDI'], time_frames)
+                    else:
+                        midi_values = np.zeros(time_frames, dtype=np.int32)
+                    midi_dataset[idx] = midi_values
+                    
                     file_ids[idx] = file_id
                     
                     idx += 1
