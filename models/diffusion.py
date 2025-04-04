@@ -120,6 +120,7 @@ class UNet(nn.Module):
         
         self.time_dim = time_dim
         self.context_dim = context_dim
+        self.out_channels = out_channels  # Store this as an attribute
         
         # Time embedding
         self.time_mlp = nn.Sequential(
@@ -220,6 +221,28 @@ class UNet(nn.Module):
         # Add interpolation layer to ensure output matches input dimensions
         self.output_interpolate = True
     
+    def fix_output_channels(self, x, out_channels):
+        """
+        Ensure the output tensor has the correct number of channels
+        
+        Args:
+            x: Input tensor [batch, in_channels, height, width]
+            out_channels: Target number of output channels
+            
+        Returns:
+            Tensor with corrected number of channels [batch, out_channels, height, width]
+        """
+        if x.shape[1] == out_channels:
+            return x
+            
+        # If we have too many channels, slice to the desired number
+        if x.shape[1] > out_channels:
+            return x[:, :out_channels, :, :]
+            
+        # If we have too few channels, use a 1x1 conv to project to the desired number
+        projection = nn.Conv2d(x.shape[1], out_channels, kernel_size=1).to(x.device)
+        return projection(x)
+
     def forward(self, x, t, context=None):
         """
         Forward pass through UNet with debug prints
@@ -321,11 +344,13 @@ class UNet(nn.Module):
         
         # Final convolution
         h = self.final_conv(h)
-        
+    
         # Ensure output dimensions match input dimensions
         if self.output_interpolate and h.shape[2:] != original_shape[2:]:
             h = F.interpolate(h, size=original_shape[2:], mode='bilinear', align_corners=True)
-            print(f"Interpolated final output to match input shape: {h.shape}")
+        
+        # Ensure output channels match the expected out_channels
+        h = self.fix_output_channels(h, self.out_channels)  # Add this line
         
         print(f"Final output shape: {h.shape}")
         return h
@@ -433,8 +458,18 @@ class DiffusionModel(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         predicted_noise = self.model(x_noisy, t, context)
         
-        # Ensure predicted_noise matches the shape of the original noise exactly
-        if predicted_noise.shape != noise.shape:
+        # Handle channel dimension mismatch
+        if predicted_noise.shape[1] != noise.shape[1]:
+            # If predicted has more channels than noise, truncate to match
+            if predicted_noise.shape[1] > noise.shape[1]:
+                predicted_noise = predicted_noise[:, :noise.shape[1], :, :]
+            # If predicted has fewer channels than noise, replicate to match
+            else:
+                repeats = math.ceil(noise.shape[1] / predicted_noise.shape[1])
+                predicted_noise = predicted_noise.repeat(1, repeats, 1, 1)[:, :noise.shape[1], :, :]
+        
+        # Ensure spatial dimensions match
+        if predicted_noise.shape[2:] != noise.shape[2:]:
             predicted_noise = F.interpolate(
                 predicted_noise, 
                 size=noise.shape[2:], 
