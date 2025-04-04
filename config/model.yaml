@@ -1,9 +1,9 @@
 data:
-  bin_dir: datasets/gin
+  bin_dir: datasets
   bin_file: mel_spectrograms.h5
   data_key: mel_spectrograms
   lazy_load: true
-  raw_dir: datasets/raw
+  raw_dir: datasets/gin
   max_samples: 100
   variable_length: true
   

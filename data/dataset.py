@@ -1,150 +1,124 @@
-import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-import pytorch_lightning as pl
-import h5py
+import yaml
 import numpy as np
-import math
+import librosa
+import os
+import torch
 
-class H5FileManager:
-    _instance = None
-    
-    @staticmethod
-    def get_instance():
-        if H5FileManager._instance is None:
-            H5FileManager._instance = H5FileManager()
-        return H5FileManager._instance
-    
-    def __init__(self):
-        self.h5_files = {}
-    
-    def get_file(self, file_path):
-        if file_path not in self.h5_files:
-            self.h5_files[file_path] = h5py.File(file_path, 'r')
-        return self.h5_files[file_path]
-    
-    def close_all(self):
-        for file in self.h5_files.values():
-            file.close()
-        self.h5_files = {}
+def load_config(config_path="config/model.yaml"):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
 
-class SVSDataset(Dataset):
-    def __init__(self, h5_path, data_key='mel_spectrograms', lazy_load=True):
-        self.h5_path = h5_path
-        self.data_key = data_key
-        self.lazy_load = lazy_load
-        
-        if lazy_load:
-            h5_manager = H5FileManager.get_instance()
-            h5_file = h5_manager.get_file(h5_path)
+def extract_mel_spectrogram(wav_path, config):
+    y, sr = librosa.load(wav_path, sr=config['audio']['sample_rate'])
+    
+    max_audio_length = config['audio'].get('max_audio_length', 10.0)
+    max_samples = int(max_audio_length * sr)
+    
+    if len(y) > max_samples:
+        y = y[:max_samples]
+    
+    mel_spec = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=config['audio']['n_fft'],
+        hop_length=config['audio']['hop_length'],
+        win_length=config['audio']['win_length'],
+        n_mels=config['audio']['n_mels'],
+        fmin=config['audio']['fmin'],
+        fmax=config['audio']['fmax'],
+    )
+    
+    mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    return mel_spec
+
+def extract_mel_spectrogram_variable_length(wav_path, config):
+    y, sr = librosa.load(wav_path, sr=config['audio']['sample_rate'])
+    
+    max_audio_length = config['audio'].get('max_audio_length', 10.0)
+    max_samples = int(max_audio_length * sr)
+    
+    if len(y) > max_samples:
+        y = y[:max_samples]
+    
+    mel_spec = librosa.feature.melspectrogram(
+        y=y,
+        sr=sr,
+        n_fft=config['audio']['n_fft'],
+        hop_length=config['audio']['hop_length'],
+        win_length=config['audio'].get('win_length', config['audio']['n_fft']),
+        n_mels=config['audio']['n_mels'],
+        fmin=config['audio']['fmin'],
+        fmax=config['audio']['fmax'],
+    )
+    
+    mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    return mel_spec
+
+def extract_f0(wav_path, config):
+    y, sr = librosa.load(wav_path, sr=config['audio']['sample_rate'])
+    
+    max_audio_length = config['audio'].get('max_audio_length', 10.0)
+    max_samples = int(max_audio_length * sr)
+    
+    if len(y) > max_samples:
+        y = y[:max_samples]
+    
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y,
+        fmin=config['audio'].get('f0_min', 50),
+        fmax=config['audio'].get('f0_max', 600),
+        sr=sr,
+        hop_length=config['audio']['hop_length']
+    )
+    
+    f0 = np.nan_to_num(f0)
+    return f0
+
+def normalize_mel_spectrogram(mel_spec):
+    mel_spec = np.clip(mel_spec, -80.0, 0.0)
+    mel_spec = (mel_spec + 80.0) / 80.0
+    return mel_spec
+
+def denormalize_mel_spectrogram(mel_spec):
+    mel_spec = mel_spec * 80.0 - 80.0
+    return mel_spec
+
+def pad_or_truncate_mel(mel_spec, target_shape):
+    mel_bins, time_frames = target_shape
+    current_bins, current_frames = mel_spec.shape
+    
+    if current_bins == mel_bins and current_frames == time_frames:
+        return mel_spec
+    
+    padded_mel = np.zeros(target_shape, dtype=np.float32)
+    
+    bins_to_copy = min(current_bins, mel_bins)
+    frames_to_copy = min(current_frames, time_frames)
+    
+    padded_mel[:bins_to_copy, :frames_to_copy] = mel_spec[:bins_to_copy, :frames_to_copy]
+    
+    return padded_mel
+
+def expand_phone_seq_to_frames(phone_seq, durations, total_frames):
+    frame_level_phones = []
+    for phone, dur in zip(phone_seq, durations):
+        frame_level_phones.extend([phone] * dur)
+    
+    if len(frame_level_phones) > total_frames:
+        frame_level_phones = frame_level_phones[:total_frames]
+    elif len(frame_level_phones) < total_frames:
+        if frame_level_phones:
+            frame_level_phones.extend([frame_level_phones[-1]] * (total_frames - len(frame_level_phones)))
         else:
-            h5_file = h5py.File(h5_path, 'r')
-            
-        if data_key in h5_file:
-            self.length = len(h5_file[data_key])
-            self.data_shape = h5_file[data_key].shape[1:]
-        else:
-            raise KeyError(f"Data key '{data_key}' not found in {h5_path}")
-            
-        if not lazy_load:
-            self.data = h5_file[data_key][:]
-            h5_file.close()
-    
-    def __len__(self):
-        return self.length
-    
-    def __getitem__(self, idx):
-        h5_manager = H5FileManager.get_instance()
-        h5_file = h5_manager.get_file(self.h5_path)
+            frame_level_phones = [0] * total_frames
         
-        # Get mel spectrogram (target)
-        mel_spec = h5_file[self.data_key][idx]
-        mel_spec = torch.from_numpy(mel_spec).float()
-        
-        # Get F0 contour
-        f0 = h5_file['f0'][idx]
-        f0 = torch.from_numpy(f0).float()
-        
-        # Get phone info
-        phone_label = h5_file['phone_label'][idx]
-        phone_duration = h5_file['phone_duration'][idx]
-        phone_label = torch.from_numpy(phone_label).long()
-        phone_duration = torch.from_numpy(phone_duration).float()
-        
-        # Get MIDI info
-        midi_label = h5_file['midi_label'][idx]
-        midi_label = torch.from_numpy(midi_label).long()
-        
-        return {
-            'mel_spec': mel_spec,
-            'f0': f0,
-            'phone_label': phone_label,
-            'phone_duration': phone_duration,
-            'midi_label': midi_label
-        }
+    return np.array(frame_level_phones)
 
-class SVSDataModule(pl.LightningDataModule):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.batch_size = config['train']['batch_size']
-        self.num_workers = config['train'].get('num_workers', 4)
-        self.pin_memory = config['train'].get('pin_memory', True)
-        self.validation_split = config['train'].get('validation_split', 0.1)
-        
-        self.h5_path = f"{config['data']['bin_dir']}/{config['data']['bin_file']}"
-        self.data_key = config['data'].get('data_key', 'mel_spectrograms')
-        self.lazy_load = config['data'].get('lazy_load', True)
-        self.max_samples = config['data'].get('max_samples', None)
-        
-    def setup(self, stage=None):
-        self.dataset = SVSDataset(
-            h5_path=self.h5_path,
-            data_key=self.data_key,
-            lazy_load=self.lazy_load
-        )
-        
-        full_dataset_size = len(self.dataset)
-        subset_size = full_dataset_size
-        
-        if self.max_samples and self.max_samples > 0:
-            subset_size = min(self.max_samples, full_dataset_size)
-            
-        if subset_size < full_dataset_size:
-            generator = torch.Generator().manual_seed(42)
-            indices = torch.randperm(full_dataset_size, generator=generator)[:subset_size].tolist()
-            self.dataset = torch.utils.data.Subset(self.dataset, indices)
-        
-        dataset_size = len(self.dataset)
-        val_size = int(dataset_size * self.validation_split)
-        train_size = dataset_size - val_size
-        
-        generator = torch.Generator().manual_seed(42)
-        
-        self.train_dataset, self.val_dataset = random_split(
-            self.dataset, 
-            [train_size, val_size],
-            generator=generator
-        )
+def prepare_model_inputs(f0, phone_labels, phone_durations, midi_labels, device):
+    f0 = torch.from_numpy(f0).float().to(device).unsqueeze(0)
+    phone_labels = torch.from_numpy(phone_labels).long().to(device).unsqueeze(0)
+    phone_durations = torch.from_numpy(phone_durations).float().to(device).unsqueeze(0)
+    midi_labels = torch.from_numpy(midi_labels).long().to(device).unsqueeze(0)
     
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=True
-        )
-        
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory
-        )
-        
-    def teardown(self, stage=None):
-        if stage == 'fit' or stage is None:
-            H5FileManager.get_instance().close_all()
+    return f0, phone_labels, phone_durations, midi_labels

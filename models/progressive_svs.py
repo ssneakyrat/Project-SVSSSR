@@ -87,7 +87,7 @@ class ProgressiveSVS(pl.LightningModule):
         )
         
         # Loss function
-        self.loss_fn = nn.L1Loss()
+        self.loss_fn = nn.L1Loss(reduction='none')
         
     def forward(self, f0, phone_label, phone_duration, midi_label):
         # Encode input features
@@ -116,36 +116,55 @@ class ProgressiveSVS(pl.LightningModule):
         phone_label = batch['phone_label']
         phone_duration = batch['phone_duration']
         midi_label = batch['midi_label']
+        lengths = batch['length']
         
         # Forward pass
         mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        
+        # Create masks for variable length
+        max_len = mel_specs.shape[2]
+        mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
+        mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
         
         # Adjust target resolution based on current stage
         if self.current_stage == 1:
             # Downsample ground truth for low-res stage
             scale_factor = 1/self.config['model']['low_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            time_dim = int(self.config['model']['time_frames'] * scale_factor)
             
+            # Downsample keeping original time dimension
             mel_target = F.interpolate(
-                mel_specs.unsqueeze(1), 
-                size=(freq_dim, time_dim),
+                mel_specs, 
+                size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)
+            )
+            
+            # Downsample mask as well
+            mask = F.interpolate(
+                mask.float(), 
+                size=(freq_dim, mask.shape[2]),
+                mode='nearest'
+            ).bool()
             
         elif self.current_stage == 2:
             # Downsample ground truth for mid-res stage
             scale_factor = 1/self.config['model']['mid_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            time_dim = int(self.config['model']['time_frames'] * scale_factor)
             
             mel_target = F.interpolate(
-                mel_specs.unsqueeze(1), 
-                size=(freq_dim, time_dim),
+                mel_specs, 
+                size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)
+            )
+            
+            # Downsample mask as well
+            mask = F.interpolate(
+                mask.float(), 
+                size=(freq_dim, mask.shape[2]),
+                mode='nearest'
+            ).bool()
             
         else:
             # Full resolution for final stage
@@ -157,9 +176,15 @@ class ProgressiveSVS(pl.LightningModule):
             
         if mel_target.dim() == 3 and mel_pred.dim() == 2:
             mel_pred = mel_pred.unsqueeze(0)
-            
-        # Compute loss
+        
+        # Compute masked loss
         loss = self.loss_fn(mel_pred, mel_target)
+        
+        # Apply mask to loss - only consider valid timesteps
+        loss = loss * mask.float()
+        
+        # Normalize by actual lengths
+        loss = loss.sum() / (mask.sum() + 1e-8)
         
         self.log('train_loss', loss, prog_bar=True)
         return loss
@@ -170,36 +195,54 @@ class ProgressiveSVS(pl.LightningModule):
         phone_label = batch['phone_label']
         phone_duration = batch['phone_duration']
         midi_label = batch['midi_label']
+        lengths = batch['length']
         
         # Forward pass
         mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        
+        # Create masks for variable length
+        max_len = mel_specs.shape[2]
+        mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
+        mask = mask.unsqueeze(1).expand(-1, mel_specs.shape[1], -1)  # Expand to [B, C, T]
         
         # Adjust target resolution based on current stage
         if self.current_stage == 1:
             # Downsample ground truth for low-res stage
             scale_factor = 1/self.config['model']['low_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            time_dim = int(self.config['model']['time_frames'] * scale_factor)
             
             mel_target = F.interpolate(
-                mel_specs.unsqueeze(1), 
-                size=(freq_dim, time_dim),
+                mel_specs, 
+                size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)
+            )
+            
+            # Downsample mask as well
+            mask = F.interpolate(
+                mask.float(), 
+                size=(freq_dim, mask.shape[2]),
+                mode='nearest'
+            ).bool()
             
         elif self.current_stage == 2:
             # Downsample ground truth for mid-res stage
             scale_factor = 1/self.config['model']['mid_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-            time_dim = int(self.config['model']['time_frames'] * scale_factor)
             
             mel_target = F.interpolate(
-                mel_specs.unsqueeze(1), 
-                size=(freq_dim, time_dim),
+                mel_specs, 
+                size=(freq_dim, mel_specs.shape[2]),
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)
+            )
+            
+            # Downsample mask as well
+            mask = F.interpolate(
+                mask.float(), 
+                size=(freq_dim, mask.shape[2]),
+                mode='nearest'
+            ).bool()
             
         else:
             # Full resolution for final stage
@@ -212,14 +255,25 @@ class ProgressiveSVS(pl.LightningModule):
         if mel_target.dim() == 3 and mel_pred.dim() == 2:
             mel_pred = mel_pred.unsqueeze(0)
         
-        # Compute loss
+        # Compute masked loss
         loss = self.loss_fn(mel_pred, mel_target)
+        
+        # Apply mask to loss - only consider valid timesteps
+        loss = loss * mask.float()
+        
+        # Normalize by actual lengths
+        loss = loss.sum() / (mask.sum() + 1e-8)
         
         self.log('val_loss', loss, prog_bar=True)
         
         # Visualize first sample in batch at appropriate intervals
         if batch_idx == 0 and self.current_epoch % 5 == 0:
-            self._log_mel_comparison(mel_pred[0].detach().cpu(), mel_target[0].detach().cpu())
+            # Get the actual length
+            length = lengths[0].item()
+            self._log_mel_comparison(
+                mel_pred[0, :, :length].detach().cpu(), 
+                mel_target[0, :, :length].detach().cpu()
+            )
         
         return loss
     
