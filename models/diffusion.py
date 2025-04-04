@@ -194,7 +194,7 @@ class UNet(nn.Module):
             
             # Upsample
             self.ups.append(nn.Sequential(
-                nn.Upsample(scale_factor=2, mode='nearest'),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 nn.Conv2d(in_channels, out_channels, 3, padding=1)
             ))
             
@@ -216,6 +216,9 @@ class UNet(nn.Module):
             nn.SiLU(),
             nn.Conv2d(now_channels, out_channels, 3, padding=1)
         )
+        
+        # Add interpolation layer to ensure output matches input dimensions
+        self.output_interpolate = True
     
     def forward(self, x, t, context=None):
         """
@@ -229,6 +232,9 @@ class UNet(nn.Module):
         Returns:
             Output tensor [batch, out_channels, height, width]
         """
+        # Store original dimensions for final resize
+        original_shape = x.shape
+
         # Time embedding
         t = t.to(torch.float32)
         t = self.time_mlp(t)
@@ -286,10 +292,10 @@ class UNet(nn.Module):
                 print(f"Up {i//3}, skip connection shape: {skip.shape}")
                 skip_idx -= 1
                 
-                # Ensure spatial dimensions match for concatenation
+                # Resize h to match skip's spatial dimensions exactly instead of the other way around
                 if h.shape[2:] != skip.shape[2:]:
-                    skip = F.interpolate(skip, size=h.shape[2:], mode='bilinear', align_corners=False)
-                    print(f"Up {i//3}, interpolated skip shape: {skip.shape}")
+                    h = F.interpolate(h, size=skip.shape[2:], mode='bilinear', align_corners=True)
+                    print(f"Up {i//3}, interpolated upsampled output to: {h.shape}")
                 
                 # Concatenate along channel dimension
                 h_before_cat = h.shape
@@ -313,10 +319,16 @@ class UNet(nn.Module):
                 h = self.ups[i+2](h)
                 print(f"Up {i//3}, after Identity: {h.shape}")
         
-        # Final
-        h_final = self.final_conv(h)
-        print(f"Final output shape: {h_final.shape}")
-        return h_final
+        # Final convolution
+        h = self.final_conv(h)
+        
+        # Ensure output dimensions match input dimensions
+        if self.output_interpolate and h.shape[2:] != original_shape[2:]:
+            h = F.interpolate(h, size=original_shape[2:], mode='bilinear', align_corners=True)
+            print(f"Interpolated final output to match input shape: {h.shape}")
+        
+        print(f"Final output shape: {h.shape}")
+        return h
 
 
 class DiffusionModel(nn.Module):
@@ -421,6 +433,15 @@ class DiffusionModel(nn.Module):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         predicted_noise = self.model(x_noisy, t, context)
         
+        # Ensure predicted_noise matches the shape of the original noise exactly
+        if predicted_noise.shape != noise.shape:
+            predicted_noise = F.interpolate(
+                predicted_noise, 
+                size=noise.shape[2:], 
+                mode='bilinear', 
+                align_corners=True
+            )
+            
         loss = F.mse_loss(predicted_noise, noise)
         return loss
     
@@ -437,6 +458,15 @@ class DiffusionModel(nn.Module):
             Sample at timestep t-1 [batch, channels, height, width]
         """
         model_output = self.model(x, t, context)
+        
+        # Ensure model_output has the same shape as x
+        if model_output.shape != x.shape:
+            model_output = F.interpolate(
+                model_output, 
+                size=x.shape[2:], 
+                mode='bilinear', 
+                align_corners=True
+            )
         
         # Get posterior parameters
         posterior_variance = self._extract_into_tensor(self.posterior_variance, t, x.shape)
