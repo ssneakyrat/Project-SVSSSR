@@ -115,6 +115,47 @@ class ProgressiveSVS(pl.LightningModule):
         # Loss function
         self.loss_fn = nn.L1Loss(reduction='none')
         
+        # Spectral loss weight - applied for Stage 2
+        self.spectral_loss_weight = 1.0 # Increased weight for spectral loss
+        
+    def _spectral_convergence_loss(self, pred, target):
+        """Spectral convergence loss for better frequency domain matching"""
+        # Get magnitudes of frequency components
+        if pred.dim() > 2:
+            # For batched data, iterate through batch dimension
+            batch_size = pred.size(0)
+            loss = 0.0
+            for i in range(batch_size):
+                # Handle both 3D [B, F, T] and 4D [B, 1, F, T] tensors
+                if pred.dim() == 4:
+                    p = pred[i, 0]  # [F, T]
+                    t = target[i, 0]  # [F, T]
+                else:
+                    p = pred[i]  # [F, T]
+                    t = target[i]  # [F, T]
+                
+                # Compute FFT along time dimension
+                # Cast to float32 before FFT to avoid cuFFT half-precision limitation
+                p_mag = torch.abs(torch.fft.rfft(p.float(), dim=1))
+                t_mag = torch.abs(torch.fft.rfft(t.float(), dim=1))
+                
+                # Compute error and magnitude
+                error = torch.norm(t_mag - p_mag, p="fro")
+                magnitude = torch.norm(t_mag, p="fro")
+                
+                loss += error / (magnitude + 1e-8)
+            
+            return loss / batch_size
+        else:
+            # Simple case: single spectrogram
+            pred_mag = torch.abs(torch.fft.rfft(pred, dim=1))
+            target_mag = torch.abs(torch.fft.rfft(target, dim=1))
+            
+            error = torch.norm(target_mag - pred_mag, p="fro")
+            magnitude = torch.norm(target_mag, p="fro")
+            
+            return error / (magnitude + 1e-8)
+        
     def _apply_length_mask(self, mel_output, lengths):
         """Apply length mask to generated output"""
         batch_size = mel_output.size(0)
@@ -252,11 +293,6 @@ class ProgressiveSVS(pl.LightningModule):
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
             mel_pred = mel_pred.squeeze(1)
         
-        # Apply mask based on dimensions
-        # Note: The specific interpolation for stage 1 prediction is removed
-        # as it's now handled by the generic resizing below if needed.
-        # The mask expansion is also moved below after resizing.
-
         # Ensure pred and target have the same length (target_seq_len) before loss
         current_len_pred = mel_pred.shape[-1]
         current_len_target = mel_target.shape[-1]
@@ -271,16 +307,29 @@ class ProgressiveSVS(pl.LightningModule):
         if mask.shape[-1] != target_seq_len:
              mask = self._resize_mask(mask, target_seq_len) # Use existing resize function - mask is still [B, T]
 
-        # Calculate loss
-        loss = self.loss_fn(mel_pred, mel_target) # Shape [B, C, T]
+        # Calculate L1 loss
+        l1_loss = self.loss_fn(mel_pred, mel_target) # Shape [B, C, T]
 
         # Expand mask to match loss shape [B, C, T] before multiplication
-        if loss.dim() == 3 and mask.dim() == 2:
-             mask = mask.unsqueeze(1).expand_as(loss) # Expand to [B, C, T]
+        if l1_loss.dim() == 3 and mask.dim() == 2:
+             mask = mask.unsqueeze(1).expand_as(l1_loss) # Expand to [B, C, T]
 
         # Apply mask
-        loss = loss * mask.float()
-        loss = loss.sum() / (mask.sum() + 1e-8)
+        l1_loss = l1_loss * mask.float()
+        l1_loss = l1_loss.sum() / (mask.sum() + 1e-8)
+        
+        # Add spectral loss for Stage 2
+        if self.current_stage == 2:
+            # Calculate spectral convergence loss
+            spec_loss = self._spectral_convergence_loss(mel_pred, mel_target)
+            # Combine losses
+            loss = l1_loss + self.spectral_loss_weight * spec_loss
+            # Log both components
+            self.log('train_l1_loss', l1_loss, prog_bar=True)
+            self.log('train_spec_loss', spec_loss, prog_bar=True)
+        else:
+            # For Stage 1 and 3, just use L1 loss
+            loss = l1_loss
         
         self.log('train_loss', loss, prog_bar=True)
         
@@ -319,11 +368,6 @@ class ProgressiveSVS(pl.LightningModule):
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
             mel_pred = mel_pred.squeeze(1)
             
-        # Apply mask based on dimensions
-        # Note: The specific interpolation for stage 1 prediction is removed
-        # as it's now handled by the generic resizing below if needed.
-        # The mask expansion is also moved below after resizing.
-            
         # Ensure pred and target have the same length (target_seq_len) before loss
         current_len_pred = mel_pred.shape[-1]
         current_len_target = mel_target.shape[-1]
@@ -336,18 +380,31 @@ class ProgressiveSVS(pl.LightningModule):
 
         # Resize mask if needed after target interpolation
         if mask.shape[-1] != target_seq_len:
-             mask = self._resize_mask(mask, target_seq_len) # Use existing resize function - mask is still [B, T]
+             mask = self._resize_mask(mask, target_seq_len)
 
-        # Calculate loss
-        loss = self.loss_fn(mel_pred, mel_target) # Shape [B, C, T]
+        # Calculate L1 loss
+        l1_loss = self.loss_fn(mel_pred, mel_target)
 
         # Expand mask to match loss shape [B, C, T] before multiplication
-        if loss.dim() == 3 and mask.dim() == 2:
-             mask = mask.unsqueeze(1).expand_as(loss) # Expand to [B, C, T]
+        if l1_loss.dim() == 3 and mask.dim() == 2:
+             mask = mask.unsqueeze(1).expand_as(l1_loss)
 
         # Apply mask
-        loss = loss * mask.float()
-        loss = loss.sum() / (mask.sum() + 1e-8)
+        l1_loss = l1_loss * mask.float()
+        l1_loss = l1_loss.sum() / (mask.sum() + 1e-8)
+        
+        # Add spectral loss for Stage 2
+        if self.current_stage == 2:
+            # Calculate spectral convergence loss
+            spec_loss = self._spectral_convergence_loss(mel_pred, mel_target)
+            # Combine losses
+            loss = l1_loss + self.spectral_loss_weight * spec_loss
+            # Log both components
+            self.log('val_l1_loss', l1_loss, prog_bar=True)
+            self.log('val_spec_loss', spec_loss, prog_bar=True)
+        else:
+            # For Stage 1 and 3, just use L1 loss
+            loss = l1_loss
         
         self.log('val_loss', loss, prog_bar=True)
         
@@ -403,9 +460,9 @@ class ProgressiveSVS(pl.LightningModule):
         if self.current_stage == 1:
             lr = base_lr
         elif self.current_stage == 2:
-            lr = base_lr * 0.5  # Half the learning rate
+            lr = base_lr  # Already adjusted in train.py
         else:
-            lr = base_lr * 0.1  # 1/10th the learning rate
+            lr = base_lr  # Already adjusted in train.py
         
         # Handle freezing earlier stages
         if self.current_stage > 1 and self.config['train'].get('freeze_earlier_stages', False):

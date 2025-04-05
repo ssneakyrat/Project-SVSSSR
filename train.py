@@ -87,7 +87,8 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate from config')
     parser.add_argument('--disable_early_stopping', action='store_true', help='Disable early stopping')
     parser.add_argument('--freeze_earlier_stages', action='store_true', help='Freeze earlier stages when training in Stage 2 or 3')
-    parser.add_argument('--use_warmup', action='store_true', help='Use learning rate warmup for Stage 3')
+    parser.add_argument('--no_freeze', action='store_true', help='Ensure earlier stages are not frozen (overrides freeze_earlier_stages)')
+    parser.add_argument('--use_warmup', action='store_true', help='Use learning rate warmup')
     args = parser.parse_args()
     
     pl.seed_everything(args.seed)
@@ -106,7 +107,11 @@ def main():
     if args.learning_rate:
         config['train']['learning_rate'] = args.learning_rate
         
-    if args.freeze_earlier_stages:
+    # Handle freezing options
+    if args.no_freeze:
+        # Always override to ensure no freezing
+        config['train']['freeze_earlier_stages'] = False
+    elif args.freeze_earlier_stages:
         config['train']['freeze_earlier_stages'] = True
     
     # Get current stage and stage-specific settings
@@ -117,23 +122,23 @@ def main():
     if not args.max_epochs and current_stage <= len(stage_epochs):
         config['train']['num_epochs'] = stage_epochs[current_stage-1]
     
-    # Stage-specific batch size adjustments with improved Stage 3 handling
+    # Improved Stage 2 batch size handling
     if current_stage == 2 and not args.batch_size:
-        # Half the batch size for Stage 2
+        # Less aggressive batch size reduction
+        original_bs = config['train']['batch_size']
+        config['train']['batch_size'] = max(12, original_bs // 1.5)
+    elif current_stage == 3 and not args.batch_size:
+        # More moderate batch size reduction for Stage 3
         original_bs = config['train']['batch_size']
         config['train']['batch_size'] = max(8, original_bs // 2)
-    elif current_stage == 3 and not args.batch_size:
-        # More moderate batch size reduction for Stage 3 (half instead of quarter)
-        original_bs = config['train']['batch_size']
-        config['train']['batch_size'] = max(8, original_bs // 2)  # No smaller than 8
     
-    # Stage-specific learning rate adjustments with improved Stage 3 handling
+    # Improved Stage 2 learning rate handling
     if current_stage == 2 and not args.learning_rate:
-        # Half the learning rate for Stage 2
-        config['train']['learning_rate'] *= 0.5
+        # More moderate learning rate reduction
+        config['train']['learning_rate'] *= 0.75  # Instead of 0.5
     elif current_stage == 3 and not args.learning_rate:
-        # More moderate learning rate reduction for Stage 3 (0.3x instead of 0.1x)
-        config['train']['learning_rate'] *= 0.3
+        # More moderate learning rate reduction for Stage 3
+        config['train']['learning_rate'] *= 0.3  # Instead of 0.1
     
     # Verify dataset path
     h5_path = os.path.join(config['data']['bin_dir'], config['data']['bin_file'])
@@ -158,7 +163,7 @@ def main():
         ModelCheckpoint(
             monitor='val_loss',
             filename=f'svs-stage{current_stage}-' + '{epoch:02d}-{val_loss:.4f}',
-            save_top_k=3 if current_stage == 3 else 1,  # Save top 3 models for Stage 3
+            save_top_k=3 if current_stage >= 2 else 1,  # Save top 3 models for Stage 2 and 3
             mode='min',
             save_last=True
         ),
@@ -178,11 +183,11 @@ def main():
         )
         callbacks.append(early_stopping)
     
-    # Add warmup callback for Stage 3 if requested
-    use_warmup = args.use_warmup or current_stage == 3
-    if use_warmup and current_stage == 3:
+    # Add warmup callback for Stage 2+ if requested
+    use_warmup = args.use_warmup or current_stage >= 2  # Enable by default for Stage 2+
+    if use_warmup:
         warmup_epochs = min(10, config['train']['num_epochs'] // 10)
-        print(f"Using {warmup_epochs} epochs of learning rate warmup for Stage 3")
+        print(f"Using {warmup_epochs} epochs of learning rate warmup for Stage {current_stage}")
         
         class WarmupCallback(pl.Callback):
             def __init__(self, warmup_epochs, initial_factor=0.3):
@@ -224,12 +229,15 @@ def main():
         if torch.cuda.is_available():
             trainer_kwargs['precision'] = '16-mixed'
         
-        # Improved gradient clipping for Stage 3
-        if current_stage == 3:
-            trainer_kwargs['gradient_clip_val'] = 3.0  # More moderate clipping
+        # Add gradient clipping for Stage 2 and 3
+        if current_stage == 2:
+            trainer_kwargs['gradient_clip_val'] = 1.0  # Add gradient clipping for Stage 2
+        elif current_stage == 3:
+            trainer_kwargs['gradient_clip_val'] = 3.0  # More moderate clipping for Stage 3
             
-            # Use smaller gradient accumulation for more frequent updates
-            trainer_kwargs['accumulate_grad_batches'] = 1
+        # Accumulate gradients for more stable updates in Stage 2
+        if current_stage == 2:
+            trainer_kwargs['accumulate_grad_batches'] = 2  # Accumulate gradients for Stage 2
         
         trainer = pl.Trainer(**trainer_kwargs)
         

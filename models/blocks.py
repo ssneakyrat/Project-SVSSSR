@@ -115,56 +115,172 @@ class LowResModel(nn.Module):
 
 class MidResUpsampler(nn.Module):
     """Mid-Resolution Upsampler (40×432)
-    Upsamples low-resolution output to mid-resolution.
+    Upsamples low-resolution output to mid-resolution with improved architecture.
+    - Adds skip connections from Stage 1
+    - Uses separate operations for time and frequency upsampling
+    - Deeper network with more layers
+    - Improved weight initialization
     """
     def __init__(self, input_dim, channels_list, output_dim):
         super().__init__()
         self.output_dim = output_dim
+        self.input_dim = input_dim
 
-        # Upsampler: Use stride=(1, 2) to only upsample time
-        self.upsampler = TransposedConvBlock2D(
-            1,
-            channels_list[0],
-            kernel_size=(3, 4),  # Kernel (Freq, Time)
-            stride=(1, 2),       # Stride (Freq, Time) - Only double time
-            padding=(1, 1)       # Padding (Freq, Time)
+        # Separate upsampling for time and frequency dimensions
+        # First handle time dimension upsampling
+        self.time_upsampler = TransposedConvBlock2D(
+            1,                      # Input channels (from single-channel 3D tensor)
+            channels_list[0] // 2,  # Intermediate channels
+            kernel_size=(3, 4),     # Kernel size (freq, time)
+            stride=(1, 2),          # Only double time dimension
+            padding=(1, 1)
         )
         
-        # Processing blocks with residual connections for better gradient flow
+        # Then handle frequency dimension upsampling
+        self.freq_conv = ConvBlock2D(channels_list[0] // 2, channels_list[0] // 2, kernel_size=3, padding=1)
+        
+        # Feature fusion after upsampling
+        self.fusion = ConvBlock2D(
+            channels_list[0] // 2, 
+            channels_list[0],
+            kernel_size=3, 
+            padding=1
+        )
+        
+        # Direct skip connection from Stage 1 through a projection layer
+        self.skip_projection = nn.Conv2d(1, channels_list[0], kernel_size=1)
+        
+        # Deeper processing blocks with residual connections
         self.blocks = nn.ModuleList()
-        current_channels = channels_list[0]
+        self.intermediate_skip_projections = nn.ModuleList()
         for i in range(len(channels_list) - 1):
+            in_ch = channels_list[i]
             out_ch = channels_list[i+1]
             self.blocks.append(ResidualConvBlock2D(
-                current_channels,
-                out_ch
+                in_ch,
+                out_ch,
+                kernel_size=5 if i == 0 else 3,  # Larger kernel for first block
+                padding=2 if i == 0 else 1
             ))
-            current_channels = out_ch
-
+            
+            # Check if an intermediate skip connection will be added for this block index later
+            # Condition matches the forward pass: i > 0 and i % 2 == 0 and i < len(self.blocks) - 1
+            # Note: len(self.blocks) == len(channels_list) - 1
+            if i > 0 and i % 2 == 0 and i < (len(channels_list) - 1):
+                # Input channels for projection are from the tensor stored 2 steps ago
+                proj_in_ch = channels_list[i-2]
+                # Output channels for projection must match the output of the current block (block[i])
+                proj_out_ch = out_ch # which is channels_list[i+1]
+                
+                if proj_in_ch != proj_out_ch:
+                    self.intermediate_skip_projections.append(
+                        nn.Conv2d(proj_in_ch, proj_out_ch, kernel_size=1)
+                    )
+                else:
+                    # Append Identity if channels already match
+                    self.intermediate_skip_projections.append(nn.Identity())
+        
+        # Final refinement layer
+        self.refinement = ConvBlock2D(
+            channels_list[-1], 
+            channels_list[-1] // 2,
+            kernel_size=3,
+            padding=1
+        )
+        
         # Final projection
-        self.output_proj = nn.Conv2d(current_channels, 1, kernel_size=1)
+        self.output_proj = nn.Conv2d(channels_list[-1] // 2, 1, kernel_size=1)
+        
+        # Apply proper weight initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights for better gradient flow"""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
         
     def forward(self, x):
-        # Input is [B, C, T] from Stage 1, shape [B, 20, 216]
-
+        # Store the original input for skip connection
+        input_features = x
+        
         # Reshape to [B, 1, C, T]
         if x.dim() == 3:
-            x = x.unsqueeze(1) # Shape [B, 1, 20, 216]
+            x = x.unsqueeze(1)  # Shape [B, 1, 20, 216]
         
-        # Apply upsampling (only time)
-        x = self.upsampler(x) # Shape [B, channels_list[0], 20, 432]
+        # Apply time dimension upsampling
+        x = self.time_upsampler(x)  # Shape [B, channels/2, 20, 432]
         
-        # Process through blocks
-        for block in self.blocks:
+        # Apply frequency dimension upsampling
+        x = self.freq_conv(x) # Apply convolution first
+        # Now apply frequency upsampling dynamically
+        target_freq_dim = self.output_dim
+        current_time_dim = x.shape[-1]
+        x = F.interpolate(
+            x,
+            size=(target_freq_dim, current_time_dim),
+            mode='bilinear',
+            align_corners=False
+        ) # Shape [B, channels/2, 40, 432]
+        
+        # Apply feature fusion
+        x = self.fusion(x)  # Shape [B, channels, 40, 432]
+        
+        # Add skip connection from Stage 1
+        if input_features.dim() == 3:  # [B, 20, 216]
+            # Prepare skip connection - first upsample time dimension
+            skip = F.interpolate(
+                input_features, 
+                size=x.shape[-1],  # Match time dimension of upsampled feature
+                mode='linear', 
+                align_corners=False
+            )  # Shape [B, 20, 432]
+            
+            # Transpose to match channel/frequency dimensions for 2D operations
+            skip = skip.transpose(1, 2)  # Shape [B, 432, 20]
+            
+            # Upsample frequency dimension
+            skip = F.interpolate(
+                skip.unsqueeze(1),
+                size=(x.shape[2], x.shape[3]),  # Match both dimensions
+                mode='bilinear',
+                align_corners=False
+            )  # Shape [B, 1, 40, 432]
+            
+            # Project skip connection to proper channel dimension
+            skip = self.skip_projection(skip)  # Shape [B, channels, 40, 432]
+            
+            # Add skip to main path with scaling to prevent overwhelming
+            x = x + 0.3 * skip  # Scaled addition helps with stability
+        
+        # Process through deeper residual blocks
+        intermediates = []
+        skip_proj_idx = 0 # Index for projection layers
+        for i, block in enumerate(self.blocks):
+            intermediates.append(x)
             x = block(x)
+            
+            # Add intermediate skip connections every 2 blocks for deeper networks
+            if i > 0 and i % 2 == 0 and i < len(self.blocks) - 1:
+                # Retrieve skip tensor from 2 steps ago
+                skip_tensor = intermediates[i-2]
+                # Project skip tensor to match current channels using the corresponding projection layer
+                projected_skip = self.intermediate_skip_projections[skip_proj_idx](skip_tensor)
+                skip_proj_idx += 1 # Increment index for the next projection layer
+                # Add projected skip from earlier in the network
+                x = x + 0.5 * projected_skip
+        
+        # Apply final refinement
+        x = self.refinement(x)
         
         # Final projection
-        x = self.output_proj(x) # Shape [B, 1, 20, 432]
-
-        # Resize frequency dimension to self.output_dim (40)
-        if x.shape[2] != self.output_dim:
-             x = F.interpolate(x, size=(self.output_dim, x.shape[3]), mode='bilinear', align_corners=False)
-             
+        x = self.output_proj(x)
+        
         return x
 
 class HighResUpsampler(nn.Module):
