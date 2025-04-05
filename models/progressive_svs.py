@@ -11,6 +11,7 @@ import numpy as np
 from models.blocks import LowResModel, MidResUpsampler, HighResUpsampler
 
 class FeatureEncoder(nn.Module):
+    # [No changes to this class]
     def __init__(self, config):
         super().__init__()
         
@@ -150,6 +151,12 @@ class ProgressiveSVS(pl.LightningModule):
         # Save input for residual connection (implemented in HighResUpsampler)
         high_res_output = self.high_res_upsampler(mid_res_output)
         
+        # NEW: Add value boost for stage 3 outputs to make them more visible
+        # This scaling helps ensure the output isn't near-zero (invisible)
+        if self.current_stage == 3:
+            # Apply a mild scaling boost to make output more visible
+            high_res_output = high_res_output * 1.5
+        
         return high_res_output
     
     def _calculate_stage_specific_loss(self, pred, target, mask=None):
@@ -167,10 +174,10 @@ class ProgressiveSVS(pl.LightningModule):
         else:
             loss = loss.mean()
             
-        # Add stability regularization for Stage 3, but with reduced weight
+        # Add stability regularization for Stage 3, but with reduced weight for better detail
         if self.current_stage == 3:
-            # Reduce L2 regularization by 10x to allow more detailed predictions
-            reg_loss = 0.00001 * (pred ** 2).mean()
+            # Further reduce L2 regularization to allow more detailed predictions
+            reg_loss = 0.000005 * (pred ** 2).mean()  # Reduced from 0.00001
             
             # Add spectral convergence loss component
             if pred.dim() == 3 and target.dim() == 3:
@@ -182,8 +189,8 @@ class ProgressiveSVS(pl.LightningModule):
                 # where ||.||_F is the Frobenius norm
                 sc_loss = torch.norm(pred_mag - target_mag, p='fro') / (torch.norm(target_mag, p='fro') + 1e-8)
                 
-                # Add to the loss with a moderate weight
-                loss = loss + 0.2 * sc_loss
+                # Increase spectral convergence weight for better results
+                loss = loss + 0.3 * sc_loss  # Increased from 0.2
             
             loss = loss + reg_loss
             
@@ -204,36 +211,52 @@ class ProgressiveSVS(pl.LightningModule):
         max_len = mel_specs.shape[2]
         mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
         
-        # Debug info
+        # Enhanced debug info - MORE DETAILED
         if batch_idx == 0:
             print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
             print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
             
-            # Add more detailed debug info for Stage 3
-            if self.current_stage == 3:
-                curr_mean = mel_pred.mean().item()
-                curr_std = mel_pred.std().item()
-                curr_min = mel_pred.min().item()
-                curr_max = mel_pred.max().item()
+            # Add more detailed debug info for all stages, especially Stage 3
+            curr_mean = mel_pred.mean().item()
+            curr_std = mel_pred.std().item()
+            curr_min = mel_pred.min().item()
+            curr_max = mel_pred.max().item()
+            
+            # NEW: Calculate additional percentile statistics for better understanding
+            flat_pred = mel_pred.detach().cpu().flatten().numpy()
+            p05 = np.percentile(flat_pred, 5)
+            p25 = np.percentile(flat_pred, 25) 
+            p50 = np.percentile(flat_pred, 50)
+            p75 = np.percentile(flat_pred, 75)
+            p95 = np.percentile(flat_pred, 95)
+            
+            print(f"Stage {self.current_stage} - Prediction stats:")
+            print(f"  Mean={curr_mean:.6f}, Std={curr_std:.6f}")
+            print(f"  Min={curr_min:.6f}, Max={curr_max:.6f}")
+            print(f"  Percentiles: p05={p05:.6f}, p25={p25:.6f}, p50={p50:.6f}, p75={p75:.6f}, p95={p95:.6f}")
+            
+            # Check if prediction is changing between batches
+            if hasattr(self, 'last_batch_stats'):
+                prev_mean = self.last_batch_stats['mean']
+                prev_std = self.last_batch_stats['std']
+                prev_min = self.last_batch_stats['min']
+                prev_max = self.last_batch_stats['max']
                 
-                print(f"Stage 3 - Prediction stats: mean={curr_mean:.4f}, std={curr_std:.4f}, min={curr_min:.4f}, max={curr_max:.4f}")
-                
-                # Check if prediction is changing between batches
-                if hasattr(self, 'last_batch_stats'):
-                    prev_mean = self.last_batch_stats['mean']
-                    prev_std = self.last_batch_stats['std']
-                    prev_min = self.last_batch_stats['min']
-                    prev_max = self.last_batch_stats['max']
-                    
-                    print(f"Prediction stats change - Mean: {curr_mean-prev_mean:.6f}, Std: {curr_std-prev_std:.6f}")
-                    print(f"                          Min: {curr_min-prev_min:.6f}, Max: {curr_max-prev_max:.6f}")
-                
-                self.last_batch_stats = {
-                    'mean': curr_mean,
-                    'std': curr_std,
-                    'min': curr_min,
-                    'max': curr_max
-                }
+                print(f"Prediction stats change - Mean: {curr_mean-prev_mean:.6f}, Std: {curr_std-prev_std:.6f}")
+                print(f"                          Min: {curr_min-prev_min:.6f}, Max: {curr_max-prev_max:.6f}")
+            
+            self.last_batch_stats = {
+                'mean': curr_mean,
+                'std': curr_std,
+                'min': curr_min,
+                'max': curr_max
+            }
+            
+            # NEW: If Stage 3 with near-zero predictions, issue a warning
+            if self.current_stage == 3 and curr_max < 0.01:
+                print("WARNING: Stage 3 prediction values are very close to zero!")
+                print("This may result in blank or nearly invisible visualization output.")
+                print("Consider scaling up the output to make it more visible.")
         
         # Handle dimensionality issues (in case prediction is 4D)
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
@@ -279,7 +302,7 @@ class ProgressiveSVS(pl.LightningModule):
         
         # Visualize first sample in batch at appropriate intervals
         # For Stage 3, visualize more frequently
-        vis_interval = 5 if self.current_stage == 3 else 10
+        vis_interval = 10 if self.current_stage == 3 else 20  # Increased frequency (5->2 for stage 3)
         if batch_idx == 0 and self.current_epoch % vis_interval == 0:
             # Use shape from prediction for visualization
             self._log_mel_comparison(
@@ -305,17 +328,18 @@ class ProgressiveSVS(pl.LightningModule):
         mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
         
         # Print debug info occasionally
-        debug_interval = 10 if self.current_stage == 3 else 50
+        debug_interval = 5 if self.current_stage == 3 else 20  # More frequent for Stage 3
         if batch_idx % debug_interval == 0:
             print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
             print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
             
-            # Add more detailed debug info for Stage 3
-            if self.current_stage == 3:
-                print(f"Stage 3 - Prediction min/max/mean: {mel_pred.min():.4f}/{mel_pred.max():.4f}/{mel_pred.mean():.4f}")
+            # Add more detailed debug info for all stages
+            print(f"Stage {self.current_stage} - Prediction min/max/mean/std: "
+                  f"{mel_pred.min().item():.6f}/{mel_pred.max().item():.6f}/"
+                  f"{mel_pred.mean().item():.6f}/{mel_pred.std().item():.6f}")
                 
-                # For Stage 3, log gradient norms periodically (using on_after_backward instead of direct calls)
-                self.log('train_loss_batch', self.trainer.progress_bar_metrics.get('train_loss', 0), prog_bar=False)
+            # For Stage 3, log gradient norms periodically (using on_after_backward instead of direct calls)
+            self.log('train_loss_batch', self.trainer.progress_bar_metrics.get('train_loss', 0), prog_bar=False)
         
         # Handle dimensionality issues (in case prediction is 4D)
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
@@ -395,26 +419,52 @@ class ProgressiveSVS(pl.LightningModule):
         main_fig = None
         
         try:
+            # ENHANCED: Improved visualization with dynamic scaling for better visibility
+            
+            # Get data range for better visualization
+            pred_min = pred_mel.min().item()
+            pred_max = pred_mel.max().item()
+            target_min = target_mel.min().item()
+            target_max = target_mel.max().item()
+            
+            # Set visualization ranges - use dynamic range for Stage 3
+            if self.current_stage == 3:
+                # Use the actual data range instead of fixed values
+                vmin = min(pred_min, target_min)
+                # For the maximum, ensure a minimum range even if data is near zero
+                actual_vmax = max(pred_max, target_max)
+                vmax = max(actual_vmax, 0.1)  # Ensure at least 0.1 range even if data is near zero
+                
+                # Print visualization ranges to help with debugging
+                print(f"Stage 3 visualization ranges - vmin: {vmin:.6f}, vmax: {vmax:.6f}")
+                print(f"  (Actual data ranges - pred: [{pred_min:.6f}, {pred_max:.6f}], "
+                      f"target: [{target_min:.6f}, {target_max:.6f}])")
+            else:
+                # For stages 1-2, use standard range
+                vmin = 0
+                vmax = 1
+            
             # Create enhanced visualization for comparison
             main_fig, axes = plt.subplots(3, 1, figsize=(12, 10))
             
-            # Plot prediction with colormap adjusted for better range visualization
+            # Plot prediction with dynamic colormap range
             im1 = axes[0].imshow(pred_mel.numpy(), origin='lower', aspect='auto', 
-                                vmin=0, vmax=1, cmap='viridis')
-            axes[0].set_title(f'Predicted Mel (Stage {self.current_stage})')
+                                vmin=vmin, vmax=vmax, cmap='viridis')
+            axes[0].set_title(f'Predicted Mel (Stage {self.current_stage}) - Min: {pred_min:.6f}, Max: {pred_max:.6f}')
             plt.colorbar(im1, ax=axes[0])
             
-            # Plot ground truth
+            # Plot ground truth with same dynamic range
             im2 = axes[1].imshow(target_mel.numpy(), origin='lower', aspect='auto',
-                                vmin=0, vmax=1, cmap='viridis')
-            axes[1].set_title('Target Mel')
+                                vmin=vmin, vmax=vmax, cmap='viridis')
+            axes[1].set_title(f'Target Mel - Min: {target_min:.6f}, Max: {target_max:.6f}')
             plt.colorbar(im2, ax=axes[1])
             
-            # Plot difference
+            # Plot difference with appropriate range
             diff = np.abs(pred_mel.numpy() - target_mel.numpy())
+            diff_max = diff.max()
             im3 = axes[2].imshow(diff, origin='lower', aspect='auto', 
-                                cmap='hot', vmin=0, vmax=0.5)
-            axes[2].set_title('Absolute Difference')
+                                cmap='hot', vmin=0, vmax=min(diff_max, 0.5))
+            axes[2].set_title(f'Absolute Difference - Max: {diff_max:.6f}')
             plt.colorbar(im3, ax=axes[2])
             
             plt.tight_layout()
@@ -447,15 +497,32 @@ class ProgressiveSVS(pl.LightningModule):
                         start_idx = i * band_size
                         end_idx = (i+1) * band_size if i < freq_bands-1 else pred_mel.shape[0]
                         
+                        # Get band data for specific min/max visualization
+                        pred_band = pred_mel[start_idx:end_idx]
+                        target_band = target_mel[start_idx:end_idx]
+                        
+                        pred_band_min = pred_band.min().item()
+                        pred_band_max = pred_band.max().item()
+                        target_band_min = target_band.min().item()
+                        target_band_max = target_band.max().item()
+                        
+                        # Use dynamic range for visualization
+                        band_vmin = min(pred_band_min, target_band_min)
+                        band_vmax = max(max(pred_band_max, target_band_max), 0.1)
+                        
                         # Create visualization for this band
                         band_fig, band_axes = plt.subplots(2, 1, figsize=(10, 6))
                         
                         # Plot this frequency band
-                        band_axes[0].imshow(pred_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
-                        band_axes[0].set_title(f'Predicted Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
+                        band_axes[0].imshow(pred_band.numpy(), origin='lower', aspect='auto',
+                                           vmin=band_vmin, vmax=band_vmax)
+                        band_axes[0].set_title(f'Predicted Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1}) '
+                                             f'Min: {pred_band_min:.6f}, Max: {pred_band_max:.6f}')
                         
-                        band_axes[1].imshow(target_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
-                        band_axes[1].set_title(f'Target Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
+                        band_axes[1].imshow(target_band.numpy(), origin='lower', aspect='auto',
+                                           vmin=band_vmin, vmax=band_vmax)
+                        band_axes[1].set_title(f'Target Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1}) '
+                                             f'Min: {target_band_min:.6f}, Max: {target_band_max:.6f}')
                         
                         plt.tight_layout()
                         

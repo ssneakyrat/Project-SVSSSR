@@ -257,14 +257,6 @@ def main():
             checkpoint_path = os.path.join(logger.log_dir, "checkpoints/last.ckpt")
             print(f"\nTo continue training with the next stage, run:")
             print(f"python train.py --stage {next_stage} --load_weights {checkpoint_path}")
-        
-        if current_stage == 3:
-            print("\nStage 3 Training Recommendations:")
-            print("1. If convergence is still poor, try:")
-            print("   - Further reducing learning rate: --learning_rate 0.00005")
-            print("   - Increasing gradient accumulation: --accumulate_grad_batches 4")
-            print("   - Mixed precision training: --precision 16-mixed")
-            print("   - Freezing earlier stages: --freeze_earlier_stages")
     
     except Exception as e:
         print(f"Error during training: {e}")

@@ -164,8 +164,8 @@ class ResidualBlock(nn.Module):
         else:
             x = self.norm2(x)
             
-        # Reduce the residual connection influence
-        x = x + 0.7 * residual
+        # Increase residual connection influence (0.7 -> 0.8)
+        x = x + 0.8 * residual
         return self.activation(x)
 
 class LowResModel(nn.Module):
@@ -271,7 +271,8 @@ class MidResUpsampler(nn.Module):
                 mode='bilinear', 
                 align_corners=False
             )
-            x = x + 0.05 * identity
+            # Increase residual influence from 0.05 to 0.1
+            x = x + 0.1 * identity
         
         # Output shape: [B, 1, C, T]
         return x
@@ -324,10 +325,13 @@ class HighResUpsampler(nn.Module):
             kernel_size=3, padding=1, groups=channels_list[-1]  # Depthwise conv for smoothing
         )
         
-        # Add a final projection layer with a smaller weight initialization
+        # Add a final projection layer with INCREASED weight initialization (key fix)
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
-        # Initialize with smaller weights to reduce artifacts
-        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
+        # Initialize with LARGER weights to make output more visible (0.1 -> 0.5)
+        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.5)
+        
+        # Add output normalization to ensure values are in visible range
+        self.output_normalization = nn.Identity()  # Default to identity, can be changed to custom normalization
         
     def forward(self, x):
         # Save input for residual connection
@@ -342,10 +346,10 @@ class HighResUpsampler(nn.Module):
             block_input = x
             x = block(x)
             
-            # Add a local residual connection with a smaller weight (0.05 instead of 0.1)
+            # Add a local residual connection with INCREASED weight (0.05 -> 0.15)
             # Only for even indices (the ResidualBlocks)
             if i % 2 == 0 and x.shape == block_input.shape:
-                x = x + 0.05 * block_input
+                x = x + 0.15 * block_input
         
         # Apply smoothing to reduce high-frequency artifacts
         x = self.smoothing_conv(x)
@@ -354,7 +358,7 @@ class HighResUpsampler(nn.Module):
         # Final processing
         x = self.output_proj(x)
         
-        # Add global residual connection with proper upsampling and reduced weight (0.05)
+        # Add global residual connection with proper upsampling and INCREASED weight (0.05 -> 0.3)
         if identity.shape[2:] != x.shape[2:]:
             # Use bilinear interpolation for smoother upsampling
             identity = F.interpolate(
@@ -364,8 +368,11 @@ class HighResUpsampler(nn.Module):
                 align_corners=False
             )
         
-        # Add the residual connection with a smaller weight (0.05 instead of 0.1)
-        x = x + 0.05 * identity
+        # Add the residual connection with a LARGER weight (0.05 -> 0.3)
+        x = x + 0.3 * identity
+        
+        # Apply output normalization
+        x = self.output_normalization(x)
         
         # Output shape: [B, 1, C, T]
         return x
