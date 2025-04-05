@@ -13,13 +13,7 @@ from models.progressive_svs import ProgressiveSVS
 from data.dataset import SVSDataModule, check_dataset, fix_multiprocessing, H5FileManager
 
 def load_model_weights_only(model, checkpoint_path):
-    """
-    Load only the model weights from a checkpoint, ignoring optimizer and callback states.
-    With improved error handling for architecture changes.
-    """
-    import torch
-    import os
-    
+    """Load only the model weights from a checkpoint"""
     if not os.path.exists(checkpoint_path):
         print(f"Error: Checkpoint file {checkpoint_path} not found")
         return False
@@ -61,18 +55,9 @@ def load_model_weights_only(model, checkpoint_path):
                 model.load_state_dict(compatible_state_dict, strict=False)
                 print(f"Successfully loaded {len(compatible_state_dict)}/{len(state_dict)} parameters")
                 
-                # Print which modules are totally incompatible
-                incompatible_modules = set()
-                for param, _, _ in mismatch_params:
-                    # Extract the module name (first part of parameter name)
-                    module_name = param.split('.')[0]
-                    incompatible_modules.add(module_name)
-                
-                print(f"Modules with incompatible parameters: {', '.join(incompatible_modules)}")
-                print("Note: These modules will use random initialization")
             else:
                 # No mismatches, load normally
-                model.load_state_dict(state_dict)
+                model.load_state_dict(state_dict, strict=False)
                 print(f"Successfully loaded all model weights from {checkpoint_path}")
             
             # Check the stage from the checkpoint
@@ -94,18 +79,14 @@ def main():
     parser = argparse.ArgumentParser(description='Train Progressive SVS Model')
     parser.add_argument('--config', type=str, default='config/model.yaml', help='Path to configuration file')
     parser.add_argument('--stage', type=int, default=None, help='Training stage (1, 2, or 3)')
-    parser.add_argument('--load_weights', type=str, default=None, help='Path to checkpoint to load weights from (ignores training state)')
-    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume full training from')
+    parser.add_argument('--load_weights', type=str, default=None, help='Path to checkpoint to load weights from')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume training from')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
-    parser.add_argument('--variable_length', action='store_true', help='Enable variable length training mode')
     parser.add_argument('--batch_size', type=int, default=None, help='Override batch size from config')
     parser.add_argument('--max_epochs', type=int, default=None, help='Override max epochs from config')
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate from config')
-    parser.add_argument('--disable_early_stopping', action='store_true', help='Disable early stopping callback')
-    parser.add_argument('--patience', type=int, default=None, help='Early stopping patience (default depends on stage)')
-    parser.add_argument('--freeze_earlier_stages', action='store_true', help='Freeze earlier stages when training in Stage 3')
-    parser.add_argument('--accumulate_grad_batches', type=int, default=None, help='Accumulate gradients over N batches')
-    parser.add_argument('--precision', type=str, default=None, choices=['32', '16-mixed'], help='Training precision')
+    parser.add_argument('--disable_early_stopping', action='store_true', help='Disable early stopping')
+    parser.add_argument('--freeze_earlier_stages', action='store_true', help='Freeze earlier stages when training in Stage 2 or 3')
     args = parser.parse_args()
     
     pl.seed_everything(args.seed)
@@ -114,9 +95,6 @@ def main():
 
     if args.stage:
         config['model']['current_stage'] = args.stage
-    
-    if args.variable_length:
-        config['data']['variable_length'] = True
     
     if args.batch_size:
         config['train']['batch_size'] = args.batch_size
@@ -130,27 +108,32 @@ def main():
     if args.freeze_earlier_stages:
         config['train']['freeze_earlier_stages'] = True
     
+    # Get current stage and stage-specific settings
     current_stage = config['model']['current_stage']
     stage_epochs = config['model'].get('stage_epochs', [30, 30, 40])
     
-    # Set appropriate defaults for Stage 3 if not specified
-    if current_stage == 3 and not args.max_epochs and not args.learning_rate:
-        # For Stage 3, longer training with lower learning rate by default
-        if not args.learning_rate:
-            original_lr = config['train']['learning_rate']
-            config['train']['learning_rate'] = original_lr * 0.1
-            print(f"Stage 3: Automatically reducing learning rate to {config['train']['learning_rate']} (1/10 of original)")
-        
-        if not args.batch_size:
-            # Maybe reduce batch size for Stage 3 to fit in memory
-            original_bs = config['train']['batch_size']
-            if original_bs > 4:
-                config['train']['batch_size'] = max(4, original_bs // 2)
-                print(f"Stage 3: Automatically reducing batch size to {config['train']['batch_size']}")
-    
+    # Apply stage-specific configurations if not overridden
     if not args.max_epochs and current_stage <= len(stage_epochs):
         config['train']['num_epochs'] = stage_epochs[current_stage-1]
     
+    # Stage-specific batch size and learning rate adjustments
+    if current_stage == 2 and not args.batch_size:
+        # Half the batch size for Stage 2
+        original_bs = config['train']['batch_size']
+        config['train']['batch_size'] = max(8, original_bs // 2)
+    elif current_stage == 3 and not args.batch_size:
+        # Quarter the batch size for Stage 3
+        original_bs = config['train']['batch_size']
+        config['train']['batch_size'] = max(4, original_bs // 4)
+    
+    if current_stage == 2 and not args.learning_rate:
+        # Half the learning rate for Stage 2
+        config['train']['learning_rate'] *= 0.5
+    elif current_stage == 3 and not args.learning_rate:
+        # Reduce learning rate by 10x for Stage 3
+        config['train']['learning_rate'] *= 0.1
+    
+    # Verify dataset path
     h5_path = os.path.join(config['data']['bin_dir'], config['data']['bin_file'])
     variable_length = config['data'].get('variable_length', True)
     
@@ -159,6 +142,7 @@ def main():
         print("You may need to run preprocess.py first.")
         return
     
+    # Setup logging and callbacks
     save_dir = config['train']['save_dir']
     os.makedirs(save_dir, exist_ok=True)
     
@@ -167,9 +151,6 @@ def main():
         name=f'stage{current_stage}',
         version=None
     )
-    
-    # Configure monitor interval based on stage
-    monitor_interval = 1 if current_stage == 3 else 10
     
     callbacks = [
         ModelCheckpoint(
@@ -185,18 +166,8 @@ def main():
     # Setup early stopping with stage-appropriate patience
     if not args.disable_early_stopping:
         # Set different patience values based on stage
-        if args.patience:
-            patience = args.patience
-        else:
-            # Default stage-specific patience values that increase with stage complexity
-            stage_patience_values = {
-                1: 10,   # Stage 1: Basic patience 
-                2: 20,   # Stage 2: More patience to handle transition
-                3: 30,   # Stage 3: Even more patience for final refinement
-            }
-            patience = stage_patience_values.get(current_stage, 10)
+        patience = 10 * current_stage  # More patience for higher stages
         
-        print(f"Using early stopping with patience of {patience} epochs")
         early_stopping = EarlyStopping(
             monitor='val_loss',
             patience=patience,
@@ -204,50 +175,43 @@ def main():
             verbose=True
         )
         callbacks.append(early_stopping)
-    else:
-        print("Early stopping has been disabled")
     
     try:
         # Initialize the model
         model = ProgressiveSVS(config)
         
-        # If weights should be loaded from a previous stage checkpoint
-        # but we want to start training fresh (with new optimizer and callbacks)
+        # Load weights from a previous stage if specified
         if args.load_weights:
             print(f"Loading model weights from: {args.load_weights}")
             load_model_weights_only(model, args.load_weights)
-            # Set resume to None to ensure we don't also try to resume training state
-            args.resume = None
         
         data_module = SVSDataModule(config)
         
+        # Configure training parameters
         trainer_kwargs = {
             'max_epochs': config['train']['num_epochs'],
             'logger': logger,
             'callbacks': callbacks,
-            'log_every_n_steps': monitor_interval,
+            'log_every_n_steps': 10,
             'accelerator': 'auto',
             'devices': 'auto',
         }
         
-        # Set precision if specified
-        if args.precision:
-            trainer_kwargs['precision'] = args.precision
+        # Use mixed precision if available to save memory
+        if torch.cuda.is_available():
+            trainer_kwargs['precision'] = '16-mixed'
         
-        # Set gradient accumulation if specified
-        if args.accumulate_grad_batches:
-            trainer_kwargs['accumulate_grad_batches'] = args.accumulate_grad_batches
-            print(f"Accumulating gradients over {args.accumulate_grad_batches} batches")
+        # Add gradient clipping for stability in Stage 3
+        if current_stage == 3:
+            trainer_kwargs['gradient_clip_val'] = 1.0
         
-        if 'gradient_clip_val' in config['train']:
-            trainer_kwargs['gradient_clip_val'] = config['train']['gradient_clip_val']
-        else:
-            # Add gradient clipping by default for Stage 3
-            if current_stage == 3:
-                trainer_kwargs['gradient_clip_val'] = 1.0
-                print("Stage 3: Enabling gradient clipping with value 1.0")
+        # Accumulate gradients for larger effective batch size in Stage 3
+        if current_stage == 3:
+            trainer_kwargs['accumulate_grad_batches'] = 2
         
         trainer = pl.Trainer(**trainer_kwargs)
+        
+        # Start training
         trainer.fit(model, data_module, ckpt_path=args.resume)
         
         print(f"Training completed for stage {current_stage}.")
@@ -263,6 +227,7 @@ def main():
         raise
     
     finally:
+        # Clean up resources
         H5FileManager.get_instance().close_all()
         print("H5 file resources released.")
 

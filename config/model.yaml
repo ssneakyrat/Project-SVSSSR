@@ -3,7 +3,7 @@ data:
   bin_file: mel_spectrograms.h5
   data_key: mel_spectrograms
   lazy_load: true
-  raw_dir: datasets/gin
+  raw_dir: datasets/raw
   max_samples: 100
   variable_length: true
   
@@ -38,7 +38,7 @@ model:
   
   # Progressive training
   current_stage: 1
-  stage_epochs: [600, 400, 200]
+  stage_epochs: [100, 200, 400]
 
 train:
   batch_size: 16
@@ -49,3 +49,4 @@ train:
   lr_patience: 5
   lr_factor: 0.5
   save_dir: logs/progressive_svs
+  freeze_earlier_stages: true
