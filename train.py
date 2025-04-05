@@ -113,6 +113,7 @@ def train(config_path='config/model.yaml'):
         # Add other trainer flags as needed, e.g.:
         # deterministic=True,
         gradient_clip_val=config['train'].get('gradient_clip_val'), # Use value from config
+        precision=16 if torch.cuda.is_available() else 32 # Enable Mixed Precision (AMP) if GPU is available
     )
     print(f"Trainer initialized. Using accelerator: {trainer.accelerator}")
 

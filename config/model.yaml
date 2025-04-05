@@ -36,12 +36,12 @@ model:
   # Vocab size will be read from HDF5 attributes
 
   transformer:
-    hidden_dim: 256       # Internal dimension of Transformer blocks
-    encoder_layers: 4     # Number of encoder layers
+    hidden_dim: 192       # Internal dimension of Transformer blocks (Reduced from 256)
+    encoder_layers: 3     # Number of encoder layers (Reduced from 4)
     encoder_heads: 2      # Number of attention heads in encoder
-    decoder_layers: 4     # Number of decoder layers
+    decoder_layers: 3     # Number of decoder layers (Reduced from 4)
     decoder_heads: 2      # Number of attention heads in decoder
-    conv_filter_size: 1024 # Dimension of the inner Conv1D layer in FFN
+    conv_filter_size: 768 # Dimension of the inner Conv1D layer in FFN (Reduced from 1024)
     conv_kernel_size: 9   # Kernel size of the Conv1D layer in FFN
     dropout: 0.2          # Dropout rate for Transformer blocks
 
@@ -63,7 +63,7 @@ train:
   tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs (relative to log_dir)
   checkpoint_dir: checkpoints # Subdirectory for model checkpoints (relative to log_dir)
   save_interval: 10     # Save checkpoint every N epochs (more frequent might be good)
-  num_workers: 4        # DataLoader workers (adjust based on system)
+  num_workers: 8        # DataLoader workers (Increased from 4, adjust based on system)
   log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps
   gradient_clip_val: 1.0 # Gradient clipping value
 
