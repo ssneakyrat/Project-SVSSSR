@@ -160,6 +160,8 @@ def main():
     parser.add_argument('--vocoder_path', type=str, default=None, help='Path to vocoder model (overrides config)')
     parser.add_argument('--generate_audio', action='store_true', help='Generate audio using vocoder')
     parser.add_argument('--device', type=str, default=None, help='Device to run inference on')
+    parser.add_argument('--adjust_length', action='store_true', 
+                        help='Adjust output mel length to match input length divided by total upsampling factor')
     
     args = parser.parse_args()
     
@@ -189,10 +191,29 @@ def main():
         args.phone_path, args.f0_path, args.duration_path, args.midi_path, device
     )
     
+    # Calculate expected output length based on input length and upsampling factor
+    input_length = phone_ids.shape[1]
+    
+    # Calculate total upsampling factor from configuration
+    total_upsampling = 1
+    for factor in config['model']['upsampling_factors']:
+        total_upsampling *= factor
+        
+    expected_length = input_length * total_upsampling
+    print(f"Input sequence length: {input_length}")
+    print(f"Total upsampling factor: {total_upsampling}x")
+    print(f"Expected output length: {expected_length}")
+    
     # Generate mel spectrogram
     print("Generating mel spectrogram...")
     with torch.no_grad():
         mel_output = model(phone_ids, f0, durations, midi_ids)
+        
+        # Adjust length if requested
+        if args.adjust_length:
+            print(f"Adjusting mel length from {mel_output.shape[-1]} to {input_length}...")
+            mel_output = model.adjust_mel_length(mel_output)
+            print(f"Adjusted mel shape: {mel_output.shape}")
     
     # Save mel spectrogram
     mel_output_path = os.path.join(output_dir, f"{args.output_name}.npy")

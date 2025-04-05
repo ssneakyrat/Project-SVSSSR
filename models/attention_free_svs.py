@@ -18,6 +18,13 @@ class AttentionFreeSVS(pl.LightningModule):
         self.mel_bins = config['model']['mel_bins']
         self.variable_length = config['model'].get('variable_length_mode', False)
         
+        # Calculate total upsampling factor from configuration
+        self.total_upsampling = 1
+        for factor in config['model']['upsampling_factors']:
+            self.total_upsampling *= factor
+        
+        print(f"Total upsampling factor: {self.total_upsampling}x")
+        
         # Initialize input processing modules
         self.phone_encoder = PhoneEncoder(
             vocab_size=config.get('data', {}).get('phone_vocab_size', 50),
@@ -128,6 +135,85 @@ class AttentionFreeSVS(pl.LightningModule):
         
         return mel_output
     
+    def adjust_mel_length(self, mel, target_length=None, downsample=True):
+        """
+        Adjust the time dimension of mel spectrogram either by downsampling
+        to match target length or by a fixed factor.
+        
+        Args:
+            mel: Mel spectrogram tensor of any shape where the last dimension is time
+                 and second-to-last is mel_bins (if it exists)
+            target_length: Target length for time dimension, if None use total_upsampling
+            downsample: If True, downsample; if False, truncate
+            
+        Returns:
+            Adjusted mel spectrogram with same dimensions but modified time length
+        """
+        # Store original shape for debugging
+        original_shape = mel.shape
+        original_dim = mel.dim()
+        
+        # Convert to 4D [batch, channels, mel_bins, time] for adaptive_avg_pool2d
+        if original_dim == 1:  # [time] - very unlikely but handle it
+            mel = mel.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, time]
+        elif original_dim == 2:  # [mel_bins, time] or [time, mel_bins]
+            # Check if mel_bins should be the first or second dimension based on shape
+            if mel.shape[0] == self.mel_bins:  # [mel_bins, time]
+                mel = mel.unsqueeze(0).unsqueeze(0)  # [1, 1, mel_bins, time]
+            else:  # [time, mel_bins] or other 2D shape
+                # Assume first dim is time if it doesn't match mel_bins
+                mel = mel.transpose(0, 1).unsqueeze(0).unsqueeze(0)  # [1, 1, mel_bins, time]
+        elif original_dim == 3:  # [batch, mel_bins, time]
+            mel = mel.unsqueeze(1)  # [batch, 1, mel_bins, time]
+        
+        # If no target_length provided, downsample by total_upsampling factor
+        if target_length is None and downsample:
+            # Calculate target length based on upsampling factor
+            target_length = mel.shape[-1] // self.total_upsampling
+            # Ensure target_length is at least 1
+            target_length = max(1, target_length)
+        
+        # If target_length is specified, adjust to that length
+        if target_length is not None:
+            if downsample:
+                # Use adaptive pooling to downsample - ensure we have 4D tensor for pooling
+                try:
+                    mel = F.adaptive_avg_pool2d(mel, (mel.shape[-2], target_length))
+                except Exception as e:
+                    print(f"Error during adaptive_avg_pool2d: {e}")
+                    print(f"Original shape: {original_shape}, Current shape: {mel.shape}")
+                    print(f"Target length: {target_length}")
+                    # Fallback: use simple truncation or padding
+                    if mel.shape[-1] > target_length:
+                        mel = mel[..., :target_length]
+                    elif mel.shape[-1] < target_length:
+                        # Pad with zeros
+                        padding = torch.zeros(mel.shape[:-1] + (target_length - mel.shape[-1],), 
+                                             device=mel.device, dtype=mel.dtype)
+                        mel = torch.cat([mel, padding], dim=-1)
+            else:
+                # Simply truncate to desired length
+                if mel.shape[-1] > target_length:
+                    mel = mel[..., :target_length]
+                elif mel.shape[-1] < target_length:
+                    # Pad with zeros
+                    padding = torch.zeros(mel.shape[:-1] + (target_length - mel.shape[-1],), 
+                                         device=mel.device, dtype=mel.dtype)
+                    mel = torch.cat([mel, padding], dim=-1)
+        
+        # Convert back to original number of dimensions
+        if original_dim == 1:
+            mel = mel.squeeze(0).squeeze(0).squeeze(0)  # Back to [time]
+        elif original_dim == 2:
+            if original_shape[0] == self.mel_bins:  # Original was [mel_bins, time]
+                mel = mel.squeeze(0).squeeze(0)  # Back to [mel_bins, time]
+            else:  # Original was [time, mel_bins]
+                mel = mel.squeeze(0).squeeze(0).transpose(0, 1)  # Back to [time, mel_bins]
+        elif original_dim == 3:
+            mel = mel.squeeze(1)  # Back to [batch, mel_bins, time]
+        
+        return mel
+    
     def compute_masked_loss(self, pred, target, mask=None):
         """
         Compute MSE loss with optional masking for variable-length data
@@ -153,12 +239,8 @@ class AttentionFreeSVS(pl.LightningModule):
         # Adjust time dimension mismatch (handle upsampling factor difference)
         time_dim = -1  # Last dimension is time
         if pred.shape[time_dim] != target.shape[time_dim]:
-            # Downsample pred to match target's time dimension
-            factor = pred.shape[time_dim] // target.shape[time_dim]
-            if factor > 1:
-                # Use adaptive pooling to downsample the time dimension
-                import torch.nn.functional as F
-                pred = F.adaptive_avg_pool2d(pred, (pred.shape[2], target.shape[time_dim]))
+            # Use the general-purpose adjustment method
+            pred = self.adjust_mel_length(pred, target.shape[time_dim])
         
         if mask is None:
             return F.mse_loss(pred, target)
@@ -265,7 +347,9 @@ class AttentionFreeSVS(pl.LightningModule):
         # Log sample spectrograms at regular intervals
         if batch_idx == 0 and self.global_step > 0:
             # Log first sample in batch
-            self._log_spectrograms(mel_pred[0], mel_ground_truth[0])
+            # Adjust predicted mel to match target length for visualization
+            adjusted_mel_pred = self.adjust_mel_length(mel_pred[0], mel_ground_truth[0].shape[-1])
+            self._log_spectrograms(adjusted_mel_pred, mel_ground_truth[0])
         
         return loss
     
