@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 # Import custom modules
 from data.dataset import DataModule # Assuming DataModule is in data/dataset.py
-from model import MinimalSVS        # Assuming MinimalSVS is in model.py
+from model import SVSGAN            # Import the new SVSGAN model
 
 def train(config_path='config/model.yaml'):
     """
@@ -74,8 +74,8 @@ def train(config_path='config/model.yaml'):
 
 
     # --- 3. Initialize Model ---
-    print("Initializing MinimalSVS model...")
-    model = MinimalSVS(config)
+    print("Initializing SVSGAN model...")
+    model = SVSGAN(config)
     print("Model initialized successfully.")
 
     # --- 4. Configure Callbacks and Logger ---
@@ -91,7 +91,7 @@ def train(config_path='config/model.yaml'):
     # Saves the best model based on validation loss
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename='minimal-svs-{epoch:02d}-{val_loss:.2f}',
+        filename='svs-gan-{epoch:02d}-{val_loss:.2f}', # Updated filename for GAN model
         save_top_k=1,          # Save only the best model
         monitor='val_loss',    # Monitor validation loss
         mode='min',            # Mode should be 'min' for loss

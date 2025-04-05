@@ -13,7 +13,7 @@ data:
   sample_percentage: null
   variable_length: true
   min_phones_in_lab: 5 # Minimum number of phone entries required in a .lab file to process it
-  
+
 audio:
   sample_rate: 22050
   n_fft: 1024
@@ -28,30 +28,52 @@ audio:
 
 # Model specific parameters
 model:
-  # Architecture details for MinimalSVS
-  name: MinimalSVS # Identifier for the model class
-  embedding_dim: 128
-  f0_dim: 1           # Dimension of F0 input (usually 1)
-  rnn_hidden_dim: 512 # Increased hidden size
-  rnn_layers: 2
-  mel_bins: 80        # Output dimension (should match audio.n_mels)
-  # Post-Net Configuration
+  name: SVSGAN # Updated model name
+  mel_bins: 80        # Shared: Output dimension (should match audio.n_mels)
+  f0_dim: 1           # Shared: Dimension of F0 input (usually 1)
+  vocab_size: null    # Shared: Will be dynamically set from data
+
+  generator:
+    embedding_dim: 256 # Default from SVSGAN code
+    rnn_hidden_dim: 512 # Default from SVSGAN code
+    rnn_layers: 2       # Default from SVSGAN code
+    bidirectional: true # Default from SVSGAN code
+
+  # Post-Net Configuration (Used by Generator)
   postnet:
-    n_convs: 5        # Number of convolutional layers in the Post-Net
-    kernel_size: 5    # Kernel size for Post-Net convolutions
-    channels: 512     # Number of channels in Post-Net convolutions
+    n_convs: 5
+    kernel_size: 5
+    channels: 512
+    dropout: 0.5 # Default from SVSGAN code
+
+  discriminator:
+    in_channels: 1      # Default from SVSGAN code
+    n_layers: 4         # Default from SVSGAN code
+    base_channels: 64   # Default from SVSGAN code
+    kernel_size: [3, 9] # Default from SVSGAN code (Use list for tuple)
+    stride: [1, 2]      # Default from SVSGAN code (Use list for tuple)
+    padding: [1, 4]     # Default from SVSGAN code (Use list for tuple)
+    norm_layer: 'instance' # Default from SVSGAN code ('batch' or 'instance')
 
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
-  learning_rate: 0.001    # Increased learning rate
-  epochs: 50            # Number of training epochs
+  epochs: 100           # GANs often require more epochs, adjust as needed
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
-  tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs (relative to log_dir)
-  checkpoint_dir: checkpoints # Subdirectory for model checkpoints (relative to log_dir)
-  save_interval: 100      # Save checkpoint every N epochs
-  num_workers: 4        # DataLoader workers (adjust based on system)
+  tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs
+  checkpoint_dir: checkpoints # Subdirectory for model checkpoints
+  num_workers: 4        # DataLoader workers
   log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps
-  gradient_clip_val: 1.0 # Added gradient clipping value
-  # Add any other training-specific parameters here (e.g., optimizer type, scheduler settings)
+
+  # GAN specific training params
+  learning_rate_g: 0.0004 # Generator learning rate
+  learning_rate_d: 0.00005 # Discriminator learning rate (adjusted)
+  adam_beta1: 0.5         # Adam beta1 (common for GANs)
+  adam_beta2: 0.999      # Adam beta2 (common for GANs)
+  lambda_recon: 50        # Weight for L1 reconstruction loss in Generator loss (adjusted)
+
+  # log_interval defines log_every_n_steps in Trainer
+  log_interval: 50        # Log training metrics every N steps
+
+  # Removed: learning_rate (replaced by _g/_d), save_interval (handled by checkpoint callback)
