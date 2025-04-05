@@ -174,6 +174,8 @@ class H5Dataset(Dataset):
             for name, h5_key in self.data_keys.items():
                 if h5_key in group:
                     data_np = group[h5_key][()] # Read data from the group dataset
+
+
                     # Convert to tensor with appropriate type
                     # Add other potential integer keys from your config/preprocessing
                     if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence']:
@@ -207,12 +209,22 @@ class H5Dataset(Dataset):
 # Transposition/channel adding logic might need to be added back into H5Dataset.__getitem__
 # or handled within the model/transforms if required by specific model architectures.
 
+def create_mask(lengths, max_len=None):
+    """Creates a boolean mask from sequence lengths."""
+    if max_len is None:
+        max_len = lengths.max().item()
+    # Create range tensor (0, 1, ..., max_len-1)
+    ids = torch.arange(0, max_len, device=lengths.device).unsqueeze(0) # Shape (1, MaxLen)
+    # Compare lengths (Batch, 1) with range (1, MaxLen) -> broadcasts to (Batch, MaxLen)
+    mask = ids < lengths.unsqueeze(1)
+    return mask
+
 def collate_fn_pad(batch):
     """
-    Custom collate function to pad sequences in a batch of dictionaries.
-    Handles padding for keys like 'mel', 'f0', 'phoneme', 'duration'.
-    Assumes 'mel' and 'f0' are frame-level (variable length in time dim).
-    Assumes 'phoneme' and 'duration' are phoneme-level (variable length in sequence dim).
+    Custom collate function for TransformerSVS.
+    Pads sequences ('mel', 'f0', 'energy', 'phoneme', 'duration') and creates attention masks.
+    - 'mel', 'f0', 'energy': Frame-level (Batch, Features, Time) or (Batch, Time) -> Padded to max Time
+    - 'phoneme', 'duration': Phoneme-level (Batch, SeqLen) -> Padded to max SeqLen
     """
     # Filter out None items (samples that failed to load)
     batch = [item for item in batch if item is not None]
@@ -222,55 +234,66 @@ def collate_fn_pad(batch):
     batch_size = len(batch)
     keys = batch[0].keys()
     padded_batch = {key: [] for key in keys}
-    lengths = {key: [] for key in keys} # Store original lengths if needed
+    phone_lengths = []
+    mel_lengths = []
 
-    # Determine max lengths for each sequence type
-    max_len = {}
-    for key in keys:
-        if key in ['mel', 'f0']: # Frame-level sequences (Batch, Features, Time) or (Batch, Time)
-             # Assuming mel might be (Freq, Time) and f0 (1, Time) or (Time) before batching
-             # Need to handle potential dimension differences
-             max_len[key] = max(item[key].shape[-1] for item in batch) # Max length is in the last dimension
-        elif key in ['phoneme', 'duration']: # Phoneme-level sequences (Batch, Seq_Len)
-             max_len[key] = max(item[key].shape[0] for item in batch) # Max length is in the first dimension (after batch)
-        # Add other keys if they are sequences and need padding
+    # Define keys needing padding and their type
+    frame_keys = ['mel', 'f0', 'energy'] # Padded based on time dimension
+    phone_keys = ['phoneme', 'duration'] # Padded based on sequence length
+
+    # Determine max lengths
+    max_mel_len = 0
+    max_phone_len = 0
+    for item in batch:
+        if 'mel' in item: # Use mel length as the reference for frame-level sequences
+            # Mel shape is (Time, Features)
+            max_mel_len = max(max_mel_len, item['mel'].shape[0]) # Use shape[0] for time
+        if 'phoneme' in item: # Use phoneme length as the reference for phone-level sequences
+            max_phone_len = max(max_phone_len, item['phoneme'].shape[0])
 
     # Pad each item in the batch
     for item in batch:
+        # Store original lengths (FIXED)
+        if 'mel' in item: mel_lengths.append(item['mel'].shape[0]) # Use shape[0] for time
+        if 'phoneme' in item: phone_lengths.append(item['phoneme'].shape[0])
+
         for key in keys:
             data = item[key]
-            current_len = data.shape[-1] if key in ['mel', 'f0'] else data.shape[0]
-            target_len = max_len.get(key, current_len) # Use max_len if key needs padding
-            pad_value = 0.0 # Default padding value (adjust if needed, e.g., for phoneme IDs)
-
-            if current_len < target_len:
-                padding_size = target_len - current_len
-                if key in ['mel', 'f0']: # Pad time dimension (last)
-                    # Determine padding tuple based on data dimensions
-                    # Example: mel (Freq, Time) -> pad (0, padding_size)
-                    # Example: f0 (1, Time) -> pad (0, padding_size)
-                    # Example: f0 (Time) -> pad (0, padding_size)
-                    pad_dims = (0, padding_size)
-                    if data.dim() > 1: # Handle potential feature dimensions
-                         pad_dims = (0, 0) * (data.dim() - 1) + pad_dims
-                    padded_data = torch.nn.functional.pad(data, pad_dims, mode='constant', value=pad_value)
-                elif key in ['phoneme', 'duration']: # Pad sequence dimension (first after batch)
-                    # Example: phoneme (Seq_Len) -> pad (0, padding_size)
-                    padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
-                else: # Data doesn't need padding based on keys
+            pad_value = 0.0 # Default padding value
+            if key in frame_keys:
+                target_len = max_mel_len
+                # Data shape is (Time, Features) or (Time, 1)
+                current_len = data.shape[0] # Use shape[0] for time
+                if current_len < target_len:
+                    padding_size = target_len - current_len
+                    # Manual padding for clarity
+                    if data.dim() > 1: # e.g., mel (Time, Features)
+                        padded_data = torch.full((target_len,) + data.shape[1:], pad_value, dtype=data.dtype, device=data.device)
+                        padded_data[:current_len, ...] = data
+                    else: # e.g., f0, energy (Time,)
+                        padded_data = torch.full((target_len,), pad_value, dtype=data.dtype, device=data.device)
+                        padded_data[:current_len] = data
+                elif current_len > target_len: # Should not happen if max_mel_len is correct
+                    # Slice time dim
+                    padded_data = data[:target_len, ...] if data.dim() > 1 else data[:target_len]
+                else:
                     padded_data = data
-            elif current_len > target_len: # Should not happen if max_len is calculated correctly, but handle truncation just in case
-                 if key in ['mel', 'f0']:
-                      padded_data = data[..., :target_len] # Truncate last dim
-                 elif key in ['phoneme', 'duration']:
-                      padded_data = data[:target_len] # Truncate first dim
-                 else:
-                      padded_data = data
-            else: # No padding needed
+            elif key in phone_keys:
+                target_len = max_phone_len
+                current_len = data.shape[0]
+                # Use padding index 0 for phoneme IDs
+                pad_value = 0 if key == 'phoneme' else 0.0
+                if current_len < target_len:
+                    padding_size = target_len - current_len
+                    padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
+                elif current_len > target_len: # Should not happen if max_phone_len is correct
+                    padded_data = data[:target_len]
+                else:
+                    padded_data = data
+            else: # Data doesn't need padding based on keys (e.g., scalar values)
                 padded_data = data
 
             padded_batch[key].append(padded_data)
-            lengths[key].append(current_len) # Store original length
 
     # Stack tensors for each key
     final_batch = {}
@@ -284,11 +307,14 @@ def collate_fn_pad(batch):
                 print(f"  Item {i} shape: {t.shape}")
             raise e
 
-    # Optionally return lengths as well
-    # final_batch['lengths'] = lengths # Original comment
-    # Add mel lengths specifically for masking
-    if 'mel' in lengths:
-         final_batch['mel_lengths'] = torch.tensor(lengths['mel'], dtype=torch.long)
+    # Create masks and add lengths
+    phone_lengths_tensor = torch.tensor(phone_lengths, dtype=torch.long)
+    mel_lengths_tensor = torch.tensor(mel_lengths, dtype=torch.long)
+
+    final_batch['phone_lengths'] = phone_lengths_tensor
+    final_batch['mel_lengths'] = mel_lengths_tensor
+    final_batch['src_mask'] = create_mask(phone_lengths_tensor, max_phone_len) # Mask for encoder input
+    final_batch['mel_mask'] = create_mask(mel_lengths_tensor, max_mel_len)   # Mask for decoder output / variance adaptor input
 
     return final_batch
 
@@ -308,7 +334,8 @@ class DataModule(pl.LightningDataModule):
             # 'phoneme': config['data']['phoneme_key'], # Original - Loads frame-level phonemes
             'phoneme': 'phone_sequence', # Corrected - Loads phone-level sequence IDs
             'duration': config['data']['duration_key'],
-            'f0': config['data']['f0_key']
+            'f0': config['data']['f0_key'],
+            'energy': config['data']['energy_key'] # Added energy key
             # Optionally load frame-level phonemes under a different key if needed elsewhere
             # 'frame_phoneme': config['data']['phoneme_key'],
         }

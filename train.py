@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 # Import custom modules
 from data.dataset import DataModule # Assuming DataModule is in data/dataset.py
-from model import MinimalSVS        # Assuming MinimalSVS is in model.py
+from model import TransformerSVS    # Import the new Transformer model
 
 def train(config_path='config/model.yaml'):
     """
@@ -74,8 +74,9 @@ def train(config_path='config/model.yaml'):
 
 
     # --- 3. Initialize Model ---
-    print("Initializing MinimalSVS model...")
-    model = MinimalSVS(config)
+    print(f"Initializing {config['model']['name']} model...") # Use name from config
+    # Pass vocab_size explicitly to the model constructor
+    model = TransformerSVS(config, vocab_size=data_module.vocab_size)
     print("Model initialized successfully.")
 
     # --- 4. Configure Callbacks and Logger ---
@@ -91,7 +92,7 @@ def train(config_path='config/model.yaml'):
     # Saves the best model based on validation loss
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename='minimal-svs-{epoch:02d}-{val_loss:.2f}',
+        filename='transformer-svs-{epoch:02d}-{val_loss:.2f}', # Updated filename prefix
         save_top_k=1,          # Save only the best model
         monitor='val_loss',    # Monitor validation loss
         mode='min',            # Mode should be 'min' for loss

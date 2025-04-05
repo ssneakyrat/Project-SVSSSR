@@ -180,7 +180,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
 
 # --- Feature Extraction ---
 def extract_features(audio_path, config):
-    """Extracts log Mel spectrogram, log F0, and voiced mask."""
+    """Extracts log Mel spectrogram, log F0, and RMS energy."""
     sr = config['audio']['sample_rate']
     hop_length = config['audio']['hop_length']
     win_length = config['audio']['win_length']
@@ -194,37 +194,49 @@ def extract_features(audio_path, config):
     try:
         # Load audio
         audio, _ = librosa.load(audio_path, sr=sr)
-        audio = audio.astype(np.float64) # PyWorld requires float64
+        # Use float32 for librosa features, convert to float64 for pyworld if needed later
+        audio_float32 = audio.astype(np.float32)
 
         # Extract Mel spectrogram
         mel_spectrogram = librosa.feature.melspectrogram(
-            y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length,
+            y=audio_float32, sr=sr, n_fft=n_fft, hop_length=hop_length,
             win_length=win_length, n_mels=n_mels, fmin=fmin, fmax=fmax
         )
         # Log-scale Mel spectrogram (common practice)
         log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
         log_mel_spectrogram = log_mel_spectrogram.T # Shape (T, n_mels)
+        mel_frames = log_mel_spectrogram.shape[0]
 
         # Extract F0 using PyWorld
-        _f0, t = pw.dio(audio, sr, f0_floor=f0_min, f0_ceil=f0_max,
+        audio_float64 = audio.astype(np.float64) # PyWorld requires float64
+        _f0, t = pw.dio(audio_float64, sr, f0_floor=f0_min, f0_ceil=f0_max,
                         frame_period=hop_length * 1000 / sr)
-        f0 = pw.stonemask(audio, _f0, t, sr) # Refine F0
+        f0 = pw.stonemask(audio_float64, _f0, t, sr) # Refine F0
 
-        # Ensure F0 length matches Mel length (minor discrepancies can occur)
-        mel_frames = log_mel_spectrogram.shape[0]
+        # Ensure F0 length matches Mel length
         if len(f0) < mel_frames:
             f0 = np.pad(f0, (0, mel_frames - len(f0)), mode='constant', constant_values=0)
         elif len(f0) > mel_frames:
             f0 = f0[:mel_frames]
 
-        f0 = f0[:, np.newaxis] # Shape (T, 1)
-
         # Log-scale F0, handle zeros
         voiced_mask = f0 > 1e-8 # Use a small epsilon to avoid log(0)
         log_f0 = np.zeros_like(f0)
         log_f0[voiced_mask] = np.log(f0[voiced_mask])
+        log_f0 = log_f0[:, np.newaxis] # Shape (T, 1)
 
-        return log_mel_spectrogram, log_f0, voiced_mask.squeeze() # Return log_f0 and mask
+        # Extract RMS Energy
+        energy = librosa.feature.rms(y=audio_float32, frame_length=win_length, hop_length=hop_length)[0]
+
+        # Ensure energy length matches Mel length
+        if len(energy) < mel_frames:
+            energy = np.pad(energy, (0, mel_frames - len(energy)), mode='constant', constant_values=0)
+        elif len(energy) > mel_frames:
+            energy = energy[:mel_frames]
+
+        energy = energy[:, np.newaxis] # Shape (T, 1)
+
+        return log_mel_spectrogram, log_f0, energy # Return log_mel, log_f0, energy
 
     except Exception as e:
         logging.error(f"Error extracting features for {audio_path}: {e}")
@@ -351,13 +363,17 @@ def preprocess_data(config_path='config/model.yaml'):
     logging.info("Starting Pass 1: Extracting features and calculating normalization stats...")
     all_log_mels = []
     all_log_f0s_voiced = []
+    all_energies = [] # Added list for energy
 
     for pair in tqdm(file_pairs, desc="Pass 1: Extracting Features"):
-        log_mel, log_f0, voiced_mask = extract_features(pair['wav'], config)
-        if log_mel is not None and log_f0 is not None and voiced_mask is not None:
+        log_mel, log_f0, energy = extract_features(pair['wav'], config) # Unpack energy
+        # Check all returned features
+        if log_mel is not None and log_f0 is not None and energy is not None:
             # Store features for stat calculation
             all_log_mels.append(log_mel)
-            # Only consider voiced frames for F0 stats
+            all_energies.append(energy) # Store energy
+            # Only consider voiced frames for F0 stats (using log_f0 shape for mask)
+            voiced_mask = log_f0 > np.log(1e-8) # Recreate mask based on log_f0
             if np.any(voiced_mask):
                  all_log_f0s_voiced.append(log_f0[voiced_mask])
         else:
@@ -373,6 +389,7 @@ def preprocess_data(config_path='config/model.yaml'):
     # Concatenate all features
     all_log_mels_np = np.concatenate(all_log_mels, axis=0)
     all_log_f0s_voiced_np = np.concatenate(all_log_f0s_voiced, axis=0)
+    all_energies_np = np.concatenate(all_energies, axis=0) # Concatenate energy
 
     # Calculate Mel stats
     mel_mean = np.mean(all_log_mels_np, axis=0)
@@ -387,6 +404,13 @@ def preprocess_data(config_path='config/model.yaml'):
         logging.warning(f"F0 standard deviation is very low ({f0_std}). Setting to 1e-5.")
         f0_std = 1e-5
 
+    # Calculate Energy stats
+    energy_mean = np.mean(all_energies_np)
+    energy_std = np.std(all_energies_np)
+    if energy_std < 1e-5:
+        logging.warning(f"Energy standard deviation is very low ({energy_std}). Setting to 1e-5.")
+        energy_std = 1e-5
+
     logging.info(f"Calculated Mel Mean shape: {mel_mean.shape}, Mel Std shape: {mel_std.shape}")
     logging.info(f"Calculated F0 Mean (voiced, log): {f0_mean:.4f}, F0 Std (voiced, log): {f0_std:.4f}")
 
@@ -394,8 +418,10 @@ def preprocess_data(config_path='config/model.yaml'):
     norm_stats = {
         'mel_mean': mel_mean.tolist(), # Convert to list for JSON
         'mel_std': mel_std.tolist(),
-        'f0_mean': f0_mean,
-        'f0_std': f0_std
+        'f0_mean': float(f0_mean),
+        'f0_std': float(f0_std),
+        'energy_mean': float(energy_mean), # Add energy stats
+        'energy_std': float(energy_std)
     }
     try:
         with open(stats_file_path, 'w') as f_stats:
@@ -427,9 +453,9 @@ def preprocess_data(config_path='config/model.yaml'):
 
         logging.debug(f"Processing: {base_filename}")
 
-        # 1. Re-extract Mel and F0 (or retrieve if stored - re-extracting is simpler here)
-        log_mel, log_f0, voiced_mask = extract_features(wav_path, config)
-        if log_mel is None: # Check again just in case
+        # 1. Re-extract Mel, F0, and Energy
+        log_mel, log_f0, energy = extract_features(wav_path, config) # Unpack energy
+        if log_mel is None or log_f0 is None or energy is None: # Check all features
             logging.warning(f"Skipping {base_filename} due to feature extraction error in Pass 2.")
             continue
 
@@ -437,14 +463,19 @@ def preprocess_data(config_path='config/model.yaml'):
 
         # 2. Normalize features
         norm_log_mel = (log_mel - mel_mean) / mel_std
+        # Recreate voiced mask based on log_f0 for normalization
+        voiced_mask = log_f0 > np.log(1e-8)
         norm_log_f0 = np.zeros_like(log_f0) # Initialize with zeros (unvoiced)
         if np.any(voiced_mask): # Apply normalization only to voiced frames
             norm_log_f0[voiced_mask] = (log_f0[voiced_mask] - f0_mean) / f0_std
+        # Normalize energy
+        norm_energy = (energy - energy_mean) / energy_std
 
-        # 3. Pad/Truncate NORMALIZED Mel and F0 to target_frames
+        # 3. Pad/Truncate NORMALIZED features to target_frames
         # Pad normalized mel with 0? Or with normalized mean? Padding with 0 is common.
         padded_norm_mel = pad_or_truncate(norm_log_mel, target_frames, pad_value=0.0)
         padded_norm_f0 = pad_or_truncate(norm_log_f0, target_frames, pad_value=0.0)
+        padded_norm_energy = pad_or_truncate(norm_energy, target_frames, pad_value=0.0) # Pad energy
 
         # 4. Parse Labels (get timestamps and phones)
         lab_entries, unique_phones_in_file, max_end_time = parse_lab_file(lab_path)
@@ -503,6 +534,7 @@ def preprocess_data(config_path='config/model.yaml'):
         processed_data[base_filename] = {
             'mel': padded_norm_mel, # Store normalized mel
             'f0': padded_norm_f0,   # Store normalized f0
+            'energy': padded_norm_energy, # Store normalized energy
             'phone_sequence': initial_phones,
             'duration_sequence': np.array(adjusted_durations, dtype=np.int32),
             'initial_duration_sequence': np.array(initial_durations, dtype=np.int32) # Keep for potential analysis/vis
@@ -545,6 +577,8 @@ def preprocess_data(config_path='config/model.yaml'):
             f.attrs['mel_std'] = mel_std
             f.attrs['f0_mean'] = f0_mean
             f.attrs['f0_std'] = f0_std
+            f.attrs['energy_mean'] = energy_mean # Add energy stats
+            f.attrs['energy_std'] = energy_std
             logging.info(f"Saved vocab_size ({vocab_size}) and normalization stats as HDF5 attributes.")
 
             # Save data for each file
@@ -563,13 +597,15 @@ def preprocess_data(config_path='config/model.yaml'):
 
 
                 # Save datasets (using keys from config)
+                # TODO: Add 'energy_key' to config/model.yaml
+                energy_key = data_config.get('energy_key', 'energy') # Default key if not in config yet
                 group.create_dataset(data_config['mel_key'], data=data['mel'], compression="gzip") # Normalized mel
                 group.create_dataset(data_config['f0_key'], data=data['f0'], compression="gzip")   # Normalized f0
+                group.create_dataset(energy_key, data=data['energy'], compression="gzip") # Normalized energy
                 group.create_dataset(data_config['phoneme_key'], data=frame_level_phone_ids, compression="gzip") # Frame-level IDs
                 group.create_dataset(data_config['duration_key'], data=data['duration_sequence'], compression="gzip") # Adjusted durations per phone
                 group.create_dataset('phone_sequence', data=phone_sequence_ids, compression="gzip") # IDs corresponding to durations
                 # group.create_dataset('initial_duration_sequence', data=data['initial_duration_sequence'], compression="gzip") # Optional: Save initial durations
-
         logging.info("HDF5 file saved successfully.")
 
     except Exception as e:

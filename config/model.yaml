@@ -4,16 +4,17 @@ data:
   bin_dir: datasets
   bin_file: mel_spectrograms.h5
   mel_key: mel_spectrograms # Key for target mel spectrograms
-  phoneme_key: phonemes     # Key for input phoneme sequences
-  duration_key: durations   # Key for input duration sequences
-  f0_key: f0                # Key for input F0 sequences
+  phoneme_key: phonemes     # Key for input phoneme sequences (frame-level IDs after preprocessing)
+  duration_key: durations   # Key for ground-truth duration sequences (per phone)
+  f0_key: f0                # Key for ground-truth F0 sequences (frame-level, log scale)
+  energy_key: energy        # Key for ground-truth energy sequences (frame-level)
   lazy_load: true
   raw_dir: datasets/gin
   # max_samples: 100 # Set to null or remove to use full dataset
   sample_percentage: null
-  variable_length: true
+  variable_length: true # Note: Padding will happen in collate_fn for Transformer
   min_phones_in_lab: 5 # Minimum number of phone entries required in a .lab file to process it
-  
+
 audio:
   sample_rate: 22050
   n_fft: 1024
@@ -24,34 +25,57 @@ audio:
   fmax: 8000
   f0_min: 50
   f0_max: 600
-  max_audio_length: 10.0
+  max_audio_length: 10.0 # Used for padding length calculation in preprocessing
 
 # Model specific parameters
 model:
-  # Architecture details for MinimalSVS
-  name: MinimalSVS # Identifier for the model class
-  embedding_dim: 128
-  f0_dim: 1           # Dimension of F0 input (usually 1)
-  rnn_hidden_dim: 512 # Increased hidden size
-  rnn_layers: 2
-  mel_bins: 80        # Output dimension (should match audio.n_mels)
-  # Post-Net Configuration
-  postnet:
-    n_convs: 5        # Number of convolutional layers in the Post-Net
-    kernel_size: 5    # Kernel size for Post-Net convolutions
-    channels: 512     # Number of channels in Post-Net convolutions
+  # Architecture details for TransformerSVS (FastSpeech 2 style)
+  name: TransformerSVS # Identifier for the model class
+  embedding_dim: 128    # Phoneme embedding dimension
+  mel_bins: 80          # Output dimension (should match audio.n_mels)
+  # Vocab size will be read from HDF5 attributes
+
+  transformer:
+    hidden_dim: 256       # Internal dimension of Transformer blocks
+    encoder_layers: 4     # Number of encoder layers
+    encoder_heads: 2      # Number of attention heads in encoder
+    decoder_layers: 4     # Number of decoder layers
+    decoder_heads: 2      # Number of attention heads in decoder
+    conv_filter_size: 1024 # Dimension of the inner Conv1D layer in FFN
+    conv_kernel_size: 9   # Kernel size of the Conv1D layer in FFN
+    dropout: 0.2          # Dropout rate for Transformer blocks
+
+  variance_adaptor:
+    hidden_dim: 256       # Hidden dimension for predictors
+    kernel_size: 3        # Kernel size for predictor Conv1D layers
+    dropout: 0.5          # Dropout rate for predictors
+    pitch_feature_level: "frame" # Pitch prediction target level
+    energy_feature_level: "frame" # Energy prediction target level
+    # Duration is predicted per phoneme implicitly
 
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
-  learning_rate: 0.001    # Increased learning rate
-  epochs: 50            # Number of training epochs
+  learning_rate: 0.001    # Initial learning rate (consider AdamW and scheduler)
+  epochs: 200          # Increase epochs for Transformer training
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
   tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs (relative to log_dir)
   checkpoint_dir: checkpoints # Subdirectory for model checkpoints (relative to log_dir)
-  save_interval: 100      # Save checkpoint every N epochs
+  save_interval: 10     # Save checkpoint every N epochs (more frequent might be good)
   num_workers: 4        # DataLoader workers (adjust based on system)
   log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps
-  gradient_clip_val: 1.0 # Added gradient clipping value
-  # Add any other training-specific parameters here (e.g., optimizer type, scheduler settings)
+  gradient_clip_val: 1.0 # Gradient clipping value
+
+  # Loss weights for multi-task learning
+  loss_weights:
+    mel: 1.0
+    duration: 1.0 # Weight for duration predictor loss (MSE on log duration)
+    pitch: 1.0    # Weight for pitch predictor loss (MSE on log F0)
+    energy: 1.0   # Weight for energy predictor loss (MSE on energy)
+  warmup_steps: 4000 # Added for Noam scheduler configuration
+
+  # Add optimizer/scheduler settings if needed (e.g., AdamW parameters, warmup steps)
+  # optimizer: AdamW
+  # scheduler: WarmupDecay (e.g., Noam scheduler)
+  # warmup_steps: 4000
