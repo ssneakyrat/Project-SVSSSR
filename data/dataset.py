@@ -1,3 +1,7 @@
+import warnings
+# Filter the specific h5py UserWarning about HDF5 version mismatch
+warnings.filterwarnings("ignore", message=r"h5py is running against HDF5.*when it was built against.*", category=UserWarning)
+
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import pytorch_lightning as pl

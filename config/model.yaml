@@ -56,7 +56,10 @@ model:
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
-  epochs: 1000           # GANs often require more epochs, adjust as needed
+  epochs_per_stage:
+    stage1: 30
+    stage2: 100
+    stage3: 150
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
   tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs
@@ -70,6 +73,7 @@ train:
   lr_factor: 0.5          # Factor by which the learning rate will be reduced (scheduler)
   lr_patience: 10         # Number of epochs with no improvement after which learning rate will be reduced (scheduler)
   # gradient_clip_val: 1.0 # Optional: Gradient clipping value
+  freeze_loaded_weights: true # Default: Freeze weights when loading from ckpt
 
   # log_interval defines log_every_n_steps in Trainer
   log_interval: 50        # Log training metrics every N steps

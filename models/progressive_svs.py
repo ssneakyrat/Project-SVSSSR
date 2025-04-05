@@ -107,8 +107,10 @@ class ProgressiveSVS(pl.LightningModule):
         # Encode input features
         features = self.feature_encoder(f0, phone_label, phone_duration, midi_label)
         
+        
         # Stage 1: Low-Resolution Model (20×216)
         low_res_output = self.low_res_model(features)
+        
         
         if self.current_stage == 1:
             return low_res_output
@@ -121,6 +123,7 @@ class ProgressiveSVS(pl.LightningModule):
         
         # Stage 3: High-Resolution Upsampler (80×864)
         high_res_output = self.high_res_upsampler(mid_res_output)
+        
         
         return high_res_output
     
@@ -175,19 +178,30 @@ class ProgressiveSVS(pl.LightningModule):
             mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
             mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
 
+            # Upsample time dimension by factor of 2 (assuming 862*2=1724)
+            target_time_dim = t * 2
             mel_target = F.interpolate(
                 mel_specs_4d,
-                size=(freq_dim, t), # Target shape (Freq, Time)
+                size=(freq_dim, target_time_dim), # Target shape (Freq, Time * 2)
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to (B, F', T)
+            ).squeeze(1)  # Back to (B, F', T*2)
 
             # Permute back to (B, T, F')
             mel_target = mel_target.permute(0, 2, 1)
             
-            # Resize mask to match new frequency dimension
-            # Expand mask to match mel_target shape (B, T, F')
-            mask = mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T, F')
+            # Upsample mask along time dimension to match target_time_dim (T*2)
+            # Original mask shape: (B, T) where T=862
+            # Target mask shape: (B, T*2, F') where T*2=1724
+            mask_float = mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            upsampled_mask = F.interpolate(
+                mask_float,
+                size=(1, target_time_dim), # Target shape (1, Time*2)
+                mode='nearest'
+            ).squeeze(1).squeeze(1) # Back to (B, T*2)
+
+            # Expand upsampled mask to match mel_target frequency dimension (F')
+            mask = upsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T*2, F')
             
         else:
             # Full resolution for final stage
@@ -265,19 +279,30 @@ class ProgressiveSVS(pl.LightningModule):
             mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
             mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
 
+            # Upsample time dimension by factor of 2 (assuming 862*2=1724)
+            target_time_dim = t * 2
             mel_target = F.interpolate(
                 mel_specs_4d,
-                size=(freq_dim, t), # Target shape (Freq, Time)
+                size=(freq_dim, target_time_dim), # Target shape (Freq, Time * 2)
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to (B, F', T)
+            ).squeeze(1)  # Back to (B, F', T*2)
 
             # Permute back to (B, T, F')
             mel_target = mel_target.permute(0, 2, 1)
             
-            # Resize mask to match new frequency dimension
-            # Expand mask to match mel_target shape (B, T, F')
-            mask = mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T, F')
+            # Upsample mask along time dimension to match target_time_dim (T*2)
+            # Original mask shape: (B, T) where T=862
+            # Target mask shape: (B, T*2, F') where T*2=1724
+            mask_float = mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            upsampled_mask = F.interpolate(
+                mask_float,
+                size=(1, target_time_dim), # Target shape (1, Time*2)
+                mode='nearest'
+            ).squeeze(1).squeeze(1) # Back to (B, T*2)
+
+            # Expand upsampled mask to match mel_target frequency dimension (F')
+            mask = upsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T*2, F')
             
         else:
             # Full resolution for final stage
@@ -287,10 +312,15 @@ class ProgressiveSVS(pl.LightningModule):
         
         # Handle dimensionality issues
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
-            mel_pred = mel_pred.squeeze(1)
+            mel_pred = mel_pred.squeeze(1) # Shape becomes [B, F, T_pred]
+            # Permute mel_pred to match mel_target shape [B, T, F]
+            mel_pred = mel_pred.permute(0, 2, 1) # Shape becomes [B, T_pred, F]
             
         if mel_target.dim() == 3 and mel_pred.dim() == 2:
+            # This condition should no longer be met after permutation
             mel_pred = mel_pred.unsqueeze(0)
+        
+        # --- End logging ---
         
         # Compute masked loss
         loss = self.loss_fn(mel_pred, mel_target)

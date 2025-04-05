@@ -7,6 +7,9 @@ import yaml
 import numpy as np
 import librosa
 import pyworld as pw
+import warnings
+# Filter the specific h5py UserWarning about HDF5 version mismatch
+warnings.filterwarnings("ignore", message=r"h5py is running against HDF5.*when it was built against.*", category=UserWarning)
 import h5py
 from tqdm import tqdm
 import json
