@@ -142,7 +142,20 @@ def main():
     # Run inference
     print(f"Running inference with model at stage {model.current_stage}...")
     with torch.no_grad():
-        mel_output = model(f0, phone_label, phone_durations, midi_label)
+        # Calculate sequence length based on F0
+        # Create a simple binary "has content" mask from F0
+        f0_mask = (f0[0] > 0.0).float()
+        # Find the last non-zero position
+        if torch.any(f0_mask):
+            seq_length = torch.argwhere(f0_mask)[-1].item() + 1
+        else:
+            seq_length = f0.shape[1]  # Use full length if no content detected
+        
+        # Create a tensor for lengths
+        lengths = torch.tensor([seq_length], device=f0.device)
+        
+        # Pass lengths to model
+        mel_output = model(f0, phone_label, phone_durations, midi_label, lengths)
     
     # Ensure the output directory exists
     os.makedirs(os.path.dirname(args.output), exist_ok=True)

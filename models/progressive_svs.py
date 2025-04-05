@@ -115,7 +115,37 @@ class ProgressiveSVS(pl.LightningModule):
         # Loss function
         self.loss_fn = nn.L1Loss(reduction='none')
         
-    def forward(self, f0, phone_label, phone_duration, midi_label):
+    def _apply_length_mask(self, mel_output, lengths):
+        """Apply length mask to generated output"""
+        batch_size = mel_output.size(0)
+        
+        # Determine dimensions based on output shape and stage
+        if mel_output.dim() == 4:  # [B, 1, F, T]
+            freq_dim = mel_output.size(2)
+            time_dim = mel_output.size(3)
+            # Create time dimension mask
+            mask = torch.arange(time_dim, device=lengths.device).expand(batch_size, time_dim) < lengths.unsqueeze(1)
+            # Reshape for broadcasting [B, 1, 1, T]
+            mask = mask.unsqueeze(1).unsqueeze(1)
+            # Expand across frequency dimension [B, 1, F, T]
+            mask = mask.expand(-1, -1, freq_dim, -1)
+        elif mel_output.dim() == 3:  # [B, F, T]
+            freq_dim = mel_output.size(1)
+            time_dim = mel_output.size(2)
+            # Create time dimension mask
+            mask = torch.arange(time_dim, device=lengths.device).expand(batch_size, time_dim) < lengths.unsqueeze(1)
+            # Reshape for broadcasting [B, 1, T]
+            mask = mask.unsqueeze(1)
+            # Expand across frequency dimension [B, F, T]
+            mask = mask.expand(-1, freq_dim, -1)
+        else:
+            return mel_output
+        
+        # Apply mask: keep values where mask is True, set to 0 otherwise
+        masked_output = torch.where(mask, mel_output, torch.zeros_like(mel_output))
+        return masked_output
+
+    def forward(self, f0, phone_label, phone_duration, midi_label, lengths=None):
         """Forward pass through the model based on current stage"""
         # Encode input features
         features = self.feature_encoder(f0, phone_label, phone_duration, midi_label)
@@ -124,6 +154,10 @@ class ProgressiveSVS(pl.LightningModule):
         low_res_output = self.low_res_model(features)
         
         if self.current_stage == 1:
+            if lengths is not None:
+                # Scale lengths for low res
+                scaled_lengths = torch.ceil(lengths / self.low_res_scale).long()
+                low_res_output = self._apply_length_mask(low_res_output, scaled_lengths)
             return low_res_output
         
         # Stage 2: Mid-Resolution Upsampler (40×432)
@@ -134,6 +168,10 @@ class ProgressiveSVS(pl.LightningModule):
         mid_res_output = self.mid_res_upsampler(low_res_output)
         
         if self.current_stage == 2:
+            if lengths is not None:
+                # Scale lengths for mid res
+                scaled_lengths = torch.ceil(lengths / self.mid_res_scale).long()
+                mid_res_output = self._apply_length_mask(mid_res_output, scaled_lengths)
             return mid_res_output
         
         # Stage 3: High-Resolution Upsampler (80×864)
@@ -142,6 +180,9 @@ class ProgressiveSVS(pl.LightningModule):
             mid_res_output = mid_res_output.unsqueeze(1)
             
         high_res_output = self.high_res_upsampler(mid_res_output)
+        
+        if lengths is not None:
+            high_res_output = self._apply_length_mask(high_res_output, lengths)
         
         return high_res_output
     
@@ -188,7 +229,7 @@ class ProgressiveSVS(pl.LightningModule):
         lengths = batch['length']  # [B]
         
         # Forward pass
-        mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        mel_pred = self(f0, phone_label, phone_duration, midi_label, lengths)
         
         # Get proper target for current stage
         mel_target = self._get_stage_target(mel_specs, self.current_stage)
@@ -255,7 +296,7 @@ class ProgressiveSVS(pl.LightningModule):
         lengths = batch['length']
         
         # Forward pass
-        mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        mel_pred = self(f0, phone_label, phone_duration, midi_label, lengths)
         
         # Get proper target for current stage
         mel_target = self._get_stage_target(mel_specs, self.current_stage)
