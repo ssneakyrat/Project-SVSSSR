@@ -1,0 +1,18 @@
+HDF5 File Structure:
+--------------------
+/MIDI_PITCH (Dataset): Shape=(111,), Dtype=object
+/f0_values (Dataset): Shape=(111, 862), Dtype=float32
+/file_ids (Dataset): Shape=(111,), Dtype=object
+/lengths (Dataset): Shape=(111,), Dtype=int32
+/mel_spectrograms (Dataset): Shape=(111, 80, 862), Dtype=float32
+  Attributes:
+    - hop_length: 256
+    - max_frames: 862
+    - n_fft: 1024
+    - n_mels: 80
+    - sample_rate: 22050
+    - variable_length: True
+/phone_frame_ends (Dataset): Shape=(111,), Dtype=object
+/phone_frame_starts (Dataset): Shape=(111,), Dtype=object
+/phone_map (Dataset): Shape=(54,), Dtype=object
+/phone_texts (Dataset): Shape=(111,), Dtype=object
