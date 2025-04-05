@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import io
 from PIL import Image
 import torchvision
+import numpy as np
 
 from models.blocks import LowResModel, MidResUpsampler, HighResUpsampler
 
@@ -74,25 +75,40 @@ class ProgressiveSVS(pl.LightningModule):
         self.low_res_model = LowResModel(
             input_dim, 
             config['model']['low_res_channels'], 
-            output_dim=low_res_freq_bins  # Now using correct dimension
+            output_dim=low_res_freq_bins
         )
         
         # Stage 2: Mid-Resolution Upsampler (40×432)
         self.mid_res_upsampler = MidResUpsampler(
-            low_res_freq_bins,  # Input is output of previous stage
+            low_res_freq_bins,
             config['model']['mid_res_channels'], 
             output_dim=mid_res_freq_bins
         )
         
         # Stage 3: High-Resolution Upsampler (80×864)
         self.high_res_upsampler = HighResUpsampler(
-            mid_res_freq_bins,  # Input is output of previous stage
+            mid_res_freq_bins,
             config['model']['high_res_channels'], 
             output_dim=full_mel_bins
         )
         
         # Loss function
         self.loss_fn = nn.L1Loss(reduction='none')
+        
+        # Adjust learning rates for different stages
+        self.stage_lr_scale = {
+            1: 1.0,    # Full learning rate for Stage 1
+            2: 0.5,    # Half learning rate for Stage 2
+            3: 0.1     # 1/10th learning rate for Stage 3
+        }
+        
+        # For tracking metrics across batches
+        self.last_batch_stats = {
+            'mean': 0.0,
+            'std': 0.0,
+            'min': 0.0,
+            'max': 0.0
+        }
         
     def forward(self, f0, phone_label, phone_duration, midi_label):
         # Encode input features
@@ -105,15 +121,55 @@ class ProgressiveSVS(pl.LightningModule):
             return low_res_output
         
         # Stage 2: Mid-Resolution Upsampler (40×432)
+        # Ensure the input shape is correct for mid_res_upsampler
+        if low_res_output.dim() != 3:
+            print(f"WARNING: Unexpected low_res_output shape: {low_res_output.shape}")
+            # Attempt to reshape if needed
+            if low_res_output.dim() == 4 and low_res_output.size(1) == 1:
+                low_res_output = low_res_output.squeeze(1)
+        
         mid_res_output = self.mid_res_upsampler(low_res_output)
         
         if self.current_stage == 2:
             return mid_res_output
         
         # Stage 3: High-Resolution Upsampler (80×864)
+        # Ensure mid_res_output is in the right shape for high_res_upsampler
+        if mid_res_output.dim() != 4 or mid_res_output.size(1) != 1:
+            print(f"WARNING: Unexpected mid_res_output shape: {mid_res_output.shape}")
+            # Log more details about the tensor
+            if mid_res_output.dim() == 3:
+                # Assuming [B, C, T] -> needs to be [B, 1, C, T]
+                print("Reshaping mid_res_output from 3D to 4D")
+                mid_res_output = mid_res_output.unsqueeze(1)
+        
         high_res_output = self.high_res_upsampler(mid_res_output)
         
         return high_res_output
+    
+    def _calculate_stage_specific_loss(self, pred, target, mask=None):
+        """
+        Calculate stage-specific loss with adaptive weighting
+        """
+        # Stage 3 may need additional stabilization with regularization
+        loss = self.loss_fn(pred, target)
+        
+        if mask is not None:
+            # Apply mask to loss - only consider valid timesteps
+            loss = loss * mask.float()
+            # Normalize by actual lengths
+            loss = loss.sum() / (mask.sum() + 1e-8)
+        else:
+            loss = loss.mean()
+            
+        # Add stability regularization for Stage 3
+        if self.current_stage == 3:
+            # Add small L2 regularization on the predictions
+            # This helps stabilize training when working with fine details
+            reg_loss = 0.0001 * (pred ** 2).mean()
+            loss = loss + reg_loss
+            
+        return loss
     
     def validation_step(self, batch, batch_idx):
         mel_specs = batch['mel_spec']
@@ -134,6 +190,32 @@ class ProgressiveSVS(pl.LightningModule):
         if batch_idx == 0:
             print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
             print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
+            
+            # Add more detailed debug info for Stage 3
+            if self.current_stage == 3:
+                curr_mean = mel_pred.mean().item()
+                curr_std = mel_pred.std().item()
+                curr_min = mel_pred.min().item()
+                curr_max = mel_pred.max().item()
+                
+                print(f"Stage 3 - Prediction stats: mean={curr_mean:.4f}, std={curr_std:.4f}, min={curr_min:.4f}, max={curr_max:.4f}")
+                
+                # Check if prediction is changing between batches
+                if hasattr(self, 'last_batch_stats'):
+                    prev_mean = self.last_batch_stats['mean']
+                    prev_std = self.last_batch_stats['std']
+                    prev_min = self.last_batch_stats['min']
+                    prev_max = self.last_batch_stats['max']
+                    
+                    print(f"Prediction stats change - Mean: {curr_mean-prev_mean:.6f}, Std: {curr_std-prev_std:.6f}")
+                    print(f"                          Min: {curr_min-prev_min:.6f}, Max: {curr_max-prev_max:.6f}")
+                
+                self.last_batch_stats = {
+                    'mean': curr_mean,
+                    'std': curr_std,
+                    'min': curr_min,
+                    'max': curr_max
+                }
         
         # Handle dimensionality issues (in case prediction is 4D)
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
@@ -172,19 +254,15 @@ class ProgressiveSVS(pl.LightningModule):
             print(f"Stage {self.current_stage} - Target shape after interpolation: {mel_target.shape}")
             print(f"Stage {self.current_stage} - Mask shape: {mask.shape}")
         
-        # Compute masked loss
-        loss = self.loss_fn(mel_pred, mel_target)
-        
-        # Apply mask to loss - only consider valid timesteps
-        loss = loss * mask.float()
-        
-        # Normalize by actual lengths
-        loss = loss.sum() / (mask.sum() + 1e-8)
+        # Compute loss with stage-specific adaptations
+        loss = self._calculate_stage_specific_loss(mel_pred, mel_target, mask)
         
         self.log('val_loss', loss, prog_bar=True)
         
         # Visualize first sample in batch at appropriate intervals
-        if batch_idx == 0 and self.current_epoch % 5 == 0:
+        # For Stage 3, visualize more frequently
+        vis_interval = 1 if self.current_stage == 3 else 5
+        if batch_idx == 0 and self.current_epoch % vis_interval == 0:
             # Use shape from prediction for visualization
             self._log_mel_comparison(
                 mel_pred[0].detach().cpu(), 
@@ -209,9 +287,17 @@ class ProgressiveSVS(pl.LightningModule):
         mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
         
         # Print debug info occasionally
-        if batch_idx % 50 == 0:
+        debug_interval = 10 if self.current_stage == 3 else 50
+        if batch_idx % debug_interval == 0:
             print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
             print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
+            
+            # Add more detailed debug info for Stage 3
+            if self.current_stage == 3:
+                print(f"Stage 3 - Prediction min/max/mean: {mel_pred.min():.4f}/{mel_pred.max():.4f}/{mel_pred.mean():.4f}")
+                
+                # For Stage 3, log gradient norms periodically (using on_after_backward instead of direct calls)
+                self.log('train_loss_batch', self.trainer.progress_bar_metrics.get('train_loss', 0), prog_bar=False)
         
         # Handle dimensionality issues (in case prediction is 4D)
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
@@ -242,39 +328,76 @@ class ProgressiveSVS(pl.LightningModule):
         mask = new_mask.unsqueeze(1).expand(-1, target_freq_dim, -1)
         
         # Debug occasionally
-        if batch_idx % 50 == 0:
+        if batch_idx % debug_interval == 0:
             print(f"Stage {self.current_stage} - Target shape after interpolation: {mel_target.shape}")
         
-        # Compute masked loss
-        loss = self.loss_fn(mel_pred, mel_target)
+        # Compute loss with stage-specific adaptations
+        loss = self._calculate_stage_specific_loss(mel_pred, mel_target, mask)
         
-        # Apply mask to loss - only consider valid timesteps
-        loss = loss * mask.float()
-        
-        # Normalize by actual lengths
-        loss = loss.sum() / (mask.sum() + 1e-8)
-        
+        # Log training loss properly (WITHOUT manually calling backward)
         self.log('train_loss', loss, prog_bar=True)
+        
         return loss
     
+    def on_after_backward(self):
+        """Called after backward pass to log gradients without interfering with PyTorch Lightning"""
+        # Only track gradients occasionally and for Stage 3
+        if self.current_stage == 3 and self.global_step % 50 == 0:
+            grad_norms = {}
+            for name, module in [
+                ('encoder', self.feature_encoder),
+                ('low_res', self.low_res_model),
+                ('mid_res', self.mid_res_upsampler),
+                ('high_res', self.high_res_upsampler)
+            ]:
+                total_norm = 0
+                param_count = 0
+                for p in module.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                        param_count += 1
+                
+                if param_count > 0:
+                    total_norm = total_norm ** 0.5
+                    grad_norms[f'grad_norm_{name}'] = total_norm
+                    print(f"Gradient norm {name}: {total_norm:.6f}")
+            
+            # Log gradient norms to tensorboard
+            self.logger.experiment.add_scalars(
+                'gradient_norms',
+                grad_norms,
+                self.global_step
+            )
+    
     def _log_mel_comparison(self, pred_mel, target_mel):
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        # Create enhanced visualization for comparison
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10))
         
         # Plot prediction
-        im1 = ax1.imshow(pred_mel.numpy(), origin='lower', aspect='auto')
-        ax1.set_title(f'Predicted Mel (Stage {self.current_stage})')
-        plt.colorbar(im1, ax=ax1)
+        im1 = axes[0].imshow(pred_mel.numpy(), origin='lower', aspect='auto', 
+                            vmin=0, vmax=1)
+        axes[0].set_title(f'Predicted Mel (Stage {self.current_stage})')
+        plt.colorbar(im1, ax=axes[0])
         
         # Plot ground truth
-        im2 = ax2.imshow(target_mel.numpy(), origin='lower', aspect='auto')
-        ax2.set_title('Target Mel')
-        plt.colorbar(im2, ax=ax2)
+        im2 = axes[1].imshow(target_mel.numpy(), origin='lower', aspect='auto',
+                            vmin=0, vmax=1)
+        axes[1].set_title('Target Mel')
+        plt.colorbar(im2, ax=axes[1])
+        
+        # Plot difference
+        diff = np.abs(pred_mel.numpy() - target_mel.numpy())
+        im3 = axes[2].imshow(diff, origin='lower', aspect='auto', 
+                            cmap='hot', vmin=0, vmax=0.5)
+        axes[2].set_title('Absolute Difference')
+        plt.colorbar(im3, ax=axes[2])
         
         plt.tight_layout()
         
         # Convert plot to image
         buf = io.BytesIO()
-        plt.savefig(buf, format='png')
+        plt.savefig(buf, format='png', dpi=150)
         buf.seek(0)
         
         # Convert to tensor
@@ -288,21 +411,83 @@ class ProgressiveSVS(pl.LightningModule):
             self.current_epoch
         )
         
+        # For Stage 3, add separate frequency band visualizations
+        if self.current_stage == 3:
+            # Split into frequency bands (lower, middle, upper)
+            freq_bands = 3
+            band_size = pred_mel.shape[0] // freq_bands
+            
+            for i in range(freq_bands):
+                start_idx = i * band_size
+                end_idx = (i+1) * band_size if i < freq_bands-1 else pred_mel.shape[0]
+                
+                # Create visualization for this band
+                fig, axes = plt.subplots(2, 1, figsize=(10, 6))
+                
+                # Plot this frequency band
+                axes[0].imshow(pred_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
+                axes[0].set_title(f'Predicted Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
+                
+                axes[1].imshow(target_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
+                axes[1].set_title(f'Target Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
+                
+                plt.tight_layout()
+                
+                # Convert plot to image
+                band_buf = io.BytesIO()
+                plt.savefig(band_buf, format='png')
+                band_buf.seek(0)
+                
+                # Convert to tensor
+                band_img = Image.open(band_buf)
+                band_img_tensor = torchvision.transforms.ToTensor()(band_img)
+                
+                # Log to tensorboard
+                self.logger.experiment.add_image(
+                    f'freq_band_{i+1}_stage{self.current_stage}', 
+                    band_img_tensor, 
+                    self.current_epoch
+                )
+                
+                plt.close(fig)
+        
         plt.close(fig)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.parameters(), 
-            lr=self.config['train']['learning_rate'],
-            weight_decay=self.config['train']['weight_decay']
-        )
+        # Implement stage-specific learning rates
+        base_lr = self.config['train']['learning_rate']
+        stage_lr = base_lr * self.stage_lr_scale.get(self.current_stage, 1.0)
+        
+        print(f"Using stage-specific learning rate: {stage_lr} (base: {base_lr}, scale: {self.stage_lr_scale.get(self.current_stage, 1.0)})")
+        
+        # For Stage 3, use AdamW with slightly different parameters
+        if self.current_stage == 3:
+            optimizer = torch.optim.AdamW(
+                self.parameters(), 
+                lr=stage_lr,
+                weight_decay=self.config['train']['weight_decay'],
+                eps=1e-5,  # Increase epsilon for better stability
+                betas=(0.9, 0.999)  # Default betas, but being explicit
+            )
+        else:
+            optimizer = torch.optim.Adam(
+                self.parameters(), 
+                lr=stage_lr,
+                weight_decay=self.config['train']['weight_decay']
+            )
+        
+        # Increase scheduler patience for Stage 3
+        patience = self.config['train']['lr_patience']
+        if self.current_stage == 3:
+            patience = max(patience, 10)  # More patience for Stage 3
         
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=self.config['train']['lr_factor'],
-            patience=self.config['train']['lr_patience'],
-            verbose=True
+            patience=patience,
+            verbose=True,
+            min_lr=1e-6  # Add a minimum lr to prevent going too low
         )
         
         return {
@@ -314,3 +499,23 @@ class ProgressiveSVS(pl.LightningModule):
                 'frequency': 1
             }
         }
+        
+    def on_train_start(self):
+        # Optionally freeze earlier stages when training Stage 3
+        if self.current_stage == 3:
+            # Check if we should freeze earlier stages (could be a config option)
+            freeze_earlier_stages = self.config['train'].get('freeze_earlier_stages', False)
+            
+            if freeze_earlier_stages:
+                print("Freezing weights for Stage 1 and Stage 2 components")
+                # Freeze feature encoder (partial)
+                for param in self.feature_encoder.parameters():
+                    param.requires_grad = False
+                
+                # Freeze low-res model
+                for param in self.low_res_model.parameters():
+                    param.requires_grad = False
+                
+                # Freeze mid-res upsampler
+                for param in self.mid_res_upsampler.parameters():
+                    param.requires_grad = False

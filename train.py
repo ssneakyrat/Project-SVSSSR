@@ -44,8 +44,12 @@ def main():
     parser.add_argument('--variable_length', action='store_true', help='Enable variable length training mode')
     parser.add_argument('--batch_size', type=int, default=None, help='Override batch size from config')
     parser.add_argument('--max_epochs', type=int, default=None, help='Override max epochs from config')
+    parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate from config')
     parser.add_argument('--disable_early_stopping', action='store_true', help='Disable early stopping callback')
     parser.add_argument('--patience', type=int, default=None, help='Early stopping patience (default depends on stage)')
+    parser.add_argument('--freeze_earlier_stages', action='store_true', help='Freeze earlier stages when training in Stage 3')
+    parser.add_argument('--accumulate_grad_batches', type=int, default=None, help='Accumulate gradients over N batches')
+    parser.add_argument('--precision', type=str, default=None, choices=['32', '16-mixed'], help='Training precision')
     args = parser.parse_args()
     
     pl.seed_everything(args.seed)
@@ -63,9 +67,30 @@ def main():
     
     if args.max_epochs:
         config['train']['num_epochs'] = args.max_epochs
+        
+    if args.learning_rate:
+        config['train']['learning_rate'] = args.learning_rate
+        
+    if args.freeze_earlier_stages:
+        config['train']['freeze_earlier_stages'] = True
     
     current_stage = config['model']['current_stage']
     stage_epochs = config['model'].get('stage_epochs', [30, 30, 40])
+    
+    # Set appropriate defaults for Stage 3 if not specified
+    if current_stage == 3 and not args.max_epochs and not args.learning_rate:
+        # For Stage 3, longer training with lower learning rate by default
+        if not args.learning_rate:
+            original_lr = config['train']['learning_rate']
+            config['train']['learning_rate'] = original_lr * 0.1
+            print(f"Stage 3: Automatically reducing learning rate to {config['train']['learning_rate']} (1/10 of original)")
+        
+        if not args.batch_size:
+            # Maybe reduce batch size for Stage 3 to fit in memory
+            original_bs = config['train']['batch_size']
+            if original_bs > 4:
+                config['train']['batch_size'] = max(4, original_bs // 2)
+                print(f"Stage 3: Automatically reducing batch size to {config['train']['batch_size']}")
     
     if not args.max_epochs and current_stage <= len(stage_epochs):
         config['train']['num_epochs'] = stage_epochs[current_stage-1]
@@ -87,11 +112,14 @@ def main():
         version=None
     )
     
+    # Configure monitor interval based on stage
+    monitor_interval = 1 if current_stage == 3 else 10
+    
     callbacks = [
         ModelCheckpoint(
             monitor='val_loss',
             filename=f'svs-stage{current_stage}-' + '{epoch:02d}-{val_loss:.4f}',
-            save_top_k=1,
+            save_top_k=3 if current_stage == 3 else 1,  # Save top 3 models for Stage 3
             mode='min',
             save_last=True
         ),
@@ -141,13 +169,27 @@ def main():
             'max_epochs': config['train']['num_epochs'],
             'logger': logger,
             'callbacks': callbacks,
-            'log_every_n_steps': 10,
+            'log_every_n_steps': monitor_interval,
             'accelerator': 'auto',
             'devices': 'auto',
         }
         
+        # Set precision if specified
+        if args.precision:
+            trainer_kwargs['precision'] = args.precision
+        
+        # Set gradient accumulation if specified
+        if args.accumulate_grad_batches:
+            trainer_kwargs['accumulate_grad_batches'] = args.accumulate_grad_batches
+            print(f"Accumulating gradients over {args.accumulate_grad_batches} batches")
+        
         if 'gradient_clip_val' in config['train']:
             trainer_kwargs['gradient_clip_val'] = config['train']['gradient_clip_val']
+        else:
+            # Add gradient clipping by default for Stage 3
+            if current_stage == 3:
+                trainer_kwargs['gradient_clip_val'] = 1.0
+                print("Stage 3: Enabling gradient clipping with value 1.0")
         
         trainer = pl.Trainer(**trainer_kwargs)
         trainer.fit(model, data_module, ckpt_path=args.resume)
@@ -159,6 +201,14 @@ def main():
             checkpoint_path = os.path.join(logger.log_dir, "checkpoints/last.ckpt")
             print(f"\nTo continue training with the next stage, run:")
             print(f"python train.py --stage {next_stage} --load_weights {checkpoint_path}")
+        
+        if current_stage == 3:
+            print("\nStage 3 Training Recommendations:")
+            print("1. If convergence is still poor, try:")
+            print("   - Further reducing learning rate: --learning_rate 0.00005")
+            print("   - Increasing gradient accumulation: --accumulate_grad_batches 4")
+            print("   - Mixed precision training: --precision 16-mixed")
+            print("   - Freezing earlier stages: --freeze_earlier_stages")
     
     except Exception as e:
         print(f"Error during training: {e}")
