@@ -3,10 +3,11 @@
 data:
   bin_dir: datasets
   bin_file: mel_spectrograms.h5
-  mel_key: mel_spectrograms # Key for target mel spectrograms
-  phoneme_key: phonemes     # Key for input phoneme sequences
-  duration_key: durations   # Key for input duration sequences
-  f0_key: f0                # Key for input F0 sequences
+  mel_key: mel_spectrogram # Key for target mel spectrograms (Updated based on preprocess.py)
+  phoneme_key: phone_sequence # Key for input phoneme sequences (Updated based on preprocess.py)
+  duration_key: adjusted_durations # Key for input duration sequences (Updated based on preprocess.py)
+  f0_key: f0_contour        # Key for input F0 sequences (Updated based on preprocess.py)
+  midi_pitch_key: midi_pitch_estimated # Key for estimated MIDI pitch
   lazy_load: true
   raw_dir: datasets/gin
   # max_samples: 100 # Set to null or remove to use full dataset
@@ -28,37 +29,34 @@ audio:
 
 # Model specific parameters
 model:
-  name: SVSGAN # Updated model name
+  name: ProgressiveSVS # New model name
   mel_bins: 80        # Shared: Output dimension (should match audio.n_mels)
-  f0_dim: 1           # Shared: Dimension of F0 input (usually 1)
   vocab_size: null    # Shared: Will be dynamically set from data
 
-  generator:
-    embedding_dim: 256 # Default from SVSGAN code
-    rnn_hidden_dim: 512 # Default from SVSGAN code
-    rnn_layers: 2       # Default from SVSGAN code
-    bidirectional: true # Default from SVSGAN code
+  # --- ProgressiveSVS Specific Parameters ---
+  # Embedding dimensions (Adjust as needed)
+  f0_embed_dim: 64
+  phone_embed_dim: 256
+  midi_embed_dim: 64
 
-  # Post-Net Configuration (Used by Generator)
-  postnet:
-    n_convs: 5
-    kernel_size: 5
-    channels: 512
-    dropout: 0.5 # Default from SVSGAN code
+  # Resolution scaling factors (relative to full mel_bins)
+  # Example: low_res_scale=4 means low-res has mel_bins/4 frequency bins
+  low_res_scale: 4
+  mid_res_scale: 2
 
-  discriminator:
-    in_channels: 1      # Default from SVSGAN code
-    n_layers: 4         # Default from SVSGAN code
-    base_channels: 64   # Default from SVSGAN code
-    kernel_size: [3, 9] # Default from SVSGAN code (Use list for tuple)
-    stride: [1, 2]      # Default from SVSGAN code (Use list for tuple)
-    padding: [1, 4]     # Default from SVSGAN code (Use list for tuple)
-    norm_layer: 'instance' # Default from SVSGAN code ('batch' or 'instance')
+  # Channel configurations for each stage (Adjust based on complexity/memory)
+  # Format: List of output channels for each ConvBlock in the stage
+  low_res_channels: [256, 256, 128]
+  mid_res_channels: [128, 128, 64]
+  high_res_channels: [64, 64, 32]
+
+  # Initial training stage (1, 2, or 3)
+  current_stage: 1
 
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
-  epochs: 100           # GANs often require more epochs, adjust as needed
+  epochs: 1000           # GANs often require more epochs, adjust as needed
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
   tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs
@@ -66,14 +64,14 @@ train:
   num_workers: 4        # DataLoader workers
   log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps
 
-  # GAN specific training params
-  learning_rate_g: 0.0004 # Generator learning rate
-  learning_rate_d: 0.00005 # Discriminator learning rate (adjusted)
-  adam_beta1: 0.5         # Adam beta1 (common for GANs)
-  adam_beta2: 0.999      # Adam beta2 (common for GANs)
-  lambda_recon: 50        # Weight for L1 reconstruction loss in Generator loss (adjusted)
+  # Optimizer and Scheduler parameters for ProgressiveSVS (Adam + ReduceLROnPlateau)
+  learning_rate: 0.0002   # Initial learning rate
+  weight_decay: 0.0001    # Adam weight decay
+  lr_factor: 0.5          # Factor by which the learning rate will be reduced (scheduler)
+  lr_patience: 10         # Number of epochs with no improvement after which learning rate will be reduced (scheduler)
+  # gradient_clip_val: 1.0 # Optional: Gradient clipping value
 
   # log_interval defines log_every_n_steps in Trainer
   log_interval: 50        # Log training metrics every N steps
 
-  # Removed: learning_rate (replaced by _g/_d), save_interval (handled by checkpoint callback)
+  # Removed: GAN specific params (lr_g, lr_d, betas, lambda_recon)

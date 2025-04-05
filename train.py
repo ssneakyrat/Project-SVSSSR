@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 # Import custom modules
 from data.dataset import DataModule # Assuming DataModule is in data/dataset.py
-from model import SVSGAN            # Import the new SVSGAN model
+from models.progressive_svs import ProgressiveSVS # Import the new ProgressiveSVS model
 
 def train(config_path='config/model.yaml'):
     """
@@ -74,8 +74,8 @@ def train(config_path='config/model.yaml'):
 
 
     # --- 3. Initialize Model ---
-    print("Initializing SVSGAN model...")
-    model = SVSGAN(config)
+    print(f"Initializing {config['model']['name']} model...") # Use name from config
+    model = ProgressiveSVS(config)
     print("Model initialized successfully.")
 
     # --- 4. Configure Callbacks and Logger ---
@@ -91,7 +91,7 @@ def train(config_path='config/model.yaml'):
     # Saves the best model based on validation loss
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
-        filename='svs-gan-{epoch:02d}-{val_loss:.2f}', # Updated filename for GAN model
+        filename='progressive-svs-{epoch:02d}-{val_loss:.2f}', # Updated filename for new model
         save_top_k=1,          # Save only the best model
         monitor='val_loss',    # Monitor validation loss
         mode='min',            # Mode should be 'min' for loss
@@ -121,8 +121,11 @@ def train(config_path='config/model.yaml'):
         trainer.fit(model, datamodule=data_module)
         print("Training finished.")
     except Exception as e:
+        import traceback
         print(f"An error occurred during training: {e}")
-        # Consider more specific error handling if needed
+        print("--- Full Traceback ---")
+        traceback.print_exc() # Print the full traceback
+        print("----------------------")
 
 if __name__ == "__main__":
     # Set random seed for reproducibility (optional but recommended)

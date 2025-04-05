@@ -1,0 +1,61 @@
+config:
+  data:
+    bin_dir: datasets
+    bin_file: mel_spectrograms.h5
+    mel_key: mel_spectrogram
+    phoneme_key: phone_sequence
+    duration_key: adjusted_durations
+    f0_key: f0_contour
+    midi_pitch_key: midi_pitch_estimated
+    lazy_load: true
+    raw_dir: datasets/gin
+    sample_percentage: null
+    variable_length: true
+    min_phones_in_lab: 5
+  audio:
+    sample_rate: 22050
+    n_fft: 1024
+    hop_length: 256
+    win_length: 1024
+    n_mels: 80
+    fmin: 0
+    fmax: 8000
+    f0_min: 50
+    f0_max: 600
+    max_audio_length: 10.0
+  model:
+    name: ProgressiveSVS
+    mel_bins: 80
+    vocab_size: 54
+    f0_embed_dim: 64
+    phone_embed_dim: 256
+    midi_embed_dim: 64
+    low_res_scale: 4
+    mid_res_scale: 2
+    low_res_channels:
+    - 256
+    - 256
+    - 128
+    mid_res_channels:
+    - 128
+    - 128
+    - 64
+    high_res_channels:
+    - 64
+    - 64
+    - 32
+    current_stage: 1
+  train:
+    batch_size: 16
+    epochs: 100
+    val_interval: 1
+    log_dir: logs
+    tensorboard_log_dir: tensorboard
+    checkpoint_dir: checkpoints
+    num_workers: 4
+    log_spectrogram_every_n_val_steps: 5
+    learning_rate: 0.0002
+    weight_decay: 0.0001
+    lr_factor: 0.5
+    lr_patience: 10
+    log_interval: 50

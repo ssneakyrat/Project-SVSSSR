@@ -145,7 +145,8 @@ class H5Dataset(Dataset):
                               if tensor is not None:
                                   # Infer type (simple heuristic, may need refinement)
                                   # Add other potential integer keys from your config/preprocessing
-                                  if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence']:
+                                  # Add 'midi_pitch_estimated' to integer types
+                                  if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated']:
                                       sample[name] = tensor.long()
                                   else: # Assuming mel, f0 are float types
                                       sample[name] = tensor.float()
@@ -176,7 +177,8 @@ class H5Dataset(Dataset):
                     data_np = group[h5_key][()] # Read data from the group dataset
                     # Convert to tensor with appropriate type
                     # Add other potential integer keys from your config/preprocessing
-                    if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence']:
+                    # Add 'midi_pitch_estimated' to integer types
+                    if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated']:
                         sample[name] = torch.from_numpy(data_np).long()
                     else: # Assuming float types (mel, f0)
                         sample[name] = torch.from_numpy(data_np).float()
@@ -210,9 +212,10 @@ class H5Dataset(Dataset):
 def collate_fn_pad(batch):
     """
     Custom collate function to pad sequences in a batch of dictionaries.
-    Handles padding for keys like 'mel', 'f0', 'phoneme', 'duration'.
-    Assumes 'mel' and 'f0' are frame-level (variable length in time dim).
-    Assumes 'phoneme' and 'duration' are phoneme-level (variable length in sequence dim).
+    Handles padding for keys like 'mel', 'f0', 'midi_pitch_estimated', 'phoneme', 'duration'.
+    Expands phoneme IDs ('phoneme') using 'duration' into frame-level 'phone_label'.
+    Assumes 'mel', 'f0', 'midi_pitch_estimated', 'phone_label' are frame-level (variable length in time dim).
+    Assumes 'phoneme', 'duration' are phoneme-level (variable length in sequence dim).
     """
     # Filter out None items (samples that failed to load)
     batch = [item for item in batch if item is not None]
@@ -220,50 +223,137 @@ def collate_fn_pad(batch):
         return None # Return None if batch is empty after filtering
 
     batch_size = len(batch)
-    keys = batch[0].keys()
-    padded_batch = {key: [] for key in keys}
-    lengths = {key: [] for key in keys} # Store original lengths if needed
+    # Get keys from the first valid sample
+    keys = list(batch[0].keys())
+    # Add the key for the expanded frame-level phoneme labels
+    keys_in_batch = keys + ['phone_label']
+    padded_batch = {key: [] for key in keys_in_batch}
+    lengths = {key: [] for key in keys} # Store original lengths of loaded data
 
     # Determine max lengths for each sequence type
     max_len = {}
-    for key in keys:
-        if key in ['mel', 'f0']: # Frame-level sequences (Batch, Features, Time) or (Batch, Time)
-             # Assuming mel might be (Freq, Time) and f0 (1, Time) or (Time) before batching
-             # Need to handle potential dimension differences
-             max_len[key] = max(item[key].shape[-1] for item in batch) # Max length is in the last dimension
-        elif key in ['phoneme', 'duration']: # Phoneme-level sequences (Batch, Seq_Len)
-             max_len[key] = max(item[key].shape[0] for item in batch) # Max length is in the first dimension (after batch)
-        # Add other keys if they are sequences and need padding
+    # Determine max lengths for frame-level and phoneme-level sequences
+    frame_level_keys = ['mel', 'f0', 'midi_pitch_estimated'] # Keys that are frame-level
+    # 'phoneme' key holds frame-level IDs loaded from HDF5, remove it from here
+    phoneme_level_keys = ['duration', 'phone_sequence_ids'] # Keys that are phoneme-level
+    max_len_frame = 0
+    max_len_phoneme = 0
+
+    # Calculate max frame length based on frame-level keys
+    for key in frame_level_keys:
+        if key in keys: # Check if the key exists in the loaded data
+            current_max_for_key = 0
+            for i, item in enumerate(batch):
+                # Check if the key exists for the item and if it's not None
+                data_element = item.get(key)
+                if data_element is None:
+                    print(f"DEBUG: collate_fn_pad - Item index {i} has None for key '{key}'. Item keys: {list(item.keys())}")
+                    # Decide how to handle: skip? use 0? For now, just report.
+                    # We'll rely on current_max_for_key not being updated for this item.
+                elif not hasattr(data_element, 'shape'):
+                    print(f"DEBUG: collate_fn_pad - Item index {i}, key '{key}' is not None but has no 'shape'. Type: {type(data_element)}")
+                    # Handle as above.
+                else:
+                    try:
+                        # Use shape[0] for time dimension length
+                        current_max_for_key = max(current_max_for_key, data_element.shape[0])
+                    except IndexError:
+                         print(f"DEBUG: collate_fn_pad - Item index {i}, key '{key}' has shape {data_element.shape}, but failed to access shape[-1].")
+
+            max_len_frame = max(max_len_frame, current_max_for_key)
+
+    # Calculate max phoneme sequence length
+    for key in phoneme_level_keys:
+        if key in keys:
+             max_len_phoneme = max(max_len_phoneme, max(item[key].shape[0] for item in batch))
+
+    # The target length for frame-level expansion will be max_len_frame
+    max_len['phone_label'] = max_len_frame # Expanded phonemes match frame length
+    for key in frame_level_keys:
+        if key in keys:
+            max_len[key] = max_len_frame
+    for key in phoneme_level_keys:
+        if key in keys:
+            max_len[key] = max_len_phoneme
 
     # Pad each item in the batch
+    # Process each item in the batch: expand phonemes, pad sequences
     for item in batch:
-        for key in keys:
+        # --- Expand Phoneme IDs to Frame Level ---
+        # Load frame-level IDs (might not be needed here, but keeping for context)
+        # frame_level_phoneme_ids = item['phoneme']
+        # Load the PHONEME-LEVEL IDs and DURATIONS
+        phoneme_level_ids = item['phone_sequence_ids']
+        durations = item['duration']
+        target_frame_len = max_len_frame # Target length is max frame length in batch
+        # Ensure durations are positive and sum matches target_frame_len (or handle mismatch)
+        # Note: Preprocessing should ideally ensure sum(durations) == target_frames
+        # Add a check/warning here if needed.
+        durations = torch.clamp(durations, min=0) # Ensure no negative durations
+        total_duration = durations.sum()
+
+        expanded_phonemes_list = []
+        if total_duration > 0:
+             # Use repeat_interleave for efficient expansion
+             try:
+                  # Use the phoneme-level IDs here
+                  expanded_phonemes = torch.repeat_interleave(phoneme_level_ids, durations)
+             except RuntimeError as e:
+                  print(f"RuntimeError during repeat_interleave: {e}")
+                  print(f"Phoneme IDs: {phoneme_ids.shape}, Durations: {durations.shape}, Sum: {total_duration}")
+                  # Fallback or error handling: create zeros
+                  expanded_phonemes = torch.zeros(target_frame_len, dtype=torch.long)
+
+             current_expanded_len = expanded_phonemes.shape[0]
+
+             # Pad or truncate the expanded sequence to match target_frame_len
+             if current_expanded_len < target_frame_len:
+                  padding_size = target_frame_len - current_expanded_len
+                  expanded_phonemes = torch.nn.functional.pad(expanded_phonemes, (0, padding_size), mode='constant', value=0) # Pad with 0 (PAD symbol)
+             elif current_expanded_len > target_frame_len:
+                  expanded_phonemes = expanded_phonemes[:target_frame_len]
+
+        else: # Handle case where total duration is zero
+             expanded_phonemes = torch.zeros(target_frame_len, dtype=torch.long)
+        padded_batch['phone_label'].append(expanded_phonemes)
+        # Note: We don't store length for 'phone_label' as it's always max_len_frame
+
+        # --- Pad Original Loaded Data ---
+        for key in keys: # Iterate through original keys loaded from HDF5
             data = item[key]
-            current_len = data.shape[-1] if key in ['mel', 'f0'] else data.shape[0]
-            target_len = max_len.get(key, current_len) # Use max_len if key needs padding
-            pad_value = 0.0 # Default padding value (adjust if needed, e.g., for phoneme IDs)
+            # Use shape[0] for time dimension length for frame-level keys
+            current_len = data.shape[0] if key in frame_level_keys else data.shape[0]
+            target_len = max_len.get(key, current_len) # Use max_len calculated earlier
+            # Determine pad value (0 for IDs/indices, 0.0 for floats)
+            pad_value = 0 if key in ['phoneme', 'duration', 'midi_pitch_estimated'] else 0.0
 
             if current_len < target_len:
                 padding_size = target_len - current_len
-                if key in ['mel', 'f0']: # Pad time dimension (last)
-                    # Determine padding tuple based on data dimensions
-                    # Example: mel (Freq, Time) -> pad (0, padding_size)
-                    # Example: f0 (1, Time) -> pad (0, padding_size)
-                    # Example: f0 (Time) -> pad (0, padding_size)
-                    pad_dims = (0, padding_size)
-                    if data.dim() > 1: # Handle potential feature dimensions
-                         pad_dims = (0, 0) * (data.dim() - 1) + pad_dims
-                    padded_data = torch.nn.functional.pad(data, pad_dims, mode='constant', value=pad_value)
-                elif key in ['phoneme', 'duration']: # Pad sequence dimension (first after batch)
-                    # Example: phoneme (Seq_Len) -> pad (0, padding_size)
+                if key in frame_level_keys: # Pad time dimension (first)
+                    # Shape is likely (T, F) or (T,)
+                    pad_dims = (0, padding_size) # Pad the first dimension (time)
+                    if data.dim() > 1: # Handle feature dimensions (e.g., mel [T, F], f0 [T, 1])
+                         # Need to pad the first dimension, not the last
+                         # Example: (T, F) -> pad T dim -> (0, 0, 0, padding_size) incorrect
+                         # Correct padding for (T, F) should be ((0, padding_size), (0, 0))
+                         # torch.nn.functional.pad expects (pad_left, pad_right, pad_top, pad_bottom, ...)
+                         # For (T, F), we want (0, 0, 0, padding_size) -> pads last dim (F) then second-to-last (T)
+                         # Let's rethink padding for multi-dim frame-level
+                         pad_shape = list(data.shape)
+                         pad_shape[0] = padding_size # Pad the time dimension
+                         padding_tensor = torch.full(pad_shape, pad_value, dtype=data.dtype)
+                         padded_data = torch.cat((data, padding_tensor), dim=0)
+                    else: # Handle 1D case (T,)
+                         padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
+                elif key in phoneme_level_keys: # Pad sequence dimension
                     padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
                 else: # Data doesn't need padding based on keys
                     padded_data = data
-            elif current_len > target_len: # Should not happen if max_len is calculated correctly, but handle truncation just in case
-                 if key in ['mel', 'f0']:
-                      padded_data = data[..., :target_len] # Truncate last dim
-                 elif key in ['phoneme', 'duration']:
-                      padded_data = data[:target_len] # Truncate first dim
+            elif current_len > target_len: # Truncate if needed
+                 if key in frame_level_keys:
+                      padded_data = data[:target_len, ...] # Truncate first dim (time)
+                 elif key in phoneme_level_keys:
+                      padded_data = data[:target_len] # Truncate first dim (sequence)
                  else:
                       padded_data = data
             else: # No padding needed
@@ -274,21 +364,33 @@ def collate_fn_pad(batch):
 
     # Stack tensors for each key
     final_batch = {}
-    for key in keys:
+    # Stack tensors for the final batch, renaming keys as needed for the model
+    final_batch = {}
+    rename_map = {
+        'mel': 'mel_spec', # Rename 'mel' to 'mel_spec'
+        'f0': 'f0',
+        'midi_pitch_estimated': 'midi_label', # Rename 'midi_pitch_estimated' to 'midi_label'
+        'phone_label': 'phone_label', # Keep expanded phoneme label key
+        'duration': 'phone_duration' # Rename original duration key
+        # 'phoneme' key (original phoneme sequence) is not explicitly renamed/included
+        # unless needed later.
+    }
+
+    for key in keys_in_batch: # Iterate through all keys including 'phone_label'
         try:
-            final_batch[key] = torch.stack(padded_batch[key])
+            stacked_tensor = torch.stack(padded_batch[key])
+            # Rename key if needed for model input compatibility
+            final_key = rename_map.get(key, key) # Use renamed key or original if not in map
+            final_batch[final_key] = stacked_tensor
         except Exception as e:
             print(f"Error stacking key '{key}': {e}")
-            # Print shapes for debugging
             for i, t in enumerate(padded_batch[key]):
                 print(f"  Item {i} shape: {t.shape}")
             raise e
 
-    # Optionally return lengths as well
-    # final_batch['lengths'] = lengths # Original comment
-    # Add mel lengths specifically for masking
-    if 'mel' in lengths:
-         final_batch['mel_lengths'] = torch.tensor(lengths['mel'], dtype=torch.long)
+    # Add frame lengths (originally mel lengths) for masking in the model
+    if 'mel' in lengths: # Use original 'mel' key for length lookup
+         final_batch['length'] = torch.tensor(lengths['mel'], dtype=torch.long) # Use 'length' as key like in model
 
     return final_batch
 
@@ -303,14 +405,14 @@ class DataModule(pl.LightningDataModule):
         
         self.h5_path = f"{config['data']['bin_dir']}/{config['data']['bin_file']}"
         # Get all data keys from config
+        # Get all data keys from config, ensuring they match HDF5 and model needs
         self.data_keys = {
-            'mel': config['data']['mel_key'],
-            # 'phoneme': config['data']['phoneme_key'], # Original - Loads frame-level phonemes
-            'phoneme': 'phone_sequence', # Corrected - Loads phone-level sequence IDs
-            'duration': config['data']['duration_key'],
-            'f0': config['data']['f0_key']
-            # Optionally load frame-level phonemes under a different key if needed elsewhere
-            # 'frame_phoneme': config['data']['phoneme_key'],
+            'mel': config['data']['mel_key'],           # e.g., 'mel_spectrogram'
+            'f0': config['data']['f0_key'],             # e.g., 'f0_contour'
+            'phoneme': config['data']['phoneme_key'],   # e.g., 'phone_sequence' (FRAME-level IDs)
+            'duration': config['data']['duration_key'], # e.g., 'adjusted_durations' (PHONEME-level durations)
+            'phone_sequence_ids': 'phone_sequence_ids', # Key for PHONEME-level IDs
+            'midi_pitch_estimated': 'midi_pitch_estimated', # Key for estimated MIDI pitch
         }
         self.lazy_load = config['data'].get('lazy_load', True)
         self.max_samples = config['data'].get('max_samples', None)

@@ -1,6 +1,7 @@
 # preprocess.py
 
 import os
+import collections
 import glob
 import yaml
 import numpy as np
@@ -180,7 +181,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
 
 # --- Feature Extraction ---
 def extract_features(audio_path, config):
-    """Extracts log Mel spectrogram, log F0, and voiced mask."""
+    """Extracts log Mel spectrogram, log F0, voiced mask, and estimated MIDI pitch."""
     sr = config['audio']['sample_rate']
     hop_length = config['audio']['hop_length']
     win_length = config['audio']['win_length']
@@ -210,26 +211,44 @@ def extract_features(audio_path, config):
                         frame_period=hop_length * 1000 / sr)
         f0 = pw.stonemask(audio, _f0, t, sr) # Refine F0
 
-        # Ensure F0 length matches Mel length (minor discrepancies can occur)
+        # Ensure F0 length matches Mel length
         mel_frames = log_mel_spectrogram.shape[0]
         if len(f0) < mel_frames:
             f0 = np.pad(f0, (0, mel_frames - len(f0)), mode='constant', constant_values=0)
         elif len(f0) > mel_frames:
             f0 = f0[:mel_frames]
 
-        f0 = f0[:, np.newaxis] # Shape (T, 1)
+        # Keep original F0 in Hz for MIDI conversion
+        f0_hz = f0.copy()
 
-        # Log-scale F0, handle zeros
-        voiced_mask = f0 > 1e-8 # Use a small epsilon to avoid log(0)
-        log_f0 = np.zeros_like(f0)
-        log_f0[voiced_mask] = np.log(f0[voiced_mask])
+        # Calculate voiced mask (use f0_hz)
+        voiced_mask = f0_hz > 1e-8 # Use a small epsilon
 
-        return log_mel_spectrogram, log_f0, voiced_mask.squeeze() # Return log_f0 and mask
+        # Calculate log F0 for normalization/saving
+        log_f0 = np.zeros_like(f0_hz)
+        log_f0[voiced_mask] = np.log(f0_hz[voiced_mask])
+        log_f0 = log_f0[:, np.newaxis] # Shape (T, 1)
+
+        # Estimate MIDI pitch from F0 in Hz
+        midi_pitch = np.zeros_like(f0_hz)
+        voiced_f0_hz = f0_hz[voiced_mask]
+        # MIDI formula: midi = 69 + 12 * log2(f/440)
+        # Use np.log2 for base-2 logarithm
+        # Add small epsilon to avoid log2(0) for safety, although voiced_mask should prevent this
+        midi_pitch[voiced_mask] = 69 + 12 * np.log2(voiced_f0_hz / 440.0 + 1e-12)
+        # Round to nearest integer MIDI note
+        midi_pitch = np.round(midi_pitch).astype(int)
+        # Clamp to valid MIDI range [0, 127], use 0 for unvoiced
+        midi_pitch = np.clip(midi_pitch, 0, 127)
+        midi_pitch[~voiced_mask] = 0 # Ensure unvoiced frames are 0
+        midi_pitch = midi_pitch[:, np.newaxis] # Shape (T, 1)
+
+        return log_mel_spectrogram, log_f0, voiced_mask.squeeze(), midi_pitch
 
     except Exception as e:
         logging.error(f"Error extracting features for {audio_path}: {e}")
         # Return None for all expected outputs on error
-        return None, None, None
+        return None, None, None, None # Added None for midi_pitch
 
 # --- Padding/Truncating ---
 def pad_or_truncate(data, target_length, pad_value=0):
@@ -246,11 +265,11 @@ def pad_or_truncate(data, target_length, pad_value=0):
         return np.concatenate((data, padding), axis=0)
 
 # --- Visualization ---
-def visualize_alignment(mel, f0, phone_ids, durations, id_to_phone, save_path):
-    """Generates and saves an alignment plot using UNNORMALIZED data."""
+def visualize_alignment(mel, f0, midi_pitch, phone_ids, durations, id_to_phone, save_path):
+    """Generates and saves an alignment plot using UNNORMALIZED data, including estimated MIDI pitch."""
     logging.info(f"Generating alignment plot: {save_path}")
     try:
-        fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True) # Increased subplots to 4, adjusted figsize
 
         # 1. Mel Spectrogram (Unnormalized)
         img = axes[0].imshow(mel.T, aspect='auto', origin='lower', cmap='viridis')
@@ -267,11 +286,22 @@ def visualize_alignment(mel, f0, phone_ids, durations, id_to_phone, save_path):
         axes[1].legend()
         axes[1].grid(True, linestyle='--', alpha=0.6)
 
-        # 3. Phone Alignment
-        axes[2].set_title('Phone Alignment')
-        axes[2].set_ylabel('Phone ID')
-        axes[2].set_xlabel('Frame')
+        # 3. Estimated MIDI Pitch
+        # Plot MIDI pitch, setting 0 (unvoiced) to NaN for gaps
+        midi_plot = midi_pitch.astype(float).squeeze() # Ensure float for NaN
+        midi_plot[midi_plot == 0] = np.nan
+        axes[2].plot(midi_plot, label='Est. MIDI Pitch', marker='.', markersize=2, linestyle='', color='green')
+        axes[2].set_ylabel('MIDI Note #')
+        axes[2].set_title('Estimated MIDI Pitch (0=Unvoiced)')
+        axes[2].legend()
         axes[2].grid(True, linestyle='--', alpha=0.6)
+        axes[2].set_ylim(bottom=0) # Start y-axis at 0
+
+        # 4. Phone Alignment (Shifted index from 2 to 3)
+        axes[3].set_title('Phone Alignment')
+        axes[3].set_ylabel('Phone ID')
+        axes[3].set_xlabel('Frame')
+        axes[3].grid(True, linestyle='--', alpha=0.6)
 
         current_frame = 0
         yticks = []
@@ -280,7 +310,7 @@ def visualize_alignment(mel, f0, phone_ids, durations, id_to_phone, save_path):
         for phone_id, duration in zip(phone_ids, durations):
             phone_symbol = id_to_phone.get(str(phone_id), '?') # Ensure lookup uses string if keys are strings
             center_frame = current_frame + duration / 2
-            axes[2].text(center_frame, phone_id, phone_symbol, ha='center', va='center', fontsize=9, bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
+            axes[3].text(center_frame, phone_id, phone_symbol, ha='center', va='center', fontsize=9, bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
             current_frame += duration
             phone_boundaries.append(current_frame)
             if phone_id not in yticks:
@@ -290,14 +320,14 @@ def visualize_alignment(mel, f0, phone_ids, durations, id_to_phone, save_path):
 
         # Draw vertical lines for phone boundaries
         for boundary in phone_boundaries:
-             axes[2].axvline(x=boundary, color='r', linestyle='--', linewidth=0.8)
+             axes[3].axvline(x=boundary, color='r', linestyle='--', linewidth=0.8)
 
         # Set y-ticks for phones
         if yticks:
             sorted_unique_yticks = sorted(list(set(yticks)))
-            axes[2].set_yticks(sorted_unique_yticks)
-            axes[2].set_yticklabels([id_to_phone.get(str(y), '?') for y in sorted_unique_yticks]) # Ensure lookup uses string
-            axes[2].set_ylim(min(sorted_unique_yticks)-1 if sorted_unique_yticks else -1, max(sorted_unique_yticks)+1 if sorted_unique_yticks else 1)
+            axes[3].set_yticks(sorted_unique_yticks)
+            axes[3].set_yticklabels([id_to_phone.get(str(y), '?') for y in sorted_unique_yticks]) # Ensure lookup uses string
+            axes[3].set_ylim(min(sorted_unique_yticks)-1 if sorted_unique_yticks else -1, max(sorted_unique_yticks)+1 if sorted_unique_yticks else 1)
 
 
         plt.tight_layout()
@@ -353,8 +383,9 @@ def preprocess_data(config_path='config/model.yaml'):
     all_log_f0s_voiced = []
 
     for pair in tqdm(file_pairs, desc="Pass 1: Extracting Features"):
-        log_mel, log_f0, voiced_mask = extract_features(pair['wav'], config)
-        if log_mel is not None and log_f0 is not None and voiced_mask is not None:
+        # MIDI pitch not needed for stats, ignore it here
+        log_mel, log_f0, voiced_mask, _ = extract_features(pair['wav'], config)
+        if log_mel is not None and log_f0 is not None and voiced_mask is not None: # Check original features
             # Store features for stat calculation
             all_log_mels.append(log_mel)
             # Only consider voiced frames for F0 stats
@@ -428,9 +459,9 @@ def preprocess_data(config_path='config/model.yaml'):
         logging.debug(f"Processing: {base_filename}")
 
         # 1. Re-extract Mel and F0 (or retrieve if stored - re-extracting is simpler here)
-        log_mel, log_f0, voiced_mask = extract_features(wav_path, config)
-        if log_mel is None: # Check again just in case
-            logging.warning(f"Skipping {base_filename} due to feature extraction error in Pass 2.")
+        log_mel, log_f0, voiced_mask, midi_pitch = extract_features(wav_path, config)
+        if log_mel is None or midi_pitch is None: # Check again just in case, include midi_pitch
+            logging.warning(f"Skipping {base_filename} due to feature extraction error in Pass 2 (Mel or MIDI).")
             continue
 
         original_mel_frames = log_mel.shape[0] # Frames before padding/truncation
@@ -441,10 +472,11 @@ def preprocess_data(config_path='config/model.yaml'):
         if np.any(voiced_mask): # Apply normalization only to voiced frames
             norm_log_f0[voiced_mask] = (log_f0[voiced_mask] - f0_mean) / f0_std
 
-        # 3. Pad/Truncate NORMALIZED Mel and F0 to target_frames
+        # 3. Pad/Truncate NORMALIZED Mel, F0, and MIDI pitch to target_frames
         # Pad normalized mel with 0? Or with normalized mean? Padding with 0 is common.
         padded_norm_mel = pad_or_truncate(norm_log_mel, target_frames, pad_value=0.0)
         padded_norm_f0 = pad_or_truncate(norm_log_f0, target_frames, pad_value=0.0)
+        padded_midi_pitch = pad_or_truncate(midi_pitch, target_frames, pad_value=0) # Pad MIDI with 0 (unvoiced)
 
         # 4. Parse Labels (get timestamps and phones)
         lab_entries, unique_phones_in_file, max_end_time = parse_lab_file(lab_path)
@@ -503,6 +535,7 @@ def preprocess_data(config_path='config/model.yaml'):
         processed_data[base_filename] = {
             'mel': padded_norm_mel, # Store normalized mel
             'f0': padded_norm_f0,   # Store normalized f0
+            'midi_pitch_estimated': padded_midi_pitch, # Store padded MIDI pitch
             'phone_sequence': initial_phones,
             'duration_sequence': np.array(adjusted_durations, dtype=np.int32),
             'initial_duration_sequence': np.array(initial_durations, dtype=np.int32) # Keep for potential analysis/vis
@@ -513,8 +546,9 @@ def preprocess_data(config_path='config/model.yaml'):
              first_file_data_for_vis = {
                  'mel': pad_or_truncate(log_mel, target_frames, pad_value=0.0), # Pad original log_mel
                  'f0': pad_or_truncate(log_f0, target_frames, pad_value=0.0),   # Pad original log_f0
+                 'midi_pitch': pad_or_truncate(midi_pitch, target_frames, pad_value=0), # Pad original midi_pitch
                  'phone_sequence': initial_phones,
-                 'initial_duration_sequence': np.array(initial_durations, dtype=np.int32)
+                 'initial_duration_sequence': np.array(initial_durations, dtype=np.int32) # Use initial durations for vis
              }
 
 
@@ -533,6 +567,15 @@ def preprocess_data(config_path='config/model.yaml'):
 
 
     # 9. Save to HDF5
+
+    # Check for duplicate base_filenames before saving
+    filenames = [bf for bf in processed_data.keys()]
+    duplicates = [item for item, count in collections.Counter(filenames).items() if count > 1]
+    if duplicates:
+        logging.warning(f"Duplicate base_filenames found in processed_data: {duplicates}")
+        # Optionally, decide how to handle duplicates here - e.g., raise error, skip, merge?
+        # For now, just log the warning.
+
     logging.info(f"Saving processed data to HDF5 file: {output_hdf5_path}")
     try:
         with h5py.File(output_hdf5_path, 'w') as f:
@@ -550,12 +593,21 @@ def preprocess_data(config_path='config/model.yaml'):
             # Save data for each file
             for base_filename, data in tqdm(processed_data.items(), desc="Saving to HDF5"):
                 group = f.create_group(base_filename)
-
                 # Convert phone sequence to IDs
-                phone_sequence_ids = np.array([phone_to_id[p] for p in data['phone_sequence']], dtype=np.int32)
+                phone_sequence = data['phone_sequence']
+                duration_sequence = data['duration_sequence']
+
+                # --- Add Assertion ---
+                if len(phone_sequence) != len(duration_sequence):
+                     logging.error(f"ASSERTION FAILED for {base_filename}: len(phone_sequence)={len(phone_sequence)} != len(duration_sequence)={len(duration_sequence)}")
+                     # Skip this file if lengths don't match to avoid saving bad data
+                     continue
+
+                phone_sequence_ids = np.array([phone_to_id[p] for p in phone_sequence], dtype=np.int32)
 
                 # Create frame-level phone IDs from adjusted durations
-                frame_level_phone_ids = np.repeat(phone_sequence_ids, data['duration_sequence'])
+                # Use the validated duration_sequence variable here
+                frame_level_phone_ids = np.repeat(phone_sequence_ids, duration_sequence)
                 # Ensure final length is exactly target_frames
                 if len(frame_level_phone_ids) != target_frames:
                      logging.warning(f"Frame-level phone ID length mismatch for {base_filename}. Got {len(frame_level_phone_ids)}, expected {target_frames}. Clamping.")
@@ -563,12 +615,28 @@ def preprocess_data(config_path='config/model.yaml'):
 
 
                 # Save datasets (using keys from config)
+                logging.debug(f"Attempting to create dataset '{data_config['mel_key']}' in group '{base_filename}'")
                 group.create_dataset(data_config['mel_key'], data=data['mel'], compression="gzip") # Normalized mel
+
+                logging.debug(f"Attempting to create dataset '{data_config['f0_key']}' in group '{base_filename}'")
                 group.create_dataset(data_config['f0_key'], data=data['f0'], compression="gzip")   # Normalized f0
+
+                logging.debug(f"Attempting to create dataset '{data_config['phoneme_key']}' in group '{base_filename}'")
                 group.create_dataset(data_config['phoneme_key'], data=frame_level_phone_ids, compression="gzip") # Frame-level IDs
-                group.create_dataset(data_config['duration_key'], data=data['duration_sequence'], compression="gzip") # Adjusted durations per phone
-                group.create_dataset('phone_sequence', data=phone_sequence_ids, compression="gzip") # IDs corresponding to durations
+
+                logging.debug(f"Attempting to create dataset '{data_config['duration_key']}' in group '{base_filename}'")
+                # Use the validated duration_sequence variable here
+                group.create_dataset(data_config['duration_key'], data=duration_sequence, compression="gzip") # Adjusted durations per phone
+
+                logging.debug(f"Attempting to create dataset 'phone_sequence_ids' in group '{base_filename}'") # Renamed hardcoded name
+                group.create_dataset('phone_sequence_ids', data=phone_sequence_ids, compression="gzip") # IDs corresponding to durations
                 # group.create_dataset('initial_duration_sequence', data=data['initial_duration_sequence'], compression="gzip") # Optional: Save initial durations
+                if 'midi_pitch_estimated' in data:
+                     logging.debug(f"Attempting to create dataset 'midi_pitch_estimated' in group '{base_filename}'")
+                     group.create_dataset('midi_pitch_estimated', data=data['midi_pitch_estimated'], compression="gzip")
+                else:
+                     logging.warning(f"Key 'midi_pitch_estimated' not found in processed_data for {base_filename} during HDF5 saving.")
+
 
         logging.info("HDF5 file saved successfully.")
 
@@ -586,12 +654,13 @@ def preprocess_data(config_path='config/model.yaml'):
         example_phone_ids = np.array([phone_to_id[p] for p in first_file_data_for_vis['phone_sequence']], dtype=np.int32)
 
         visualize_alignment(
-            first_file_data_for_vis['mel'], # Unnormalized log-mel
-            first_file_data_for_vis['f0'],  # Unnormalized log-f0
-            example_phone_ids,
-            first_file_data_for_vis['initial_duration_sequence'], # Use initial durations for alignment vis
-            id_to_phone,
-            vis_save_path
+            mel=first_file_data_for_vis['mel'], # Unnormalized log-mel
+            f0=first_file_data_for_vis['f0'],  # Unnormalized log-f0
+            midi_pitch=first_file_data_for_vis['midi_pitch'], # Pass MIDI pitch
+            phone_ids=example_phone_ids,
+            durations=first_file_data_for_vis['initial_duration_sequence'], # Use initial durations key from the vis dict
+            id_to_phone=id_to_phone,
+            save_path=vis_save_path
         )
     else:
         logging.warning("Skipping visualization as no data was processed successfully.")
