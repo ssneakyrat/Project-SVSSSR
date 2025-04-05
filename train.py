@@ -15,23 +15,79 @@ from data.dataset import SVSDataModule, check_dataset, fix_multiprocessing, H5Fi
 def load_model_weights_only(model, checkpoint_path):
     """
     Load only the model weights from a checkpoint, ignoring optimizer and callback states.
+    With improved error handling for architecture changes.
     """
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    import torch
+    import os
     
-    if 'state_dict' in checkpoint:
-        # Extract only the model weights
-        state_dict = checkpoint['state_dict']
-        model.load_state_dict(state_dict)
-        print(f"Successfully loaded model weights from {checkpoint_path}")
+    if not os.path.exists(checkpoint_path):
+        print(f"Error: Checkpoint file {checkpoint_path} not found")
+        return False
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
         
-        # Check the stage from the checkpoint
-        if 'hyper_parameters' in checkpoint and 'config' in checkpoint['hyper_parameters']:
-            prev_config = checkpoint['hyper_parameters']['config']
-            prev_stage = prev_config['model']['current_stage']
-            print(f"Previous checkpoint was from stage {prev_stage}")
+        if 'state_dict' in checkpoint:
+            # Extract only the model weights
+            state_dict = checkpoint['state_dict']
+            
+            # Check for any mismatching parameters
+            model_state_dict = model.state_dict()
+            mismatch_params = []
+            
+            for key in state_dict:
+                if key in model_state_dict:
+                    if state_dict[key].shape != model_state_dict[key].shape:
+                        mismatch_params.append((key, state_dict[key].shape, model_state_dict[key].shape))
+            
+            if mismatch_params:
+                print(f"Warning: Found {len(mismatch_params)} parameters with mismatched shapes")
+                print("This indicates a model architecture change. Examples:")
+                for i, (param, old_shape, new_shape) in enumerate(mismatch_params[:5]):
+                    print(f"  {param}: checkpoint={old_shape}, current={new_shape}")
+                
+                if len(mismatch_params) > 5:
+                    print(f"  ... and {len(mismatch_params) - 5} more mismatched parameters")
+                
+                print("\nAttempting to load compatible parameters only...")
+                
+                # Create a new state dict with only compatible parameters
+                compatible_state_dict = {}
+                for key, value in state_dict.items():
+                    if key in model_state_dict and value.shape == model_state_dict[key].shape:
+                        compatible_state_dict[key] = value
+                
+                # Load the compatible parameters
+                model.load_state_dict(compatible_state_dict, strict=False)
+                print(f"Successfully loaded {len(compatible_state_dict)}/{len(state_dict)} parameters")
+                
+                # Print which modules are totally incompatible
+                incompatible_modules = set()
+                for param, _, _ in mismatch_params:
+                    # Extract the module name (first part of parameter name)
+                    module_name = param.split('.')[0]
+                    incompatible_modules.add(module_name)
+                
+                print(f"Modules with incompatible parameters: {', '.join(incompatible_modules)}")
+                print("Note: These modules will use random initialization")
+            else:
+                # No mismatches, load normally
+                model.load_state_dict(state_dict)
+                print(f"Successfully loaded all model weights from {checkpoint_path}")
+            
+            # Check the stage from the checkpoint
+            if 'hyper_parameters' in checkpoint and 'config' in checkpoint['hyper_parameters']:
+                prev_config = checkpoint['hyper_parameters']['config']
+                prev_stage = prev_config['model']['current_stage']
+                print(f"Previous checkpoint was from stage {prev_stage}")
+            
             return True
-    else:
-        print(f"Error: No state_dict found in checkpoint {checkpoint_path}")
+        else:
+            print(f"Error: No state_dict found in checkpoint {checkpoint_path}")
+            return False
+    
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
         return False
 
 def main():

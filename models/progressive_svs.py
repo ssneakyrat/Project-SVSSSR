@@ -71,6 +71,10 @@ class ProgressiveSVS(pl.LightningModule):
         low_res_freq_bins = int(full_mel_bins / config['model']['low_res_scale'])
         mid_res_freq_bins = int(full_mel_bins / config['model']['mid_res_scale'])
         
+        # Use original high-res channels from config to maintain checkpoint compatibility
+        # DO NOT MODIFY CHANNEL SIZES - this ensures checkpoint compatibility
+        high_res_channels = config['model']['high_res_channels']
+        
         # Stage 1: Low-Resolution Model (20×216)
         self.low_res_model = LowResModel(
             input_dim, 
@@ -88,7 +92,7 @@ class ProgressiveSVS(pl.LightningModule):
         # Stage 3: High-Resolution Upsampler (80×864)
         self.high_res_upsampler = HighResUpsampler(
             mid_res_freq_bins,
-            config['model']['high_res_channels'], 
+            high_res_channels, 
             output_dim=full_mel_bins
         )
         
@@ -143,6 +147,7 @@ class ProgressiveSVS(pl.LightningModule):
                 print("Reshaping mid_res_output from 3D to 4D")
                 mid_res_output = mid_res_output.unsqueeze(1)
         
+        # Save input for residual connection (implemented in HighResUpsampler)
         high_res_output = self.high_res_upsampler(mid_res_output)
         
         return high_res_output
@@ -162,11 +167,24 @@ class ProgressiveSVS(pl.LightningModule):
         else:
             loss = loss.mean()
             
-        # Add stability regularization for Stage 3
+        # Add stability regularization for Stage 3, but with reduced weight
         if self.current_stage == 3:
-            # Add small L2 regularization on the predictions
-            # This helps stabilize training when working with fine details
-            reg_loss = 0.0001 * (pred ** 2).mean()
+            # Reduce L2 regularization by 10x to allow more detailed predictions
+            reg_loss = 0.00001 * (pred ** 2).mean()
+            
+            # Add spectral convergence loss component
+            if pred.dim() == 3 and target.dim() == 3:
+                # Get spectrogram magnitude
+                pred_mag = torch.abs(pred)
+                target_mag = torch.abs(target)
+                
+                # Calculate spectral convergence: ||X - Y||_F / ||Y||_F
+                # where ||.||_F is the Frobenius norm
+                sc_loss = torch.norm(pred_mag - target_mag, p='fro') / (torch.norm(target_mag, p='fro') + 1e-8)
+                
+                # Add to the loss with a moderate weight
+                loss = loss + 0.2 * sc_loss
+            
             loss = loss + reg_loss
             
         return loss
@@ -261,7 +279,7 @@ class ProgressiveSVS(pl.LightningModule):
         
         # Visualize first sample in batch at appropriate intervals
         # For Stage 3, visualize more frequently
-        vis_interval = 1 if self.current_stage == 3 else 5
+        vis_interval = 5 if self.current_stage == 3 else 10
         if batch_idx == 0 and self.current_epoch % vis_interval == 0:
             # Use shape from prediction for visualization
             self._log_mel_comparison(
@@ -380,15 +398,15 @@ class ProgressiveSVS(pl.LightningModule):
             # Create enhanced visualization for comparison
             main_fig, axes = plt.subplots(3, 1, figsize=(12, 10))
             
-            # Plot prediction
+            # Plot prediction with colormap adjusted for better range visualization
             im1 = axes[0].imshow(pred_mel.numpy(), origin='lower', aspect='auto', 
-                                vmin=0, vmax=1)
+                                vmin=0, vmax=1, cmap='viridis')
             axes[0].set_title(f'Predicted Mel (Stage {self.current_stage})')
             plt.colorbar(im1, ax=axes[0])
             
             # Plot ground truth
             im2 = axes[1].imshow(target_mel.numpy(), origin='lower', aspect='auto',
-                                vmin=0, vmax=1)
+                                vmin=0, vmax=1, cmap='viridis')
             axes[1].set_title('Target Mel')
             plt.colorbar(im2, ax=axes[1])
             
@@ -474,10 +492,26 @@ class ProgressiveSVS(pl.LightningModule):
         
         # For Stage 3, use AdamW with slightly different parameters
         if self.current_stage == 3:
+            # Higher learning rate specifically for high_res_upsampler parameters
+            high_res_params = []
+            other_params = []
+            
+            # Separate parameters for different learning rates
+            for name, param in self.named_parameters():
+                if 'high_res_upsampler' in name:
+                    high_res_params.append(param)
+                else:
+                    other_params.append(param)
+            
+            # Create parameter groups with different learning rates
+            param_groups = [
+                {'params': high_res_params, 'lr': stage_lr * 2.0},  # Double LR for high_res
+                {'params': other_params, 'lr': stage_lr}
+            ]
+            
             optimizer = torch.optim.AdamW(
-                self.parameters(), 
-                lr=stage_lr,
-                weight_decay=self.config['train']['weight_decay'],
+                param_groups,
+                weight_decay=self.config['train']['weight_decay'] * 0.1,  # Reduce weight decay
                 eps=1e-5,  # Increase epsilon for better stability
                 betas=(0.9, 0.999)  # Default betas, but being explicit
             )
