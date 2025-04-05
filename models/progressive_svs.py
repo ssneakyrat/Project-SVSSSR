@@ -213,8 +213,8 @@ class ProgressiveSVS(pl.LightningModule):
         
         # Enhanced debug info - MORE DETAILED
         if batch_idx == 0:
-            print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
-            print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
+            #print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
+            #print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
             
             # Add more detailed debug info for all stages, especially Stage 3
             curr_mean = mel_pred.mean().item()
@@ -230,10 +230,10 @@ class ProgressiveSVS(pl.LightningModule):
             p75 = np.percentile(flat_pred, 75)
             p95 = np.percentile(flat_pred, 95)
             
-            print(f"Stage {self.current_stage} - Prediction stats:")
-            print(f"  Mean={curr_mean:.6f}, Std={curr_std:.6f}")
-            print(f"  Min={curr_min:.6f}, Max={curr_max:.6f}")
-            print(f"  Percentiles: p05={p05:.6f}, p25={p25:.6f}, p50={p50:.6f}, p75={p75:.6f}, p95={p95:.6f}")
+            #print(f"Stage {self.current_stage} - Prediction stats:")
+            #print(f"  Mean={curr_mean:.6f}, Std={curr_std:.6f}")
+            #print(f"  Min={curr_min:.6f}, Max={curr_max:.6f}")
+            #print(f"  Percentiles: p05={p05:.6f}, p25={p25:.6f}, p50={p50:.6f}, p75={p75:.6f}, p95={p95:.6f}")
             
             # Check if prediction is changing between batches
             if hasattr(self, 'last_batch_stats'):
@@ -242,8 +242,8 @@ class ProgressiveSVS(pl.LightningModule):
                 prev_min = self.last_batch_stats['min']
                 prev_max = self.last_batch_stats['max']
                 
-                print(f"Prediction stats change - Mean: {curr_mean-prev_mean:.6f}, Std: {curr_std-prev_std:.6f}")
-                print(f"                          Min: {curr_min-prev_min:.6f}, Max: {curr_max-prev_max:.6f}")
+                #print(f"Prediction stats change - Mean: {curr_mean-prev_mean:.6f}, Std: {curr_std-prev_std:.6f}")
+                #print(f"                          Min: {curr_min-prev_min:.6f}, Max: {curr_max-prev_max:.6f}")
             
             self.last_batch_stats = {
                 'mean': curr_mean,
@@ -330,13 +330,13 @@ class ProgressiveSVS(pl.LightningModule):
         # Print debug info occasionally
         debug_interval = 5 if self.current_stage == 3 else 20  # More frequent for Stage 3
         if batch_idx % debug_interval == 0:
-            print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
-            print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
+            #print(f"Stage {self.current_stage} - Original mel shape: {mel_specs.shape}")
+            #print(f"Stage {self.current_stage} - Prediction shape: {mel_pred.shape}")
             
             # Add more detailed debug info for all stages
-            print(f"Stage {self.current_stage} - Prediction min/max/mean/std: "
-                  f"{mel_pred.min().item():.6f}/{mel_pred.max().item():.6f}/"
-                  f"{mel_pred.mean().item():.6f}/{mel_pred.std().item():.6f}")
+            #print(f"Stage {self.current_stage} - Prediction min/max/mean/std: "
+            #      f"{mel_pred.min().item():.6f}/{mel_pred.max().item():.6f}/"
+            #      f"{mel_pred.mean().item():.6f}/{mel_pred.std().item():.6f}")
                 
             # For Stage 3, log gradient norms periodically (using on_after_backward instead of direct calls)
             self.log('train_loss_batch', self.trainer.progress_bar_metrics.get('train_loss', 0), prog_bar=False)
@@ -557,24 +557,37 @@ class ProgressiveSVS(pl.LightningModule):
         
         print(f"Using stage-specific learning rate: {stage_lr} (base: {base_lr}, scale: {self.stage_lr_scale.get(self.current_stage, 1.0)})")
         
-        # For Stage 3, use AdamW with slightly different parameters
+        # Check if freezing is enabled (default to False if not specified)
+        freeze_earlier = self.config['train'].get('freeze_earlier_stages', False)
+        if self.current_stage == 3 and freeze_earlier:
+            print("Freezing earlier stages (FeatureEncoder, LowRes, MidRes) for Stage 3 training.")
+        
+        # For Stage 3, use AdamW with potentially different parameters/groups
         if self.current_stage == 3:
-            # Higher learning rate specifically for high_res_upsampler parameters
             high_res_params = []
             other_params = []
             
-            # Separate parameters for different learning rates
+            # Separate parameters
             for name, param in self.named_parameters():
+                if not param.requires_grad: # Skip params that are already frozen
+                    continue
                 if 'high_res_upsampler' in name:
                     high_res_params.append(param)
                 else:
-                    other_params.append(param)
-            
-            # Create parameter groups with different learning rates
+                    # Only add other params if not freezing
+                    if not freeze_earlier:
+                        other_params.append(param)
+                    else:
+                        # Explicitly freeze the parameter if freezing is enabled
+                        param.requires_grad = False
+
+            # Create parameter groups
             param_groups = [
                 {'params': high_res_params, 'lr': stage_lr * 2.0},  # Double LR for high_res
-                {'params': other_params, 'lr': stage_lr}
             ]
+            # Only add the 'other_params' group if we are NOT freezing
+            if not freeze_earlier:
+                param_groups.append({'params': other_params, 'lr': stage_lr})
             
             optimizer = torch.optim.AdamW(
                 param_groups,
@@ -582,9 +595,15 @@ class ProgressiveSVS(pl.LightningModule):
                 eps=1e-5,  # Increase epsilon for better stability
                 betas=(0.9, 0.999)  # Default betas, but being explicit
             )
-        else:
+        else: # Stages 1 and 2
+            # Ensure all parameters require gradients for stages 1 & 2
+            params_to_optimize = []
+            for name, param in self.named_parameters():
+                 param.requires_grad = True # Make sure params are trainable
+                 params_to_optimize.append(param)
+
             optimizer = torch.optim.Adam(
-                self.parameters(), 
+                params_to_optimize, # Use the list of params that require grad
                 lr=stage_lr,
                 weight_decay=self.config['train']['weight_decay']
             )

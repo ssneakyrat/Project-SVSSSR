@@ -330,8 +330,8 @@ class HighResUpsampler(nn.Module):
         # Initialize with LARGER weights to make output more visible (0.1 -> 0.5)
         nn.init.xavier_uniform_(self.output_proj.weight, gain=0.5)
         
-        # Add output normalization to ensure values are in visible range
-        self.output_normalization = nn.Identity()  # Default to identity, can be changed to custom normalization
+        # Add final activation to constrain output to [0, 1] range
+        self.output_normalization = nn.Sigmoid() # Changed from Identity to Sigmoid
         
     def forward(self, x):
         # Save input for residual connection
@@ -371,8 +371,8 @@ class HighResUpsampler(nn.Module):
         # Add the residual connection with a LARGER weight (0.05 -> 0.3)
         x = x + 0.3 * identity
         
-        # Apply output normalization
-        x = self.output_normalization(x)
+        # Apply final activation (Sigmoid)
+        x = self.output_normalization(x) # Applies Sigmoid now
         
         # Output shape: [B, 1, C, T]
         return x
