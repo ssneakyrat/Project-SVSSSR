@@ -133,13 +133,33 @@ class AttentionFreeSVS(pl.LightningModule):
         Compute MSE loss with optional masking for variable-length data
         
         Args:
-            pred: Predicted mel spectrogram [batch, channels, mel_bins, time]
-            target: Target mel spectrogram [batch, channels, mel_bins, time]
+            pred: Predicted mel spectrogram [batch, mel_bins, time] or [batch, channels, mel_bins, time]
+            target: Target mel spectrogram [batch, mel_bins, time] or [batch, channels, mel_bins, time]
             mask: Binary mask for valid time steps [batch, time]
             
         Returns:
             Loss value
         """
+        # Handle different tensor shapes
+        # If tensors are 3D [batch, mel_bins, time], convert to 4D by adding channel dim
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)  # [batch, mel_bins, time] -> [batch, 1, mel_bins, time]
+        
+        if target.dim() == 3:
+            target = target.unsqueeze(1)  # [batch, mel_bins, time] -> [batch, 1, mel_bins, time]
+        
+        # Now both should be 4D [batch, channels, mel_bins, time]
+        
+        # Adjust time dimension mismatch (handle upsampling factor difference)
+        time_dim = -1  # Last dimension is time
+        if pred.shape[time_dim] != target.shape[time_dim]:
+            # Downsample pred to match target's time dimension
+            factor = pred.shape[time_dim] // target.shape[time_dim]
+            if factor > 1:
+                # Use adaptive pooling to downsample the time dimension
+                import torch.nn.functional as F
+                pred = F.adaptive_avg_pool2d(pred, (pred.shape[2], target.shape[time_dim]))
+        
         if mask is None:
             return F.mse_loss(pred, target)
         
@@ -149,6 +169,8 @@ class AttentionFreeSVS(pl.LightningModule):
         
         # Count valid time steps for averaging
         valid_steps = mask.sum()
+        if valid_steps == 0:
+            valid_steps = 1  # Avoid division by zero
         
         # Compute masked loss
         squared_error = (pred - target) ** 2
@@ -249,21 +271,57 @@ class AttentionFreeSVS(pl.LightningModule):
     
     def _log_spectrograms(self, pred_mel, target_mel):
         """
-        Log spectrograms to TensorBoard
+        Log spectrograms to TensorBoard with robust handling of different tensor shapes
         
         Args:
-            pred_mel: Predicted mel spectrogram [channels, mel_bins, time]
-            target_mel: Target mel spectrogram [channels, mel_bins, time]
+            pred_mel: Predicted mel spectrogram
+            target_mel: Target mel spectrogram
         """
-        # Convert to single-channel images
-        pred_mel_img = pred_mel[0].unsqueeze(0)  # [1, mel_bins, time]
-        target_mel_img = target_mel[0].unsqueeze(0)  # [1, mel_bins, time]
+        import torch
         
-        # Log to TensorBoard
-        if hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
-            self.logger.experiment.add_image(
-                'pred_mel', pred_mel_img, self.global_step, dataformats='CHW'
-            )
-            self.logger.experiment.add_image(
-                'target_mel', target_mel_img, self.global_step, dataformats='CHW'
-            )
+        try:
+            # Clone tensors to avoid modifying originals
+            pred_img = pred_mel.detach().clone()
+            target_img = target_mel.detach().clone()
+            
+            # Handle the case where tensor is [1, time] (flattened)
+            if pred_img.dim() == 2 and pred_img.shape[0] == 1:
+                # Reshape to [1, mel_bins, time]
+                time_frames = pred_img.shape[1] // self.mel_bins
+                pred_img = pred_img.reshape(1, self.mel_bins, time_frames)
+            
+            # Convert to proper format for TensorBoard (CHW)
+            if pred_img.dim() == 2:  # [mel_bins, time]
+                pred_img = pred_img.unsqueeze(0)  # [1, mel_bins, time]
+            elif pred_img.dim() == 3 and pred_img.shape[0] > 1:  # [batch, mel_bins, time]
+                pred_img = pred_img[0].unsqueeze(0)  # Take first batch item: [1, mel_bins, time]
+            
+            # Same for target
+            if target_img.dim() == 2 and target_img.shape[0] == 1:
+                time_frames = target_img.shape[1] // self.mel_bins
+                target_img = target_img.reshape(1, self.mel_bins, time_frames)
+                
+            if target_img.dim() == 2:
+                target_img = target_img.unsqueeze(0)
+            elif target_img.dim() == 3 and target_img.shape[0] > 1:
+                target_img = target_img[0].unsqueeze(0)
+            
+            # Normalize for better visualization
+            pred_img = (pred_img - pred_img.min()) / (pred_img.max() - pred_img.min() + 1e-6)
+            target_img = (target_img - target_img.min()) / (target_img.max() - target_img.min() + 1e-6)
+            
+            # Log to TensorBoard
+            if hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
+                self.logger.experiment.add_image(
+                    'pred_mel', pred_img, self.global_step, dataformats='CHW'
+                )
+                self.logger.experiment.add_image(
+                    'target_mel', target_img, self.global_step, dataformats='CHW'
+                )
+        except Exception as e:
+            # If logging fails, print info but don't crash training
+            print(f"Warning: Failed to log spectrograms - {e}")
+            if hasattr(pred_mel, 'shape'):
+                print(f"Pred shape: {pred_mel.shape}")
+            if hasattr(target_mel, 'shape'):
+                print(f"Target shape: {target_mel.shape}")
