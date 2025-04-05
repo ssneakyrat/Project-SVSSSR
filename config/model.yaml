@@ -34,7 +34,7 @@ model:
   # Architecture settings - MODIFIED FOR BETTER PARAMETER BALANCE
   low_res_channels: [224, 160, 96, 64]    # ~140K parameters (was [224, 128, 64, 32])
   mid_res_channels: [64, 48, 36]          # ~55K parameters (was [32, 24, 16])
-  high_res_channels: [36, 28, 20, 16, 12, 8, 1]  # ~90K parameters (was [16, 12, 8, 1])
+  high_res_channels: [16, 12, 8, 1]          # Set to [16, 12, 8, 1]
   
   # Progressive training
   current_stage: 1
