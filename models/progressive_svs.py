@@ -371,87 +371,99 @@ class ProgressiveSVS(pl.LightningModule):
             )
     
     def _log_mel_comparison(self, pred_mel, target_mel):
-        # Create enhanced visualization for comparison
-        fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+        """
+        Create and log mel spectrogram comparison visualizations with proper figure cleanup.
+        """
+        main_fig = None
         
-        # Plot prediction
-        im1 = axes[0].imshow(pred_mel.numpy(), origin='lower', aspect='auto', 
-                            vmin=0, vmax=1)
-        axes[0].set_title(f'Predicted Mel (Stage {self.current_stage})')
-        plt.colorbar(im1, ax=axes[0])
-        
-        # Plot ground truth
-        im2 = axes[1].imshow(target_mel.numpy(), origin='lower', aspect='auto',
-                            vmin=0, vmax=1)
-        axes[1].set_title('Target Mel')
-        plt.colorbar(im2, ax=axes[1])
-        
-        # Plot difference
-        diff = np.abs(pred_mel.numpy() - target_mel.numpy())
-        im3 = axes[2].imshow(diff, origin='lower', aspect='auto', 
-                            cmap='hot', vmin=0, vmax=0.5)
-        axes[2].set_title('Absolute Difference')
-        plt.colorbar(im3, ax=axes[2])
-        
-        plt.tight_layout()
-        
-        # Convert plot to image
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=150)
-        buf.seek(0)
-        
-        # Convert to tensor
-        img = Image.open(buf)
-        img_tensor = torchvision.transforms.ToTensor()(img)
-        
-        # Log to tensorboard
-        self.logger.experiment.add_image(
-            f'mel_comparison_stage{self.current_stage}', 
-            img_tensor, 
-            self.current_epoch
-        )
-        
-        # For Stage 3, add separate frequency band visualizations
-        if self.current_stage == 3:
-            # Split into frequency bands (lower, middle, upper)
-            freq_bands = 3
-            band_size = pred_mel.shape[0] // freq_bands
+        try:
+            # Create enhanced visualization for comparison
+            main_fig, axes = plt.subplots(3, 1, figsize=(12, 10))
             
-            for i in range(freq_bands):
-                start_idx = i * band_size
-                end_idx = (i+1) * band_size if i < freq_bands-1 else pred_mel.shape[0]
+            # Plot prediction
+            im1 = axes[0].imshow(pred_mel.numpy(), origin='lower', aspect='auto', 
+                                vmin=0, vmax=1)
+            axes[0].set_title(f'Predicted Mel (Stage {self.current_stage})')
+            plt.colorbar(im1, ax=axes[0])
+            
+            # Plot ground truth
+            im2 = axes[1].imshow(target_mel.numpy(), origin='lower', aspect='auto',
+                                vmin=0, vmax=1)
+            axes[1].set_title('Target Mel')
+            plt.colorbar(im2, ax=axes[1])
+            
+            # Plot difference
+            diff = np.abs(pred_mel.numpy() - target_mel.numpy())
+            im3 = axes[2].imshow(diff, origin='lower', aspect='auto', 
+                                cmap='hot', vmin=0, vmax=0.5)
+            axes[2].set_title('Absolute Difference')
+            plt.colorbar(im3, ax=axes[2])
+            
+            plt.tight_layout()
+            
+            # Convert plot to image
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150)
+            buf.seek(0)
+            
+            # Convert to tensor
+            img = Image.open(buf)
+            img_tensor = torchvision.transforms.ToTensor()(img)
+            
+            # Log to tensorboard
+            self.logger.experiment.add_image(
+                f'mel_comparison_stage{self.current_stage}', 
+                img_tensor, 
+                self.current_epoch
+            )
+            
+            # For Stage 3, add separate frequency band visualizations
+            if self.current_stage == 3:
+                # Split into frequency bands (lower, middle, upper)
+                freq_bands = 3
+                band_size = pred_mel.shape[0] // freq_bands
                 
-                # Create visualization for this band
-                fig, axes = plt.subplots(2, 1, figsize=(10, 6))
-                
-                # Plot this frequency band
-                axes[0].imshow(pred_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
-                axes[0].set_title(f'Predicted Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
-                
-                axes[1].imshow(target_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
-                axes[1].set_title(f'Target Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
-                
-                plt.tight_layout()
-                
-                # Convert plot to image
-                band_buf = io.BytesIO()
-                plt.savefig(band_buf, format='png')
-                band_buf.seek(0)
-                
-                # Convert to tensor
-                band_img = Image.open(band_buf)
-                band_img_tensor = torchvision.transforms.ToTensor()(band_img)
-                
-                # Log to tensorboard
-                self.logger.experiment.add_image(
-                    f'freq_band_{i+1}_stage{self.current_stage}', 
-                    band_img_tensor, 
-                    self.current_epoch
-                )
-                
-                plt.close(fig)
-        
-        plt.close(fig)
+                for i in range(freq_bands):
+                    band_fig = None
+                    try:
+                        start_idx = i * band_size
+                        end_idx = (i+1) * band_size if i < freq_bands-1 else pred_mel.shape[0]
+                        
+                        # Create visualization for this band
+                        band_fig, band_axes = plt.subplots(2, 1, figsize=(10, 6))
+                        
+                        # Plot this frequency band
+                        band_axes[0].imshow(pred_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
+                        band_axes[0].set_title(f'Predicted Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
+                        
+                        band_axes[1].imshow(target_mel[start_idx:end_idx].numpy(), origin='lower', aspect='auto')
+                        band_axes[1].set_title(f'Target Mel - Band {i+1} (Freq: {start_idx}-{end_idx-1})')
+                        
+                        plt.tight_layout()
+                        
+                        # Convert plot to image
+                        band_buf = io.BytesIO()
+                        plt.savefig(band_buf, format='png')
+                        band_buf.seek(0)
+                        
+                        # Convert to tensor
+                        band_img = Image.open(band_buf)
+                        band_img_tensor = torchvision.transforms.ToTensor()(band_img)
+                        
+                        # Log to tensorboard
+                        self.logger.experiment.add_image(
+                            f'freq_band_{i+1}_stage{self.current_stage}', 
+                            band_img_tensor, 
+                            self.current_epoch
+                        )
+                    finally:
+                        # Ensure each band figure is closed even if an exception occurs
+                        if band_fig is not None:
+                            plt.close(band_fig)
+        finally:
+            # Ensure main figure is closed even if an exception occurs
+            if main_fig is not None:
+                plt.close(main_fig)
     
     def configure_optimizers(self):
         # Implement stage-specific learning rates
