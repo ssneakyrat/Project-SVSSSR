@@ -3,12 +3,16 @@
 data:
   bin_dir: datasets
   bin_file: mel_spectrograms.h5
-  data_key: mel_spectrograms
+  mel_key: mel_spectrograms # Key for target mel spectrograms
+  phoneme_key: phonemes     # Key for input phoneme sequences
+  duration_key: durations   # Key for input duration sequences
+  f0_key: f0                # Key for input F0 sequences
   lazy_load: true
   raw_dir: datasets/gin
-  max_samples: 100
+  # max_samples: 100 # Set to null or remove to use full dataset
   sample_percentage: null
   variable_length: true
+  min_phones_in_lab: 5 # Minimum number of phone entries required in a .lab file to process it
   
 audio:
   sample_rate: 22050
@@ -22,7 +26,32 @@ audio:
   f0_max: 600
   max_audio_length: 10.0
 
-  model:
-    # 10 seconds * 22050 Hz / 256 hop_length ≈ 861 frames
-    time_frames: 864  # Rounded to a multiple of 32 for cleaner downsampling
-    mel_bins: 80
+# Model specific parameters
+model:
+  # Architecture details for MinimalSVS
+  name: MinimalSVS # Identifier for the model class
+  embedding_dim: 128
+  f0_dim: 1           # Dimension of F0 input (usually 1)
+  rnn_hidden_dim: 512 # Increased hidden size
+  rnn_layers: 2
+  mel_bins: 80        # Output dimension (should match audio.n_mels)
+  # Post-Net Configuration
+  postnet:
+    n_convs: 5        # Number of convolutional layers in the Post-Net
+    kernel_size: 5    # Kernel size for Post-Net convolutions
+    channels: 512     # Number of channels in Post-Net convolutions
+
+# Training Configuration
+train:
+  batch_size: 16        # Adjust based on GPU memory
+  learning_rate: 0.001    # Increased learning rate
+  epochs: 50            # Number of training epochs
+  val_interval: 1       # Run validation every N epochs
+  log_dir: logs         # Base directory for all logs
+  tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs (relative to log_dir)
+  checkpoint_dir: checkpoints # Subdirectory for model checkpoints (relative to log_dir)
+  save_interval: 100      # Save checkpoint every N epochs
+  num_workers: 4        # DataLoader workers (adjust based on system)
+  log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps
+  gradient_clip_val: 1.0 # Added gradient clipping value
+  # Add any other training-specific parameters here (e.g., optimizer type, scheduler settings)
