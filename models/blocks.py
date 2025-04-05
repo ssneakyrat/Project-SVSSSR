@@ -170,6 +170,7 @@ class MidResUpsampler(nn.Module):
 class HighResUpsampler(nn.Module):
     """High-Resolution Upsampler (80×864)
     Upsamples mid-resolution output to high-resolution (full) with enhanced capacity.
+    Includes skip connections to preserve information flow.
     """
     def __init__(self, input_dim, channels_list, output_dim):
         super().__init__()
@@ -186,37 +187,47 @@ class HighResUpsampler(nn.Module):
         # Processing blocks with more capacity and residual connections
         self.blocks = nn.ModuleList()
         
-        # First half of blocks with larger kernels (5x5) for better receptive field
-        mid_point = len(channels_list) // 2
-        for i in range(mid_point):
+        # Store intermediate activations for skip connections
+        self.intermediate_layers = nn.ModuleList()
+        
+        # First block after upsampling
+        self.blocks.append(
+            ResidualConvBlock2D(
+                channels_list[0], 
+                channels_list[1],
+                kernel_size=5,  # Larger kernel for better context
+                padding=2       # Adjust padding for kernel size
+            )
+        )
+        
+        # Add deeper network with skip connections for remaining blocks
+        for i in range(1, len(channels_list) - 2):
+            # Add intermediate layer for feature fusion (1x1 conv for skip connection)
+            if i % 2 == 0:  # Add skip connections every 2 layers
+                self.intermediate_layers.append(
+                    nn.Conv2d(channels_list[i-1], channels_list[i+1], kernel_size=1)
+                )
+            
+            # Add residual block
             self.blocks.append(
                 ResidualConvBlock2D(
                     channels_list[i], 
                     channels_list[i+1],
-                    kernel_size=5,  # Larger kernel for better context
-                    padding=2       # Adjust padding for kernel size
+                    kernel_size=3 if i > 2 else 5,  # Larger kernels for early layers
+                    padding=1 if i > 2 else 2       # Matching padding
                 )
             )
         
-        # Second half of blocks with standard kernels (3x3)
-        for i in range(mid_point, len(channels_list) - 1):
-            self.blocks.append(
-                ResidualConvBlock2D(
-                    channels_list[i], 
-                    channels_list[i+1]
-                )
-            )
-        
-        # Final refinement layer with standard kernel
+        # Final refinement layer
         self.refinement = ConvBlock2D(
-            channels_list[-1], 
-            channels_list[-1],
+            channels_list[-2], 
+            channels_list[-2],
             kernel_size=3,
             padding=1
         )
         
         # Final projection to single channel
-        self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
+        self.output_proj = nn.Conv2d(channels_list[-2], 1, kernel_size=1)
         
     def forward(self, x):
         # Input is [B, 1, C, T] from Stage 2
@@ -224,9 +235,22 @@ class HighResUpsampler(nn.Module):
         # Apply upsampling
         x = self.upsampler(x)
         
-        # Process through blocks
-        for block in self.blocks:
+        # Process through blocks with skip connections
+        skip_idx = 0
+        features = []
+        
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            
+            # Store features for skip connections
+            if i < len(self.blocks) - 1 and i % 2 == 0:
+                features.append(x)
+            
+            # Apply skip connection
+            if i > 0 and i % 2 == 0 and skip_idx < len(self.intermediate_layers):
+                skip_feature = self.intermediate_layers[skip_idx](features[skip_idx])
+                x = x + skip_feature  # Add skip connection
+                skip_idx += 1
         
         # Apply final refinement
         x = self.refinement(x)

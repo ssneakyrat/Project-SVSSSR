@@ -31,10 +31,10 @@ model:
   phone_embed_dim: 128
   midi_embed_dim: 32
   
-  # Architecture settings - MODIFIED FOR BETTER PARAMETER BALANCE
-  low_res_channels: [224, 160, 96, 64]    # ~140K parameters (was [224, 128, 64, 32])
-  mid_res_channels: [64, 48, 36]          # ~55K parameters (was [32, 24, 16])
-  high_res_channels: [16, 12, 8, 1]          # Set to [16, 12, 8, 1]
+  # Balanced Architecture Settings (~100K/80K/120K parameters)
+  low_res_channels: [224, 144, 96, 48]          # Reduced to ~100K parameters
+  mid_res_channels: [48, 64, 80]                # Increased to ~80K parameters
+  high_res_channels: [80, 64, 56, 48, 32, 16, 1] # Significantly expanded to ~120K parameters
   
   # Progressive training
   current_stage: 1

@@ -87,6 +87,7 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=None, help='Override learning rate from config')
     parser.add_argument('--disable_early_stopping', action='store_true', help='Disable early stopping')
     parser.add_argument('--freeze_earlier_stages', action='store_true', help='Freeze earlier stages when training in Stage 2 or 3')
+    parser.add_argument('--use_warmup', action='store_true', help='Use learning rate warmup for Stage 3')
     args = parser.parse_args()
     
     pl.seed_everything(args.seed)
@@ -116,22 +117,23 @@ def main():
     if not args.max_epochs and current_stage <= len(stage_epochs):
         config['train']['num_epochs'] = stage_epochs[current_stage-1]
     
-    # Stage-specific batch size and learning rate adjustments
+    # Stage-specific batch size adjustments with improved Stage 3 handling
     if current_stage == 2 and not args.batch_size:
         # Half the batch size for Stage 2
         original_bs = config['train']['batch_size']
         config['train']['batch_size'] = max(8, original_bs // 2)
     elif current_stage == 3 and not args.batch_size:
-        # Quarter the batch size for Stage 3
+        # More moderate batch size reduction for Stage 3 (half instead of quarter)
         original_bs = config['train']['batch_size']
-        config['train']['batch_size'] = max(4, original_bs // 4)
+        config['train']['batch_size'] = max(8, original_bs // 2)  # No smaller than 8
     
+    # Stage-specific learning rate adjustments with improved Stage 3 handling
     if current_stage == 2 and not args.learning_rate:
         # Half the learning rate for Stage 2
         config['train']['learning_rate'] *= 0.5
     elif current_stage == 3 and not args.learning_rate:
-        # Reduce learning rate by 10x for Stage 3
-        config['train']['learning_rate'] *= 0.1
+        # More moderate learning rate reduction for Stage 3 (0.3x instead of 0.1x)
+        config['train']['learning_rate'] *= 0.3
     
     # Verify dataset path
     h5_path = os.path.join(config['data']['bin_dir'], config['data']['bin_file'])
@@ -176,6 +178,27 @@ def main():
         )
         callbacks.append(early_stopping)
     
+    # Add warmup callback for Stage 3 if requested
+    use_warmup = args.use_warmup or current_stage == 3
+    if use_warmup and current_stage == 3:
+        warmup_epochs = min(10, config['train']['num_epochs'] // 10)
+        print(f"Using {warmup_epochs} epochs of learning rate warmup for Stage 3")
+        
+        class WarmupCallback(pl.Callback):
+            def __init__(self, warmup_epochs, initial_factor=0.3):
+                super().__init__()
+                self.warmup_epochs = warmup_epochs
+                self.initial_factor = initial_factor
+                
+            def on_train_epoch_start(self, trainer, pl_module):
+                if trainer.current_epoch < self.warmup_epochs:
+                    # Linear warmup
+                    factor = self.initial_factor + (1.0 - self.initial_factor) * (trainer.current_epoch / self.warmup_epochs)
+                    for pg in trainer.optimizers[0].param_groups:
+                        pg['lr'] = pg['initial_lr'] * factor
+        
+        callbacks.append(WarmupCallback(warmup_epochs))
+    
     try:
         # Initialize the model
         model = ProgressiveSVS(config)
@@ -201,13 +224,12 @@ def main():
         if torch.cuda.is_available():
             trainer_kwargs['precision'] = '16-mixed'
         
-        # Add gradient clipping for stability in Stage 3
+        # Improved gradient clipping for Stage 3
         if current_stage == 3:
-            trainer_kwargs['gradient_clip_val'] = 1.0
-        
-        # Accumulate gradients for larger effective batch size in Stage 3
-        if current_stage == 3:
-            trainer_kwargs['accumulate_grad_batches'] = 2
+            trainer_kwargs['gradient_clip_val'] = 3.0  # More moderate clipping
+            
+            # Use smaller gradient accumulation for more frequent updates
+            trainer_kwargs['accumulate_grad_batches'] = 1
         
         trainer = pl.Trainer(**trainer_kwargs)
         

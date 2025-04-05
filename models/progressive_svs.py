@@ -437,6 +437,10 @@ class ProgressiveSVS(pl.LightningModule):
             weight_decay=self.config['train']['weight_decay']
         )
         
+        # Store the initial learning rate in the param groups for warmup callback
+        for pg in optimizer.param_groups:
+            pg['initial_lr'] = lr
+            
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
