@@ -48,7 +48,7 @@ model:
   # Format: List of output channels for each ConvBlock in the stage
   low_res_channels: [256, 256, 128]
   mid_res_channels: [128, 128, 64]
-  high_res_channels: [64, 64, 32]
+  high_res_channels: [64, 64, 64, 32]
 
   # Initial training stage (1, 2, or 3)
   current_stage: 1
@@ -59,7 +59,8 @@ train:
   epochs_per_stage:
     stage1: 150         #ideal 200
     stage2: 100         #ideal 150
-    stage3: 150
+    stage3: 100         #ideal 150
+  
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
   tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs
