@@ -2,12 +2,15 @@ import warnings
 # Filter the specific h5py UserWarning about HDF5 version mismatch
 warnings.filterwarnings("ignore", message=r"h5py is running against HDF5.*when it was built against.*", category=UserWarning)
 
+import logging # Import logging
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import pytorch_lightning as pl
 import h5py
 import numpy as np
 import math
+
+logger = logging.getLogger(__name__) # Module-level logger
 
 class H5FileManager:
     _instance = None
@@ -83,13 +86,13 @@ class H5Dataset(Dataset):
                     for h5_key in self.data_keys.values():
                         if h5_key not in first_group:
                             # Warning or error depending on strictness
-                            print(f"Warning: Data key '{h5_key}' not found in the first sample group '{first_group_name}' of {h5_path}. Assuming it exists in others.")
+                            logger.warning(f"Data key '{h5_key}' not found in the first sample group '{first_group_name}' of {h5_path}. Assuming it exists in others.")
                             # raise KeyError(f"Data key '{h5_key}' not found in the first sample group '{first_group_name}' of {h5_path}")
                 except KeyError:
-                     print(f"Warning: Could not access first group '{first_group_name}' for key check in {h5_path}.")
+                     logger.warning(f"Could not access first group '{first_group_name}' for key check in {h5_path}.")
             # Pre-load all data if not lazy loading
             if not self.lazy_load:
-                print(f"Pre-loading data from {self.h5_path}...")
+                logger.info(f"Pre-loading data from {self.h5_path}...")
                 self.data = {} # Store pre-loaded data indexed by group_name
                 for group_name in self.sample_keys:
                     self.data[group_name] = {}
@@ -99,8 +102,8 @@ class H5Dataset(Dataset):
                             self.data[group_name][name] = group[h5_key][()] # Load data into memory
                         else:
                             self.data[group_name][name] = None # Or handle differently
-                            print(f"Warning: Key '{h5_key}' not found in group '{group_name}' during pre-loading.")
-                print("Pre-loading complete.")
+                            logger.warning(f"Key '{h5_key}' not found in group '{group_name}' during pre-loading.")
+                logger.info("Pre-loading complete.")
                 # Keep handle open if not lazy loading, as __getitem__ might still use it if pre-loading fails for a key
         except Exception as e:
             # Ensure file handle is closed on error during init if not lazy
@@ -114,20 +117,22 @@ class H5Dataset(Dataset):
 
     
     def __getitem__(self, idx):
+        """Loads a single sample (group) from the HDF5 file."""
         sample = {}
         h5_file = None # Define h5_file scope
 
         try:
+            # Get HDF5 file handle (either from manager or persistent handle)
             if self.lazy_load:
                 h5_manager = H5FileManager.get_instance()
-                h5_file = h5_manager.get_file(self.h5_path)
+                h5_file = h5_manager.get_file(self.h5_path) # Lazy loading uses manager
             else:
                 # Use pre-loaded data or the persistent handle
-                if hasattr(self, 'data'): # Data was pre-loaded
+                if hasattr(self, 'data'): # Non-lazy: Check if data was pre-loaded
                      group_name = self.sample_keys[idx]
                      if group_name not in self.data:
                           # This might happen if pre-loading failed for this group earlier
-                          print(f"Warning: Group name '{group_name}' (index {idx}) not found in pre-loaded data. Attempting direct load.")
+                          logger.warning(f"Group name '{group_name}' (index {idx}) not found in pre-loaded data. Attempting direct load.")
                           # Fall back to using the handle if available
                           if self.h5_file_handle:
                                h5_file = self.h5_file_handle
@@ -142,9 +147,9 @@ class H5Dataset(Dataset):
                                    # Data is already numpy array from pre-load
                                    sample[name] = torch.from_numpy(preloaded_group_data[name])
                               else:
-                                   sample[name] = None # Or handle error
+                                   sample[name] = None # Mark as None if key was missing during pre-load
 
-                          # Apply transforms and convert types after loading all parts from pre-loaded data
+                          # Convert pre-loaded numpy arrays to tensors with appropriate types
                           for name, tensor in sample.items():
                               if tensor is not None:
                                   # Infer type (simple heuristic, may need refinement)
@@ -161,6 +166,7 @@ class H5Dataset(Dataset):
                                           sample[name] = tensor.long()
                                   else: # Assuming mel, f0 are float types
                                       sample[name] = tensor.float()
+                          # Apply any specified transforms
                           if self.transform:
                               sample = self.transform(sample) # Transform the dict
                           return sample # Return early if data was successfully retrieved from pre-loaded cache
@@ -175,11 +181,11 @@ class H5Dataset(Dataset):
                     # This case shouldn't happen if init logic is correct
                     raise RuntimeError("Dataset not properly initialized for non-lazy loading.")
 
-            # --- Common logic for lazy loading or using open handle ---
+            # --- Common logic for lazy loading or using the persistent handle (if pre-load failed) ---
             if h5_file is None:
                  raise RuntimeError("HDF5 file handle not available.")
 
-            # --- Access data within the group ---
+            # --- Access data directly from the HDF5 group ---
             group_name = self.sample_keys[idx]
             group = h5_file[group_name]
 
@@ -210,16 +216,17 @@ class H5Dataset(Dataset):
                          else: # Assuming float types (mel, f0)
                              sample[name] = torch.from_numpy(data_np).float()
                 else:
-                    print(f"Warning: Key '{h5_key}' not found in group '{group_name}' for index {idx}.")
-                    sample[name] = None # Handle missing key
+                    logger.warning(f"Key '{h5_key}' not found in group '{group_name}' for index {idx}.")
+                    sample[name] = None # Mark as None if key is missing in the group
 
+            # Apply any specified transforms
             if self.transform:
                 sample = self.transform(sample) # Apply transform to the dictionary
 
             return sample
 
         except Exception as e:
-            print(f"Error loading index {idx} from {self.h5_path}: {e}")
+            logger.error(f"Error loading index {idx} from {self.h5_path}: {e}", exc_info=True)
             # Return None or raise error depending on desired behavior
             # Returning None requires handling in collate_fn
             return None
@@ -238,6 +245,15 @@ class H5Dataset(Dataset):
 
 def collate_fn_pad(batch):
     """
+    Collate function for DataLoader. Handles:
+    1. Filtering None items (errors during __getitem__).
+    2. Determining max sequence lengths for frame-level and phoneme-level data.
+    3. Expanding phoneme-level IDs and durations to frame-level phoneme labels.
+    4. Padding all sequences in the batch to the maximum length for their type.
+    5. Stacking tensors for each key.
+    6. Renaming keys to match model input expectations.
+    """
+    """
     Custom collate function to pad sequences in a batch of dictionaries.
     Handles padding for keys like 'mel', 'f0', 'midi_pitch_estimated', 'phoneme', 'duration'.
     Expands phoneme IDs ('phoneme') using 'duration' into frame-level 'phone_label'.
@@ -255,10 +271,10 @@ def collate_fn_pad(batch):
     # Add the key for the expanded frame-level phoneme labels
     keys_in_batch = keys + ['phone_label']
     padded_batch = {key: [] for key in keys_in_batch}
-    lengths = {key: [] for key in keys} # Store original lengths of loaded data
+    lengths = {key: [] for key in keys} # Store original lengths before padding
 
     # Determine max lengths for each sequence type
-    max_len = {}
+    max_len = {} # Store max lengths for padding
     # Determine max lengths for frame-level and phoneme-level sequences
     frame_level_keys = ['mel', 'f0', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag'] # Add voiced_mask, unvoiced_flag
     # 'phoneme' key holds frame-level IDs loaded from HDF5, remove it from here
@@ -266,7 +282,8 @@ def collate_fn_pad(batch):
     max_len_frame = 0
     max_len_phoneme = 0
 
-    # Calculate max frame length based on frame-level keys
+    # --- Determine Max Lengths ---
+    # Calculate max frame length (e.g., mel, f0) across the batch
     for key in frame_level_keys:
         if key in keys: # Check if the key exists in the loaded data
             current_max_for_key = 0
@@ -274,27 +291,27 @@ def collate_fn_pad(batch):
                 # Check if the key exists for the item and if it's not None
                 data_element = item.get(key)
                 if data_element is None:
-                    print(f"DEBUG: collate_fn_pad - Item index {i} has None for key '{key}'. Item keys: {list(item.keys())}")
+                    logger.debug(f"collate_fn_pad - Item index %d has None for key '%s'. Item keys: %s", i, key, list(item.keys()))
                     # Decide how to handle: skip? use 0? For now, just report.
                     # We'll rely on current_max_for_key not being updated for this item.
                 elif not hasattr(data_element, 'shape'):
-                    print(f"DEBUG: collate_fn_pad - Item index {i}, key '{key}' is not None but has no 'shape'. Type: {type(data_element)}")
+                    logger.debug(f"collate_fn_pad - Item index %d, key '%s' is not None but has no 'shape'. Type: %s", i, key, type(data_element))
                     # Handle as above.
                 else:
                     try:
                         # Use shape[0] for time dimension length
                         current_max_for_key = max(current_max_for_key, data_element.shape[0])
                     except IndexError:
-                         print(f"DEBUG: collate_fn_pad - Item index {i}, key '{key}' has shape {data_element.shape}, but failed to access shape[-1].")
+                         logger.debug(f"collate_fn_pad - Item index %d, key '%s' has shape %s, but failed to access shape[-1].", i, key, data_element.shape)
 
             max_len_frame = max(max_len_frame, current_max_for_key)
 
-    # Calculate max phoneme sequence length
+    # Calculate max phoneme sequence length (e.g., durations) across the batch
     for key in phoneme_level_keys:
         if key in keys:
              max_len_phoneme = max(max_len_phoneme, max(item[key].shape[0] for item in batch))
 
-    # The target length for frame-level expansion will be max_len_frame
+    # Set target lengths for padding based on calculated maximums
     max_len['phone_label'] = max_len_frame # Expanded phonemes match frame length
     for key in frame_level_keys:
         if key in keys:
@@ -305,11 +322,12 @@ def collate_fn_pad(batch):
 
     # Pad each item in the batch
     # Process each item in the batch: expand phonemes, pad sequences
+    # --- Process Each Sample ---
     for item in batch:
         # --- Expand Phoneme IDs to Frame Level ---
         # Load frame-level IDs (might not be needed here, but keeping for context)
         # frame_level_phoneme_ids = item['phoneme']
-        # Load the PHONEME-LEVEL IDs and DURATIONS
+        # Load the PHONEME-LEVEL IDs and DURATIONS for expansion
         phoneme_level_ids = item['phone_sequence_ids']
         durations = item['duration']
         target_frame_len = max_len_frame # Target length is max frame length in batch
@@ -321,14 +339,14 @@ def collate_fn_pad(batch):
 
         expanded_phonemes_list = []
         if total_duration > 0:
-             # Use repeat_interleave for efficient expansion
+             # Use repeat_interleave for efficient expansion from phoneme-level to frame-level
              try:
                   # Use the phoneme-level IDs here
                   expanded_phonemes = torch.repeat_interleave(phoneme_level_ids, durations)
              except RuntimeError as e:
-                  print(f"RuntimeError during repeat_interleave: {e}")
-                  print(f"Phoneme IDs: {phoneme_ids.shape}, Durations: {durations.shape}, Sum: {total_duration}")
-                  # Fallback or error handling: create zeros
+                  logger.error(f"RuntimeError during repeat_interleave: {e}", exc_info=True)
+                  logger.error(f"Phoneme IDs shape: %s, Durations shape: %s, Sum: %s", phoneme_level_ids.shape, durations.shape, total_duration) # Corrected variable name
+                  # Fallback: create zeros if repeat_interleave fails (e.g., length mismatch)
                   expanded_phonemes = torch.zeros(target_frame_len, dtype=torch.long)
 
              current_expanded_len = expanded_phonemes.shape[0]
@@ -341,7 +359,7 @@ def collate_fn_pad(batch):
                   expanded_phonemes = expanded_phonemes[:target_frame_len]
 
         else: # Handle case where total duration is zero
-             expanded_phonemes = torch.zeros(target_frame_len, dtype=torch.long)
+             expanded_phonemes = torch.zeros(target_frame_len, dtype=torch.long) # Create zeros if total duration is 0
         padded_batch['phone_label'].append(expanded_phonemes)
         # Note: We don't store length for 'phone_label' as it's always max_len_frame
 
@@ -351,7 +369,7 @@ def collate_fn_pad(batch):
             # Use shape[0] for time dimension length for frame-level keys
             current_len = data.shape[0] if key in frame_level_keys else data.shape[0]
             target_len = max_len.get(key, current_len) # Use max_len calculated earlier
-            # Determine pad value (0 for IDs/indices, 0.0 for floats, False for bool)
+            # Determine pad value based on data type
             if key == 'voiced_mask':
                 pad_value = False # Pad bool with False
             elif key == 'unvoiced_flag':
@@ -361,6 +379,7 @@ def collate_fn_pad(batch):
             else: # mel, f0
                 pad_value = 0.0 # Pad float features with 0.0
 
+            # Pad sequence if its current length is less than the target max length
             if current_len < target_len:
                 padding_size = target_len - current_len
                 if key in frame_level_keys: # Pad time dimension (first)
@@ -380,10 +399,11 @@ def collate_fn_pad(batch):
                     else: # Handle 1D case (T,)
                          padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
                 elif key in phoneme_level_keys: # Pad sequence dimension
-                    padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
+                    padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value) # Pad 1D phoneme-level sequence
                 else: # Data doesn't need padding based on keys
                     padded_data = data
-            elif current_len > target_len: # Truncate if needed
+            # Truncate sequence if its current length exceeds the target max length
+            elif current_len > target_len:
                  if key in frame_level_keys:
                       padded_data = data[:target_len, ...] # Truncate first dim (time)
                  elif key in phoneme_level_keys:
@@ -394,9 +414,10 @@ def collate_fn_pad(batch):
                 padded_data = data
 
             padded_batch[key].append(padded_data)
-            lengths[key].append(current_len) # Store original length
+            lengths[key].append(current_len) # Store original length before padding/truncation
 
     # Stack tensors for each key
+    # --- Stack and Rename ---
     final_batch = {}
     # Stack tensors for the final batch, renaming keys as needed for the model
     final_batch = {}
@@ -415,17 +436,18 @@ def collate_fn_pad(batch):
     for key in keys_in_batch: # Iterate through all keys including 'phone_label'
         try:
             stacked_tensor = torch.stack(padded_batch[key])
-            # Rename key if needed for model input compatibility
+            # Rename key based on rename_map for model compatibility
             final_key = rename_map.get(key, key) # Use renamed key or original if not in map
             final_batch[final_key] = stacked_tensor
         except Exception as e:
-            print(f"Error stacking key '{key}': {e}")
+            logger.error(f"Error stacking key '{key}': {e}", exc_info=True)
             for i, t in enumerate(padded_batch[key]):
-                print(f"  Item {i} shape: {t.shape}")
+                logger.error(f"  Item %d shape: %s", i, t.shape)
             raise e
 
     # Add frame lengths (originally mel lengths) for masking in the model
-    if 'mel' in lengths: # Use original 'mel' key for length lookup
+    # Add the 'length' key containing original frame lengths (usually from mel spec)
+    if 'mel' in lengths:
          final_batch['length'] = torch.tensor(lengths['mel'], dtype=torch.long) # Use 'length' as key like in model
 
     return final_batch
@@ -493,7 +515,7 @@ class DataModule(pl.LightningDataModule):
                 h5_file = h5_manager.get_file(self.h5_path) # File is kept open by manager
                 if 'vocab_size' in h5_file.attrs:
                     self.vocab_size = int(h5_file.attrs['vocab_size'])
-                    print(f"Read vocab_size from HDF5 attribute: {self.vocab_size}")
+                    logger.info(f"Read vocab_size from HDF5 attribute: {self.vocab_size}")
                 else:
                     raise ValueError(f"'vocab_size' attribute not found in HDF5 file: {self.h5_path}. "
                                      "Ensure it was saved during preprocessing.")
@@ -507,7 +529,7 @@ class DataModule(pl.LightningDataModule):
 
             # --- Perform dataset subsetting and splitting only if not already done ---
             if self.train_dataset is None or self.val_dataset is None:
-                print("Performing train/validation split...") # Add log message
+                logger.info("Performing train/validation split...")
                 full_dataset_size = len(self.dataset)
                 dataset_to_split = self.dataset # Start with the full dataset
 
@@ -519,7 +541,7 @@ class DataModule(pl.LightningDataModule):
                     subset_size = int(full_dataset_size * self.sample_percentage)
 
                 if subset_size < full_dataset_size:
-                    print(f"Applying subset: Using {subset_size} samples out of {full_dataset_size}.")
+                    logger.info(f"Applying subset: Using {subset_size} samples out of {full_dataset_size}.")
                     generator_subset = torch.Generator().manual_seed(42) # Use separate generator for subsetting consistency
                     indices = torch.randperm(full_dataset_size, generator=generator_subset)[:subset_size].tolist()
                     dataset_to_split = torch.utils.data.Subset(self.dataset, indices)
@@ -543,9 +565,9 @@ class DataModule(pl.LightningDataModule):
                     [train_size, val_size],
                     generator=generator_split
                 )
-                print(f"Split complete: Train size={train_size}, Validation size={val_size}")
+                logger.info(f"Split complete: Train size={train_size}, Validation size={val_size}")
             else:
-                 print("Train/validation datasets already exist, skipping split.") # Add log message
+                 logger.info("Train/validation datasets already exist, skipping split.")
     
     def train_dataloader(self):
         return DataLoader(

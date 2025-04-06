@@ -16,24 +16,24 @@ import json
 import matplotlib.pyplot as plt
 import math
 import logging
+from utils.utils import setup_logging # Import setup_logging
 
-# Setup basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Get module-level logger
 
 # --- Configuration Loading ---
 def load_config(config_path='config/model.yaml'):
     """Loads configuration from a YAML file."""
-    logging.info(f"Loading configuration from: {config_path}")
+    logger.info(f"Loading configuration from: {config_path}")
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
-        logging.info("Configuration loaded successfully.")
+        logger.info("Configuration loaded successfully.")
         return config
     except FileNotFoundError:
-        logging.error(f"Configuration file not found at {config_path}")
+        logger.error(f"Configuration file not found at {config_path}")
         raise
     except Exception as e:
-        logging.error(f"Error loading configuration: {e}")
+        logger.error(f"Error loading configuration: {e}")
         raise
 
 # --- Label Parsing and Duration Adjustment ---
@@ -52,19 +52,19 @@ def parse_lab_file(lab_path):
                         start_sec = float(start_time_str)
                         end_sec = float(end_time_str)
                         if start_sec < 0 or end_sec < start_sec:
-                             logging.warning(f"Skipping invalid time entry in {lab_path}: {line.strip()}")
+                             logger.warning(f"Skipping invalid time entry in {lab_path}: {line.strip()}")
                              continue
                         lab_entries.append((start_sec, end_sec, phone))
                         unique_phones.add(phone)
                         max_end_time = max(max_end_time, end_sec)
                     except ValueError:
-                         logging.warning(f"Skipping non-numeric time entry in {lab_path}: {line.strip()}")
+                         logger.warning(f"Skipping non-numeric time entry in {lab_path}: {line.strip()}")
                          continue
                 else:
-                     logging.warning(f"Skipping malformed line in {lab_path}: {line.strip()}")
+                     logger.warning(f"Skipping malformed line in {lab_path}: {line.strip()}")
 
     except Exception as e:
-        logging.error(f"Error parsing lab file {lab_path}: {e}")
+        logger.error(f"Error parsing lab file {lab_path}: {e}")
         return [], [], set()
     return lab_entries, unique_phones, max_end_time
 
@@ -77,7 +77,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
     if discrepancy == 0:
         return adjusted_durations
 
-    logging.debug(f"Adjusting durations: Target={target_frames}, Original={total_lab_frames}, Discrepancy={discrepancy}")
+    logger.debug(f"Adjusting durations: Target={target_frames}, Original={total_lab_frames}, Discrepancy={discrepancy}")
 
     eligible_indices = [i for i, p in enumerate(phones) if p not in silence_symbols and durations[i] > 0]
     total_eligible_duration = sum(durations[i] for i in eligible_indices)
@@ -87,7 +87,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
         eligible_indices = [i for i, d in enumerate(durations) if d > 0]
         total_eligible_duration = sum(durations[i] for i in eligible_indices)
         if not eligible_indices:
-             logging.warning("Cannot adjust durations: No positive duration phones found.")
+             logger.warning("Cannot adjust durations: No positive duration phones found.")
              # Return original durations, might lead to length mismatch later
              return adjusted_durations
 
@@ -109,7 +109,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
              # Add/subtract remainder to/from the longest eligible phone
              longest_eligible_idx = max(eligible_indices, key=lambda i: adjusted_durations[i])
              adjusted_durations[longest_eligible_idx] += remainder
-             logging.debug(f"Applied remainder {remainder} to phone index {longest_eligible_idx}")
+             logger.debug(f"Applied remainder {remainder} to phone index {longest_eligible_idx}")
 
 
     else: # Need to remove frames (discrepancy is negative)
@@ -131,7 +131,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
                      temp_removed[i] = reduction
                      current_removed += reduction
         else: # If total duration is 0, cannot remove proportionally
-             logging.warning("Total eligible duration is 0, cannot perform proportional removal.")
+             logger.warning("Total eligible duration is 0, cannot perform proportional removal.")
 
 
         # Apply removals from first pass
@@ -162,13 +162,13 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
                     idx_pool.pop(best_i_in_pool)
             else:
                 # No more phones can be reduced
-                logging.warning(f"Could not remove all required frames. {remainder_to_remove} frames remaining.")
+                logger.warning(f"Could not remove all required frames. {remainder_to_remove} frames remaining.")
                 break # Exit loop
 
     # Final check
     final_sum = sum(adjusted_durations)
     if final_sum != target_frames:
-        logging.warning(f"Duration adjustment resulted in {final_sum} frames, expected {target_frames}. Attempting final clamp.")
+        logger.warning(f"Duration adjustment resulted in {final_sum} frames, expected {target_frames}. Attempting final clamp.")
         # As a fallback, clamp to target_frames (might truncate/extend last phone)
         diff = target_frames - final_sum
         if diff > 0: # Need to add frames
@@ -177,7 +177,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
             if adjusted_durations[-1] > abs(diff):
                  adjusted_durations[-1] += diff # diff is negative here
             else:
-                 logging.error(f"Cannot clamp duration by reducing last phone (duration {adjusted_durations[-1]}, need to remove {abs(diff)}). Final sum will be incorrect.")
+                 logger.error(f"Cannot clamp duration by reducing last phone (duration {adjusted_durations[-1]}, need to remove {abs(diff)}). Final sum will be incorrect.")
                  # Consider distributing the reduction across other phones if this happens often
 
     return adjusted_durations
@@ -249,7 +249,7 @@ def extract_features(audio_path, config):
         return log_mel_spectrogram, log_f0, voiced_mask.squeeze(), midi_pitch
 
     except Exception as e:
-        logging.error(f"Error extracting features for {audio_path}: {e}")
+        logger.error(f"Error extracting features for {audio_path}: {e}")
         # Return None for all expected outputs on error
         return None, None, None, None # Added None for midi_pitch
 
@@ -270,7 +270,7 @@ def pad_or_truncate(data, target_length, pad_value=0):
 # --- Visualization ---
 def visualize_alignment(mel, f0, midi_pitch, phone_ids, durations, id_to_phone, save_path):
     """Generates and saves an alignment plot using UNNORMALIZED data, including estimated MIDI pitch."""
-    logging.info(f"Generating alignment plot: {save_path}")
+    logger.info(f"Generating alignment plot: {save_path}")
     try:
         fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True) # Increased subplots to 4, adjusted figsize
 
@@ -336,10 +336,10 @@ def visualize_alignment(mel, f0, midi_pitch, phone_ids, durations, id_to_phone, 
         plt.tight_layout()
         plt.savefig(save_path)
         plt.close(fig)
-        logging.info(f"Alignment plot saved to {save_path}")
+        logger.info(f"Alignment plot saved to {save_path}")
 
     except Exception as e:
-        logging.error(f"Error generating visualization: {e}")
+        logger.error(f"Error generating visualization: {e}")
 
 
 # --- Main Processing Function ---
@@ -372,16 +372,16 @@ def preprocess_data(config_path='config/model.yaml'):
         if os.path.exists(wav_path):
             file_pairs.append({'id': base_filename, 'lab': lab_path, 'wav': wav_path})
         else:
-            logging.warning(f"Corresponding WAV file not found for {lab_path}, skipping.")
+            logger.warning(f"Corresponding WAV file not found for %s, skipping.", lab_path)
 
     if not file_pairs:
-        logging.error("No valid (lab, wav) file pairs found. Exiting.")
+        logger.error("No valid (lab, wav) file pairs found. Exiting.")
         return
 
-    logging.info(f"Found {len(file_pairs)} file pairs to process.")
+    logger.info(f"Found %d file pairs to process.", len(file_pairs))
 
     # --- Pass 1: Extract all features and calculate normalization stats ---
-    logging.info("Starting Pass 1: Extracting features and calculating normalization stats...")
+    logger.info("Starting Pass 1: Extracting features and calculating normalization stats...")
     all_log_mels = []
     all_log_f0s_voiced = []
 
@@ -395,13 +395,13 @@ def preprocess_data(config_path='config/model.yaml'):
             if np.any(voiced_mask):
                  all_log_f0s_voiced.append(log_f0[voiced_mask])
         else:
-            logging.warning(f"Feature extraction failed for {pair['id']}, excluding from stats.")
+            logger.warning(f"Feature extraction failed for %s, excluding from stats.", pair['id'])
             # Mark pair as failed? Or handle later. For now, just exclude from stats.
             pair['failed_extraction'] = True
 
 
     if not all_log_mels or not all_log_f0s_voiced:
-         logging.error("No valid features extracted in Pass 1. Cannot calculate stats. Exiting.")
+         logger.error("No valid features extracted in Pass 1. Cannot calculate stats. Exiting.")
          return
 
     # Concatenate all features
@@ -418,11 +418,11 @@ def preprocess_data(config_path='config/model.yaml'):
     f0_mean = np.mean(all_log_f0s_voiced_np)
     f0_std = np.std(all_log_f0s_voiced_np)
     if f0_std < 1e-5:
-        logging.warning(f"F0 standard deviation is very low ({f0_std}). Setting to 1e-5.")
+        logger.warning(f"F0 standard deviation is very low (%f). Setting to 1e-5.", f0_std)
         f0_std = 1e-5
 
-    logging.info(f"Calculated Mel Mean shape: {mel_mean.shape}, Mel Std shape: {mel_std.shape}")
-    logging.info(f"Calculated F0 Mean (voiced, log): {f0_mean:.4f}, F0 Std (voiced, log): {f0_std:.4f}")
+    logger.info(f"Calculated Mel Mean shape: %s, Mel Std shape: %s", mel_mean.shape, mel_std.shape)
+    logger.info(f"Calculated F0 Mean (voiced, log): %.4f, F0 Std (voiced, log): %.4f", f0_mean, f0_std)
 
     # Save stats
     norm_stats = {
@@ -434,21 +434,21 @@ def preprocess_data(config_path='config/model.yaml'):
     try:
         with open(stats_file_path, 'w') as f_stats:
             json.dump(norm_stats, f_stats, indent=4)
-        logging.info(f"Normalization stats saved to {stats_file_path}")
+        logger.info(f"Normalization stats saved to %s", stats_file_path)
     except Exception as e:
-        logging.error(f"Error saving normalization stats: {e}")
+        logger.error(f"Error saving normalization stats: %s", e)
         # Continue processing, but warn user stats are not saved
         # Or decide to stop here? Let's stop for safety.
         raise
 
     # --- Pass 2: Process files, normalize, and prepare for saving ---
-    logging.info("Starting Pass 2: Normalizing features and preparing data...")
+    logger.info("Starting Pass 2: Normalizing features and preparing data...")
     all_unique_phones = set(["<PAD>"]) # Add padding symbol initially
     processed_data = {} # Store results temporarily before HDF5 write
     first_file_data_for_vis = None # Store unnormalized data for the first valid file
 
     target_frames = math.ceil(audio_config['max_audio_length'] * audio_config['sample_rate'] / audio_config['hop_length'])
-    logging.info(f"Target frames per file: {target_frames}")
+    logger.info(f"Target frames per file: %d", target_frames)
 
     for pair in tqdm(file_pairs, desc="Pass 2: Processing & Normalizing"):
         base_filename = pair['id']
@@ -459,12 +459,12 @@ def preprocess_data(config_path='config/model.yaml'):
         if pair.get('failed_extraction', False):
             continue
 
-        logging.debug(f"Processing: {base_filename}")
+        logger.debug(f"Processing: %s", base_filename)
 
         # 1. Re-extract Mel and F0 (or retrieve if stored - re-extracting is simpler here)
         log_mel, log_f0, voiced_mask, midi_pitch = extract_features(wav_path, config)
         if log_mel is None or midi_pitch is None: # Check again just in case, include midi_pitch
-            logging.warning(f"Skipping {base_filename} due to feature extraction error in Pass 2 (Mel or MIDI).")
+            logger.warning(f"Skipping %s due to feature extraction error in Pass 2 (Mel or MIDI).", base_filename)
             continue
 
         original_mel_frames = log_mel.shape[0] # Frames before padding/truncation
@@ -489,12 +489,12 @@ def preprocess_data(config_path='config/model.yaml'):
         # 4. Parse Labels (get timestamps and phones)
         lab_entries, unique_phones_in_file, max_end_time = parse_lab_file(lab_path)
         if not lab_entries:
-             logging.warning(f"Skipping {base_filename} due to empty or invalid lab file.")
+             logger.warning(f"Skipping %s due to empty or invalid lab file.", base_filename)
              continue
 
         # Check minimum number of phones
         if len(lab_entries) < min_phones_in_lab:
-             logging.warning(f"Skipping {base_filename}: Found {len(lab_entries)} phones, required minimum {min_phones_in_lab}.")
+             logger.warning(f"Skipping %s: Found %d phones, required minimum %d.", base_filename, len(lab_entries), min_phones_in_lab)
              continue
 
         all_unique_phones.update(unique_phones_in_file)
@@ -741,8 +741,13 @@ def preprocess_data(config_path='config/model.yaml'):
 
 
 if __name__ == "__main__":
+    # Setup logging (can be called again, it's idempotent)
+    # Consider adding command-line args for log level/file later
+    setup_logging(level=logging.INFO)
+    logger.info("Starting preprocessing...")
     # Example usage: Run preprocessing using the default config path
     try:
         preprocess_data()
+        logger.info("Preprocessing completed successfully.")
     except Exception as e:
-         logging.exception("Preprocessing failed with an error.") # Log full traceback
+         logger.exception("Preprocessing failed with an error.") # Log full traceback

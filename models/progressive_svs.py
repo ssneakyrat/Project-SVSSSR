@@ -1,5 +1,6 @@
 # models/progressive_svs.py
 
+import logging # Import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,8 @@ from PIL import Image
 import torchvision
 from models.blocks import LowResModel, MidResUpsampler, HighResUpsampler
 from utils.plotting import plot_spectrograms_to_figure # Import the plotting utility
+
+logger = logging.getLogger(__name__) # Get logger instance
 
 
 class FeatureEncoder(nn.Module):
@@ -175,359 +178,143 @@ class ProgressiveSVS(pl.LightningModule):
 
         return high_res_output
 
-    def training_step(self, batch, batch_idx):
+    def _compute_loss_and_target(self, batch):
+        """
+        Computes the loss for the current stage, handling target downsampling and masking.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: loss, mel_pred, mel_target
+            Returns dummy loss (1e9) and None for mel_pred/mel_target on shape mismatch error.
+        """
         mel_specs = batch['mel_spec']
         f0 = batch['f0']
         phone_label = batch['phone_label']
         phone_duration = batch['phone_duration']
         midi_label = batch['midi_label']
         lengths = batch['length']
-        voiced_mask = batch['voiced_mask'] # Get the voiced mask
-        unvoiced_flag = batch['unvoiced_flag'] # Get the unvoiced flag
+        voiced_mask = batch['voiced_mask']
+        unvoiced_flag = batch['unvoiced_flag']
 
         # Forward pass
         mel_pred = self(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
 
         # Create masks for variable length based on ORIGINAL time dimension
-        original_max_len = mel_specs.shape[1] # Use time dimension (dim 1), e.g., 862
+        original_max_len = mel_specs.shape[1]
         original_mask = torch.arange(original_max_len, device=lengths.device).expand(len(lengths), original_max_len) < lengths.unsqueeze(1)
-        # Target time dimension after downsampling
-        target_time_dim = original_max_len // self.downsample_stride # Use stored stride
+        target_time_dim = original_max_len // self.downsample_stride
 
         # Adjust target resolution based on current stage
-        freq_weights_tensor = None # Initialize frequency weights
+        freq_weights_tensor = None
         if self.current_stage == 1:
-            # Downsample ground truth for low-res stage
             scale_factor = 1/self.config['model']['low_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-
-            # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
-            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
-            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
-
-            # Downsample BOTH frequency and time
-            mel_target = F.interpolate(
-                mel_specs_4d,
-                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/stride)
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Back to (B, F', T/stride)
-
-            # Permute back to (B, T, F')
+            b, t, c = mel_specs.shape
+            mel_specs_permuted = mel_specs.permute(0, 2, 1)
+            mel_specs_4d = mel_specs_permuted.unsqueeze(1)
+            mel_target = F.interpolate(mel_specs_4d, size=(freq_dim, target_time_dim), mode='bilinear', align_corners=False).squeeze(1)
             mel_target = mel_target.permute(0, 2, 1)
-
-            # Downsample original_mask to match target_time_dim (T/stride)
-            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            downsampled_mask = F.interpolate(
-                mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time/stride)
-                mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-            # Expand mask to match mel_target shape (B, T/stride, F')
-            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/stride, F')
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1)
+            downsampled_mask = F.interpolate(mask_float, size=(1, target_time_dim), mode='nearest').squeeze(1).squeeze(1)
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim)
         elif self.current_stage == 2:
-            # Downsample ground truth for mid-res stage
             scale_factor = 1/self.config['model']['mid_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-
-            # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
-            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
-            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
-
-            # Downsample BOTH frequency and time (target_time_dim = t // stride)
-            mel_target = F.interpolate(
-                mel_specs_4d,
-                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/stride)
-                mode='nearest' # Changed from bilinear to preserve high-freq target details
-                # align_corners=False # Removed as it's incompatible with mode='nearest'
-            ).squeeze(1)  # Back to (B, F', T/stride)
-
-            # Permute back to (B, T, F')
+            b, t, c = mel_specs.shape
+            mel_specs_permuted = mel_specs.permute(0, 2, 1)
+            mel_specs_4d = mel_specs_permuted.unsqueeze(1)
+            mel_target = F.interpolate(mel_specs_4d, size=(freq_dim, target_time_dim), mode='nearest').squeeze(1)
             mel_target = mel_target.permute(0, 2, 1)
-
-            # Downsample original_mask to match target_time_dim (T/stride)
-            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            downsampled_mask = F.interpolate(
-                mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time/stride)
-                mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-            # Expand mask to match mel_target shape (B, T/stride, F')
-            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/stride, F')
-            # --- Define Frequency Weights for Stage 2 ---
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1)
+            downsampled_mask = F.interpolate(mask_float, size=(1, target_time_dim), mode='nearest').squeeze(1).squeeze(1)
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim)
             freq_weights = torch.linspace(1.0, 2.0, freq_dim, device=self.device)
-            # Reshape for broadcasting: [F] -> [1, 1, F]
             freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
-            # --- End Frequency Weights ---
         else: # Stage 3
-            # Stage 3: Full frequency resolution, but DOWNsampled time
-            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
-            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
-            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
-
-            mel_target = F.interpolate(
-                mel_specs_4d,
-                size=(c, target_time_dim), # Target shape (Freq_full, Time/stride)
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1) # Back to (B, F_full, T/stride)
-            mel_target = mel_target.permute(0, 2, 1) # Back to (B, T/stride, F_full)
-
-            # Downsample original_mask to match target_time_dim (T/stride)
-            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            downsampled_mask = F.interpolate(
-                mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time/stride)
-                mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-            # Expand mask to match mel_target shape (B, T/stride, F_full)
-            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c) # Expand to (B, T/stride, F_full)
-            # --- Define Frequency Weights for Stage 3 ---
-            # Note: c is the full frequency dimension here
+            b, t, c = mel_specs.shape
+            mel_specs_permuted = mel_specs.permute(0, 2, 1)
+            mel_specs_4d = mel_specs_permuted.unsqueeze(1)
+            mel_target = F.interpolate(mel_specs_4d, size=(c, target_time_dim), mode='bilinear', align_corners=False).squeeze(1)
+            mel_target = mel_target.permute(0, 2, 1)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1)
+            downsampled_mask = F.interpolate(mask_float, size=(1, target_time_dim), mode='nearest').squeeze(1).squeeze(1)
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c)
             freq_weights = torch.linspace(1.0, 2.0, c, device=self.device)
-            # Reshape for broadcasting: [F] -> [1, 1, F]
             freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
-            # --- End Frequency Weights ---
 
         # Handle dimensionality issues if mel_pred shape is unexpected
         if mel_pred.dim() != mel_target.dim():
-             # Attempt to fix common shape mismatches, log a warning
-             print(f"Warning: Shape mismatch detected in training_step. Pred: {mel_pred.shape}, Target: {mel_target.shape}. Attempting correction.")
+             logger.warning(f"Shape mismatch detected. Pred: {mel_pred.shape}, Target: {mel_target.shape}. Attempting correction.")
              if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
-                 mel_pred = mel_pred.squeeze(1) # [B, 1, F, T] -> [B, F, T]
-                 mel_pred = mel_pred.permute(0, 2, 1) # [B, F, T] -> [B, T, F] to match target
+                 mel_pred = mel_pred.squeeze(1).permute(0, 2, 1)
              elif mel_pred.dim() == 2 and mel_target.dim() == 3:
-                 mel_pred = mel_pred.unsqueeze(0) # Add batch dim if missing
-             # Add more specific corrections if needed based on observed errors
+                 mel_pred = mel_pred.unsqueeze(0)
 
         # Ensure shapes match before loss calculation
         if mel_pred.shape != mel_target.shape:
-            print(f"ERROR: Unresolvable shape mismatch in training_step. Pred: {mel_pred.shape}, Target: {mel_target.shape}. Skipping loss calculation.")
-            # Return a dummy loss or raise an error
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
-
+            logger.error(f"Unresolvable shape mismatch. Pred: {mel_pred.shape}, Target: {mel_target.shape}. Skipping loss calculation.")
+            return torch.tensor(1e9, device=self.device, requires_grad=True), None, None # Return dummy loss and None
 
         # Compute element-wise loss
         loss_elementwise = self.loss_fn(mel_pred, mel_target)
 
-        # --- Apply Weighted Loss ---
-        unvoiced_weight = 2.0 # Weight for unvoiced frames
-        # Ensure voiced_mask has shape (B, T) before unsqueezing
+        # Apply Weighted Loss
+        unvoiced_weight = 2.0
         if voiced_mask.dim() == 3 and voiced_mask.shape[-1] == 1:
-             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T_original)
-
-        # Downsample voiced_mask to match target time dimension (T/stride)
-        voiced_mask_float = voiced_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T_original)
-        downsampled_voiced_mask = F.interpolate(
-            voiced_mask_float,
-            size=(1, target_time_dim), # Target shape (1, Time/stride)
-            mode='nearest' # Use nearest to keep boolean-like nature
-        ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-        downsampled_voiced_mask = downsampled_voiced_mask > 0.5 # Convert back to boolean-like (0. or 1.)
-
-        # Create weights: shape (B, T/stride, 1), broadcastable to (B, T/stride, F)
+             voiced_mask = voiced_mask.squeeze(-1)
+        voiced_mask_float = voiced_mask.float().unsqueeze(1).unsqueeze(1)
+        downsampled_voiced_mask = F.interpolate(voiced_mask_float, size=(1, target_time_dim), mode='nearest').squeeze(1).squeeze(1)
+        downsampled_voiced_mask = downsampled_voiced_mask > 0.5
         loss_weights = torch.where(downsampled_voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
-        loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
-        # Apply length mask and loss weights
-        # mask has shape (B, T/stride, F)
-        # Apply frequency weights if defined (for stages 2 and 3)
+        loss_weights = loss_weights.to(loss_elementwise.device)
+
+        # Apply length mask, loss weights, and frequency weights
         if freq_weights_tensor is not None:
             weighted_loss = loss_elementwise * mask.float() * loss_weights * freq_weights_tensor
             total_weight_sum = (mask.float() * loss_weights * freq_weights_tensor).sum()
-        else: # Stage 1 (no frequency weighting)
+        else: # Stage 1
             weighted_loss = loss_elementwise * mask.float() * loss_weights
             total_weight_sum = (mask.float() * loss_weights).sum()
 
         loss = weighted_loss.sum() / total_weight_sum.clamp(min=1e-8)
-        # --- End Weighted Loss ---
 
-        self.log('train_loss', loss, prog_bar=True)
+        return loss, mel_pred, mel_target
+
+    def training_step(self, batch, batch_idx):
+        loss, _, _ = self._compute_loss_and_target(batch)
+
+        # Handle potential error case where loss is high (shape mismatch)
+        if loss.item() > 1e8:
+             logger.error("Skipping training step due to error in loss calculation (shape mismatch).")
+             # Return the high dummy loss, Pytorch Lightning might handle it gracefully or log it.
+             return loss
+
+        self.log('train_loss', loss, prog_bar=True, sync_dist=True) # Added sync_dist
         return loss
 
     def validation_step(self, batch, batch_idx):
-        mel_specs = batch['mel_spec']
-        f0 = batch['f0']
-        phone_label = batch['phone_label']
-        phone_duration = batch['phone_duration']
-        midi_label = batch['midi_label']
-        lengths = batch['length']
-        voiced_mask = batch['voiced_mask'] # Get the voiced mask
-        unvoiced_flag = batch['unvoiced_flag'] # Get the unvoiced flag
+        loss, mel_pred, mel_target = self._compute_loss_and_target(batch)
 
-        # Forward pass
-        mel_pred = self(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
+        # Handle potential error case (shape mismatch)
+        if loss.item() > 1e8:
+             logger.error("Skipping validation step due to error in loss calculation (shape mismatch).")
+             self.log('val_loss', loss, prog_bar=True, sync_dist=True) # Log the high dummy loss
+             return loss # Or return None? Let's return loss for consistency.
 
-        # Create masks for variable length based on ORIGINAL time dimension
-        original_max_len = mel_specs.shape[1] # Use time dimension (dim 1), e.g., 862
-        original_mask = torch.arange(original_max_len, device=lengths.device).expand(len(lengths), original_max_len) < lengths.unsqueeze(1)
-        # Target time dimension after downsampling
-        target_time_dim = original_max_len // self.downsample_stride # Use stored stride
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True) # Added sync_dist
 
-        # Adjust target resolution based on current stage
-        freq_weights_tensor = None # Initialize frequency weights
-        if self.current_stage == 1:
-            # Downsample ground truth for low-res stage
-            scale_factor = 1/self.config['model']['low_res_scale']
-            freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
+        # Log comparison image (only on rank 0 and occasionally)
+        # Ensure mel_pred and mel_target are not None (error case handled in _compute_loss_and_target)
+        log_interval = self.config['train'].get('log_spectrogram_every_n_val_epochs', 5)
+        if batch_idx == 0 and self.global_rank == 0 and self.current_epoch % log_interval == 0 and mel_pred is not None and mel_target is not None:
+             # Get the actual length for unpadding visualization
+             lengths = batch['length']
+             length = lengths[0].item() # Original length
+             downsampled_length = length // self.downsample_stride # Length in downsampled time dim
 
-            # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
-            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
-            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
-
-            # Downsample BOTH frequency and time
-            mel_target = F.interpolate(
-                mel_specs_4d,
-                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/stride)
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1)  # Back to (B, F', T/stride)
-
-            # Permute back to (B, T, F')
-            mel_target = mel_target.permute(0, 2, 1)
-            # Downsample original_mask to match target_time_dim (T/stride)
-            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            downsampled_mask = F.interpolate(
-                mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time/stride)
-                mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-            # Expand mask to match mel_target shape (B, T/stride, F')
-            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/stride, F')
-
-        elif self.current_stage == 2:
-            # Downsample ground truth for mid-res stage
-            scale_factor = 1/self.config['model']['mid_res_scale']
-            freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
-
-            # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
-            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
-            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
-
-            # Downsample BOTH frequency and time (target_time_dim = t // stride)
-            mel_target = F.interpolate(
-                mel_specs_4d,
-                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/stride)
-                mode='nearest' # Changed from bilinear to preserve high-freq target details
-                # align_corners=False # Removed as it's incompatible with mode='nearest'
-            ).squeeze(1)  # Back to (B, F', T/stride)
-
-            # Permute back to (B, T, F')
-            mel_target = mel_target.permute(0, 2, 1)
-            # Downsample original_mask to match target_time_dim (T/stride)
-            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            downsampled_mask = F.interpolate(
-                mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time/stride)
-                mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-            # Expand mask to match mel_target shape (B, T/stride, F')
-            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/stride, F')
-            # --- Define Frequency Weights for Stage 2 ---
-            freq_weights = torch.linspace(1.0, 2.0, freq_dim, device=self.device)
-            # Reshape for broadcasting: [F] -> [1, 1, F]
-            freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
-            # --- End Frequency Weights ---
-
-        else: # Stage 3
-            # Stage 3: Full frequency resolution, but DOWNsampled time
-            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
-            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
-            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
-
-            mel_target = F.interpolate(
-                mel_specs_4d,
-                size=(c, target_time_dim), # Target shape (Freq_full, Time/stride)
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(1) # Back to (B, F_full, T/stride)
-            mel_target = mel_target.permute(0, 2, 1) # Back to (B, T/stride, F_full)
-
-            # Downsample original_mask to match target_time_dim (T/stride)
-            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            downsampled_mask = F.interpolate(
-                mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time/stride)
-                mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-            # Expand mask to match mel_target shape (B, T/stride, F_full)
-            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c) # Expand to (B, T/stride, F_full)
-            # --- Define Frequency Weights for Stage 3 ---
-            # Note: c is the full frequency dimension here
-            freq_weights = torch.linspace(1.0, 2.0, c, device=self.device)
-            # Reshape for broadcasting: [F] -> [1, 1, F]
-            freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
-            # --- End Frequency Weights ---
-
-        # Handle dimensionality issues if mel_pred shape is unexpected
-        if mel_pred.dim() != mel_target.dim():
-             # Attempt to fix common shape mismatches, log a warning
-             print(f"Warning: Shape mismatch detected in validation_step. Pred: {mel_pred.shape}, Target: {mel_target.shape}. Attempting correction.")
-             if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
-                 mel_pred = mel_pred.squeeze(1) # [B, 1, F, T] -> [B, F, T]
-                 mel_pred = mel_pred.permute(0, 2, 1) # [B, F, T] -> [B, T, F] to match target
-             elif mel_pred.dim() == 2 and mel_target.dim() == 3:
-                 mel_pred = mel_pred.unsqueeze(0) # Add batch dim if missing
-             # Add more specific corrections if needed based on observed errors
-
-        # Ensure shapes match before loss calculation
-        if mel_pred.shape != mel_target.shape:
-            print(f"ERROR: Unresolvable shape mismatch in validation_step. Pred: {mel_pred.shape}, Target: {mel_target.shape}. Skipping loss calculation.")
-            # Log a dummy loss or handle appropriately
-            self.log('val_loss', 1e9, prog_bar=True) # Log a high loss value
-            return torch.tensor(1e9, device=self.device)
-
-
-        # Compute element-wise loss
-        loss_elementwise = self.loss_fn(mel_pred, mel_target)
-
-        # --- Apply Weighted Loss ---
-        unvoiced_weight = 2.0 # Weight for unvoiced frames (same as training)
-        # Ensure voiced_mask has shape (B, T) before unsqueezing
-        if voiced_mask.dim() == 3 and voiced_mask.shape[-1] == 1:
-             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T_original)
-
-        # Downsample voiced_mask to match target time dimension (T/stride)
-        voiced_mask_float = voiced_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T_original)
-        downsampled_voiced_mask = F.interpolate(
-            voiced_mask_float,
-            size=(1, target_time_dim), # Target shape (1, Time/stride)
-            mode='nearest' # Use nearest to keep boolean-like nature
-        ).squeeze(1).squeeze(1) # Back to (B, T/stride)
-        downsampled_voiced_mask = downsampled_voiced_mask > 0.5 # Convert back to boolean-like (0. or 1.)
-
-        # Create weights: shape (B, T/stride, 1), broadcastable to (B, T/stride, F)
-        loss_weights = torch.where(downsampled_voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
-        loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
-
-        # Apply length mask and loss weights
-        # mask has shape (B, T/stride, F)
-        # Apply frequency weights if defined (for stages 2 and 3)
-        if freq_weights_tensor is not None:
-            weighted_loss = loss_elementwise * mask.float() * loss_weights * freq_weights_tensor
-            total_weight_sum = (mask.float() * loss_weights * freq_weights_tensor).sum()
-        else: # Stage 1 (no frequency weighting)
-            weighted_loss = loss_elementwise * mask.float() * loss_weights
-            total_weight_sum = (mask.float() * loss_weights).sum()
-
-        loss = weighted_loss.sum() / total_weight_sum.clamp(min=1e-8)
-        # --- End Weighted Loss ---
-        self.log('val_loss', loss, prog_bar=True)
-
-        # Visualize first sample in batch at appropriate intervals
-        log_interval = self.config['train'].get('log_spectrogram_every_n_val_epochs', 5) # Use config or default
-        if batch_idx == 0 and self.current_epoch % log_interval == 0:
-            # Get the actual length
-            length = lengths[0].item() # Original length, e.g., 862
-            # Adjust length for downsampled time dimension
-            downsampled_length = length // self.downsample_stride # e.g., 431
-            self._log_mel_comparison(
-                mel_pred[0, :downsampled_length, :].detach().cpu(),
-                mel_target[0, :downsampled_length, :].detach().cpu()
-            )
+             # Select first item, unpad using downsampled_length, transpose for plotting
+             pred_to_plot = mel_pred[0, :downsampled_length, :].detach().cpu().T # Shape (F, T_unpadded)
+             target_to_plot = mel_target[0, :downsampled_length, :].detach().cpu().T # Shape (F, T_unpadded)
+             self._log_mel_comparison(pred_to_plot, target_to_plot)
 
         return loss
 

@@ -1,6 +1,9 @@
+import logging # Import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__) # Get logger instance
 
 class ConvBlock1D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
@@ -145,13 +148,13 @@ class LowResModel(nn.Module):
         # --- Multi-band Output Projection ---
         if config is None:
             # Maintain backward compatibility if config is not passed (treat as single band)
-            print("Warning: Config not passed to LowResModel. Assuming single band output.")
+            logger.warning("Config not passed to LowResModel. Assuming single band output.")
             self.num_bands = 1
         else:
             self.num_bands = config['model'].get('num_bands_stage1', 1) # Default to 1 band
 
         if self.num_bands > 1:
-            print(f"LowResModel: Using {self.num_bands} bands for output projection.")
+            logger.info(f"LowResModel: Using {self.num_bands} bands for output projection.")
             if output_dim % self.num_bands != 0:
                 raise ValueError(f"LowResModel output_dim ({output_dim}) must be divisible by num_bands_stage1 ({self.num_bands})")
             self.bins_per_band = output_dim // self.num_bands
@@ -300,7 +303,7 @@ class MidResUpsampler(nn.Module):
         # --- Multi-band Configuration ---
         self.num_bands = config['model'].get('num_bands_stage2', 1) # Default to 1 band if not specified
         self.band_processing = config['model'].get('band_processing_stage2', 'shared') # Default to shared
-        print(f"MidResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
+        logger.info(f"MidResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
 
         # --- Upsampling (Common to all bands) ---
         # Replace Upsample + ConvBlock with ConvTranspose2d for learnable frequency upsampling
@@ -441,7 +444,7 @@ class HighResUpsampler(nn.Module):
         # --- Multi-band Configuration ---
         self.num_bands = config['model'].get('num_bands_stage3', 1) # Default to 1 band
         self.band_processing = config['model'].get('band_processing_stage3', 'shared') # Default to shared
-        print(f"HighResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
+        logger.info(f"HighResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
 
         # --- Upsampling (Common to all bands) ---
         # Keep original ConvTranspose2d for frequency upsampling in Stage 3
