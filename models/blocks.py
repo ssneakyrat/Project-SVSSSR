@@ -353,9 +353,12 @@ class MidResUpsampler(nn.Module):
         all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
         # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
         if self.downsample_stride > 1:
-            all_embeddings_downsampled = F.avg_pool1d(all_embeddings_orig_permuted,
-                                                      kernel_size=self.downsample_stride,
-                                                      stride=self.downsample_stride)
+            # Determine target time dimension from the input spectrogram x [B, T_downsampled, F_in]
+            target_time_dim = x.shape[1]
+            all_embeddings_downsampled = F.interpolate(all_embeddings_orig_permuted,
+                                                       size=target_time_dim,
+                                                       mode='linear',
+                                                       align_corners=False) # align_corners=False recommended for linear
         else:
             all_embeddings_downsampled = all_embeddings_orig_permuted
         # cond_signal shape: [B, TotalDim, T_downsampled]
@@ -490,9 +493,12 @@ class HighResUpsampler(nn.Module):
         all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
         # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
         if self.downsample_stride > 1:
-            all_embeddings_downsampled = F.avg_pool1d(all_embeddings_orig_permuted,
-                                                      kernel_size=self.downsample_stride,
-                                                      stride=self.downsample_stride)
+            # Determine target time dimension from the input spectrogram x [B, T_downsampled, F_mid]
+            target_time_dim = x.shape[1]
+            all_embeddings_downsampled = F.interpolate(all_embeddings_orig_permuted,
+                                                       size=target_time_dim,
+                                                       mode='linear',
+                                                       align_corners=False) # align_corners=False recommended for linear
         else:
             all_embeddings_downsampled = all_embeddings_orig_permuted
         # cond_signal shape: [B, TotalDim, T_downsampled]
