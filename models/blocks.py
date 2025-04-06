@@ -67,23 +67,82 @@ class ResidualBlock(nn.Module):
         x = x + residual
         return F.relu(x)
 
+# Residual Block with Modulation for 1D data
+class ResidualBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels, unvoiced_embed_dim, kernel_size=3, stride=1):
+        super().__init__()
+        # Ensure padding keeps sequence length the same for stride=1
+        padding = kernel_size // 2
+
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, 1, padding) # Stride is 1 here
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        # Modulation layers: Project unvoiced embedding to gamma and beta for bn2
+        # Use Conv1d to potentially capture temporal variations in modulation
+        self.mod_conv = nn.Conv1d(unvoiced_embed_dim, out_channels * 2, kernel_size=1) # Output gamma and beta
+
+        # Shortcut connection if channels or stride change
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x, unvoiced_embedding):
+        residual = self.shortcut(x)
+
+        # First conv block
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        # Second conv block (before modulation)
+        out = self.conv2(out)
+        out = self.bn2(out) # Apply BN before modulation
+
+        # Calculate modulation parameters (gamma, beta) using Conv1d approach
+        # unvoiced_embedding shape: (B, U_dim, T)
+        mod_params = self.mod_conv(unvoiced_embedding) # Shape: (B, 2 * out_channels, T)
+        gamma, beta = torch.chunk(mod_params, 2, dim=1) # Each: (B, out_channels, T)
+
+        # Apply modulation (FiLM-like)
+        out = gamma * out + beta
+
+        # Add residual and apply final ReLU
+        out += residual
+        out = self.relu(out)
+        return out
+
+# Modified LowResModel using ResidualBlock1D with modulation
 class LowResModel(nn.Module):
-    def __init__(self, input_dim, channels_list, output_dim):
+    def __init__(self, input_dim, channels_list, output_dim, unvoiced_embed_dim): # Added unvoiced_embed_dim
         super().__init__()
         
         self.reshape = nn.Conv1d(input_dim, channels_list[0], kernel_size=1)
         
         self.blocks = nn.ModuleList()
-        for i in range(len(channels_list) - 1):
-            self.blocks.append(ConvBlock1D(channels_list[i], channels_list[i+1]))
+        current_channels = channels_list[0]
+        # Iterate through all target channels to define blocks
+        for i in range(len(channels_list)):
+            out_channels = channels_list[i] # Target channel for this block
+            # Use ResidualBlock1D instead of ConvBlock1D
+            # Note: Stride is assumed to be 1 here. If stride > 1 is needed, it should be handled.
+            self.blocks.append(ResidualBlock1D(current_channels, out_channels, unvoiced_embed_dim))
+            current_channels = out_channels # Update current channels for the next block
         
+        # Output projection uses the last channel size from the list
         self.output_proj = nn.Conv1d(channels_list[-1], output_dim, kernel_size=1)
         
-    def forward(self, x):
+    def forward(self, x, unvoiced_embedding): # Added unvoiced_embedding
         x = self.reshape(x)
         
+        # Pass unvoiced_embedding to each block
         for block in self.blocks:
-            x = block(x)
+            x = block(x, unvoiced_embedding)
         
         x = self.output_proj(x)
         # Permute output from (B, F', T) to (B, T, F')
