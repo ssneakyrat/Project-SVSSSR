@@ -99,7 +99,8 @@ class ProgressiveSVS(pl.LightningModule):
             input_dim=input_dim_main,
             channels_list=config['model']['low_res_channels'],
             output_dim=low_res_freq_bins,
-            unvoiced_embed_dim=self.unvoiced_embed_dim # Pass only unvoiced dim here
+            unvoiced_embed_dim=self.unvoiced_embed_dim, # Pass only unvoiced dim here
+            config=config # Pass the config dictionary
         )
 
         # Stage 2: Mid-Resolution Upsampler (40×432)
@@ -112,20 +113,22 @@ class ProgressiveSVS(pl.LightningModule):
             phone_embed_dim=self.phone_embed_dim,
             midi_embed_dim=self.midi_embed_dim,
             unvoiced_embed_dim=self.unvoiced_embed_dim,
-            downsample_stride=self.downsample_stride
+            downsample_stride=self.downsample_stride,
+            config=config # Pass the config dictionary
         )
 
         # Stage 3: High-Resolution Upsampler (80×864)
         # Stage 3: High-Resolution Upsampler - Pass all embedding dims and stride
         self.high_res_upsampler = HighResUpsampler(
             input_dim=mid_res_freq_bins, # Freq dim from previous stage
-            channels_list=config['model']['high_res_channels'],
+            channels_list=config['model']['high_res_channels'], # Use updated channels
             output_dim=full_mel_bins,
             f0_embed_dim=self.f0_embed_dim,
             phone_embed_dim=self.phone_embed_dim,
             midi_embed_dim=self.midi_embed_dim,
             unvoiced_embed_dim=self.unvoiced_embed_dim,
-            downsample_stride=self.downsample_stride # Same stride as MidRes
+            downsample_stride=self.downsample_stride, # Same stride as MidRes
+            config=config # Pass the config dictionary
         )
 
         # Loss function

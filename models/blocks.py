@@ -126,7 +126,8 @@ class ResidualBlock1D(nn.Module):
 
 # Modified LowResModel using ResidualBlock1D with modulation
 class LowResModel(nn.Module):
-    def __init__(self, input_dim, channels_list, output_dim, unvoiced_embed_dim): # Added unvoiced_embed_dim
+    # Updated __init__ for multi-band output projection
+    def __init__(self, input_dim, channels_list, output_dim, unvoiced_embed_dim, config=None): # Added config
         super().__init__()
         
         self.reshape = nn.Conv1d(input_dim, channels_list[0], kernel_size=1)
@@ -141,8 +142,26 @@ class LowResModel(nn.Module):
             self.blocks.append(ResidualBlock1D(current_channels, out_channels, unvoiced_embed_dim, stride=stride))
             current_channels = out_channels # Update current channels for the next block
         
-        # Output projection uses the last channel size from the list
-        self.output_proj = nn.Conv1d(channels_list[-1], output_dim, kernel_size=1)
+        # --- Multi-band Output Projection ---
+        if config is None:
+            # Maintain backward compatibility if config is not passed (treat as single band)
+            print("Warning: Config not passed to LowResModel. Assuming single band output.")
+            self.num_bands = 1
+        else:
+            self.num_bands = config['model'].get('num_bands_stage1', 1) # Default to 1 band
+
+        if self.num_bands > 1:
+            print(f"LowResModel: Using {self.num_bands} bands for output projection.")
+            if output_dim % self.num_bands != 0:
+                raise ValueError(f"LowResModel output_dim ({output_dim}) must be divisible by num_bands_stage1 ({self.num_bands})")
+            self.bins_per_band = output_dim // self.num_bands
+            self.band_output_projs = nn.ModuleList()
+            for _ in range(self.num_bands):
+                self.band_output_projs.append(
+                    nn.Conv1d(channels_list[-1], self.bins_per_band, kernel_size=1)
+                )
+        else: # Single band (original behavior)
+            self.output_proj = nn.Conv1d(channels_list[-1], output_dim, kernel_size=1)
         
     def forward(self, x, unvoiced_embedding): # Added unvoiced_embedding
         x = self.reshape(x)
@@ -159,9 +178,17 @@ class LowResModel(nn.Module):
         for block in self.blocks:
             x = block(x, cond_embedding)
         
-        x = self.output_proj(x)
-        # Permute output from (B, F', T_downsampled) to (B, T_downsampled, F')
-        # Ensure LowResModel only returns the spectrogram
+        # Apply output projection(s)
+        if self.num_bands > 1:
+            band_outputs = []
+            for proj_layer in self.band_output_projs:
+                band_outputs.append(proj_layer(x))
+            # Concatenate along frequency dimension (dim=1)
+            x = torch.cat(band_outputs, dim=1) # Shape: [B, F_low, T_downsampled]
+        else:
+            x = self.output_proj(x) # Shape: [B, F_low, T_downsampled]
+
+        # Permute output from (B, F_low, T_downsampled) to (B, T_downsampled, F_low)
         return x.permute(0, 2, 1)
 # New ModulatedConvBlock2D class definition
 class ModulatedConvBlock2D(nn.Module):
@@ -258,70 +285,138 @@ class ModulatedResidualBlock2D(nn.Module):
 # Modify MidResUpsampler
 class MidResUpsampler(nn.Module):
     # Updated __init__ to accept embedding dimensions and stride
+    # Updated __init__ for multi-band processing
     def __init__(self, input_dim, channels_list, output_dim,
                  f0_embed_dim, phone_embed_dim, midi_embed_dim, unvoiced_embed_dim,
-                 downsample_stride=2):
+                 downsample_stride=2, config=None): # Added config parameter
         super().__init__()
+        if config is None:
+             raise ValueError("Config dictionary must be provided to MidResUpsampler")
 
         # Store stride and calculate total embedding dimension
         self.downsample_stride = downsample_stride
         self.total_embed_dim = f0_embed_dim + phone_embed_dim + midi_embed_dim + unvoiced_embed_dim
 
-        # Learnable Upsampling for frequency dimension (dim 2), preserve time (dim 3)
-        self.upsample_conv = nn.ConvTranspose2d(in_channels=1, out_channels=1, kernel_size=(4, 1), stride=(2, 1), padding=(1, 0))
+        # --- Multi-band Configuration ---
+        self.num_bands = config['model'].get('num_bands_stage2', 1) # Default to 1 band if not specified
+        self.band_processing = config['model'].get('band_processing_stage2', 'shared') # Default to shared
+        print(f"MidResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
 
-        # Use ModulatedConvBlock2D for initial conv
-        # Input is upsampled spec (1 channel), output is channels_list[0]
-        self.initial_conv = ModulatedConvBlock2D(1, channels_list[0], self.total_embed_dim)
+        # --- Upsampling (Common to all bands) ---
+        self.upsample = nn.Upsample(scale_factor=(2, 1), mode='nearest') # Upsample Frequency only
+        self.refine_conv = ConvBlock2D(in_channels=1, out_channels=1, kernel_size=3, padding=1) # Refine after upsampling
 
-        # Use ModulatedConvBlock2D for subsequent blocks
-        self.blocks = nn.ModuleList()
-        for i in range(len(channels_list) - 1):
-            self.blocks.append(ModulatedConvBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
+        # --- Band Processing Blocks ---
+        if self.num_bands > 1 and self.band_processing == 'separate':
+            self.band_processors = nn.ModuleList()
+            for _ in range(self.num_bands):
+                band_block_list = nn.ModuleList()
+                # Initial block for this band (input channel = 1)
+                band_block_list.append(ModulatedResidualBlock2D(1, channels_list[0], self.total_embed_dim))
+                # Subsequent blocks for this band
+                for i in range(len(channels_list) - 1):
+                    band_block_list.append(ModulatedResidualBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
+                self.band_processors.append(band_block_list)
+        else: # Shared processing (or single band)
+            self.shared_processor = nn.ModuleList()
+            # Initial block (input channel = 1)
+            self.shared_processor.append(ModulatedResidualBlock2D(1, channels_list[0], self.total_embed_dim))
+            # Subsequent blocks
+            for i in range(len(channels_list) - 1):
+                self.shared_processor.append(ModulatedResidualBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
 
-        # Final projection back to 1 channel (standard Conv2D)
+        # --- Final Projection (Common to all bands after concatenation) ---
+        # --- Smoothing Layer (Optional, for separate bands) ---
+        self.smoothing_conv = ConvBlock2D(channels_list[-1], channels_list[-1], kernel_size=(3, 1), padding=(1, 0))
+
+        # --- Final Projection (Common to all bands after concatenation) ---
+        # Input channels = last channel size in channels_list
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
         
-    # Updated forward for modulation
+    # Updated forward for multi-band processing
     def forward(self, x, f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig):
         # x shape: [B, T_downsampled, F_in] (Output from LowResModel)
         # Embeddings shape: [B, T_orig, Dim]
 
-        # --- Process Spectrogram ---
+        # --- Process Spectrogram (Initial Upsampling) ---
         # Permute x to [B, F_in, T_downsampled]
         x = x.permute(0, 2, 1)
         # Unsqueeze x to [B, 1, F_in, T_downsampled] for 2D operations
         x = x.unsqueeze(1)
-        # Learnable Upsampling (Frequency): [B, 1, F_in, T_downsampled] -> [B, 1, F_mid, T_downsampled]
-        x_upsampled = self.upsample_conv(x)
+        # Upsample + Refine (Frequency): [B, 1, F_in, T_downsampled] -> [B, 1, F_mid, T_downsampled]
+        x_upsampled_raw = self.upsample(x)
+        x_upsampled = self.refine_conv(x_upsampled_raw) # Shape: [B, 1, F_mid, T]
 
-        # --- Process Embeddings ---
+        # --- Process Embeddings (Common Conditioning) ---
         # Concatenate original embeddings along feature dim: [B, T_orig, TotalDim]
         all_embeddings_orig = torch.cat((f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig), dim=2)
         # Permute for 1D pooling/conv: [B, TotalDim, T_orig]
         all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
         # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
         if self.downsample_stride > 1:
-            # Use avg_pool1d for downsampling conditioning signal
             all_embeddings_downsampled = F.avg_pool1d(all_embeddings_orig_permuted,
                                                       kernel_size=self.downsample_stride,
                                                       stride=self.downsample_stride)
         else:
             all_embeddings_downsampled = all_embeddings_orig_permuted
-        # all_embeddings_downsampled shape: [B, TotalDim, T_downsampled]
+        # cond_signal shape: [B, TotalDim, T_downsampled]
+        cond_signal = all_embeddings_downsampled
 
-        # --- Modulated Convolutions ---
-        # Initial modulated convolution
-        # Input: x_upsampled [B, 1, F_mid, T], Cond: all_embeddings_downsampled [B, TotalDim, T]
-        x = self.initial_conv(x_upsampled, all_embeddings_downsampled)
+        # --- Multi-Band Processing ---
+        if self.num_bands > 1:
+            # Squeeze channel dim before splitting: [B, F_mid, T]
+            x_squeezed = x_upsampled.squeeze(1)
+            # Split into bands along frequency dim (dim=1)
+            # Note: torch.chunk might create uneven chunks if F_mid is not divisible by num_bands
+            band_tensors = torch.chunk(x_squeezed, self.num_bands, dim=1)
 
-        # Subsequent modulated convolution blocks
-        for block in self.blocks:
-            x = block(x, all_embeddings_downsampled)
-            
-        # Output projection: [B, Clast, F, T] -> [B, 1, F_mid, T]
-        x = self.output_proj(x)
-        
+            processed_bands = []
+            for i, band_tensor in enumerate(band_tensors):
+                # Unsqueeze channel dim for processing: [B, 1, F_band, T]
+                band_input = band_tensor.unsqueeze(1)
+
+                if self.band_processing == 'separate':
+                    # Ensure band_processors exists (created in __init__)
+                    if not hasattr(self, 'band_processors'):
+                         raise AttributeError("MidResUpsampler configured for separate bands, but band_processors not initialized.")
+                    processor = self.band_processors[i]
+                else: # Shared processor
+                    # Ensure shared_processor exists
+                    if not hasattr(self, 'shared_processor'):
+                         raise AttributeError("MidResUpsampler configured for shared bands, but shared_processor not initialized.")
+                    processor = self.shared_processor
+
+                # Process the band
+                processed_band = band_input
+                for block in processor:
+                    processed_band = block(processed_band, cond_signal)
+                # processed_band shape: [B, C_last, F_band, T]
+                processed_bands.append(processed_band)
+
+            # Concatenate processed bands along frequency dim (dim=2)
+            x_processed = torch.cat(processed_bands, dim=2) # Shape: [B, C_last, F_mid, T]
+
+            # --- Apply Smoothing if Separate Bands ---
+            if self.band_processing == 'separate':
+                 # Ensure smoothing_conv exists (defined in __init__)
+                if not hasattr(self, 'smoothing_conv'):
+                     raise AttributeError("MidResUpsampler configured for separate bands, but smoothing_conv not initialized.")
+                x_processed = self.smoothing_conv(x_processed) # Apply smoothing
+
+        else: # Single band processing (original path, but using shared_processor)
+             # Ensure shared_processor exists
+            if not hasattr(self, 'shared_processor'):
+                 raise AttributeError("MidResUpsampler configured for single band, but shared_processor not initialized.")
+            processor = self.shared_processor
+            x_processed = x_upsampled # Start with [B, 1, F_mid, T]
+            for block in processor:
+                x_processed = block(x_processed, cond_signal)
+            # x_processed shape: [B, C_last, F_mid, T]
+
+        # --- Final Projection ---
+        # Output projection: [B, C_last, F_mid, T] -> [B, 1, F_mid, T]
+        x = self.output_proj(x_processed)
+
         # Squeeze channel dim: [B, 1, F_mid, T] -> [B, F_mid, T]
         x = x.squeeze(1)
         # Permute back to [B, T, F_mid]
@@ -329,49 +424,70 @@ class MidResUpsampler(nn.Module):
 
 class HighResUpsampler(nn.Module):
     # Updated __init__ to accept embedding dimensions and stride
+    # Updated __init__ for multi-band processing
     def __init__(self, input_dim, channels_list, output_dim,
                  f0_embed_dim, phone_embed_dim, midi_embed_dim, unvoiced_embed_dim,
-                 downsample_stride=2): # Assuming stride matches LowResModel's first block
+                 downsample_stride=2, config=None): # Added config parameter
         super().__init__()
-        
+        if config is None:
+             raise ValueError("Config dictionary must be provided to HighResUpsampler")
+
         # Store stride and calculate total embedding dimension
         self.downsample_stride = downsample_stride
         self.total_embed_dim = f0_embed_dim + phone_embed_dim + midi_embed_dim + unvoiced_embed_dim
 
-        # Upsample only frequency dimension (dim 2), preserve time (dim 3)
-        # Input shape expected by Upsample: [B, C, F, T]
+        # --- Multi-band Configuration ---
+        self.num_bands = config['model'].get('num_bands_stage3', 1) # Default to 1 band
+        self.band_processing = config['model'].get('band_processing_stage3', 'shared') # Default to shared
+        print(f"HighResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
+
+        # --- Upsampling (Common to all bands) ---
+        # Keep original ConvTranspose2d for frequency upsampling in Stage 3
         self.upsample_conv = nn.ConvTranspose2d(in_channels=1, out_channels=1, kernel_size=(4, 1), stride=(2, 1), padding=(1, 0))
 
-        # Use ModulatedResidualBlock2D for initial conv
-        # Input is upsampled spec (1 channel), output is channels_list[0]
-        self.initial_conv = ModulatedResidualBlock2D(1, channels_list[0], self.total_embed_dim)
+        # --- Band Processing Blocks ---
+        if self.num_bands > 1 and self.band_processing == 'separate':
+            self.band_processors = nn.ModuleList()
+            for _ in range(self.num_bands):
+                band_block_list = nn.ModuleList()
+                # Initial block for this band (input channel = 1 after upsample_conv)
+                band_block_list.append(ModulatedResidualBlock2D(1, channels_list[0], self.total_embed_dim))
+                # Subsequent blocks for this band
+                for i in range(len(channels_list) - 1):
+                    band_block_list.append(ModulatedResidualBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
+                self.band_processors.append(band_block_list)
+        else: # Shared processing (or single band)
+            self.shared_processor = nn.ModuleList()
+            # Initial block (input channel = 1 after upsample_conv)
+            self.shared_processor.append(ModulatedResidualBlock2D(1, channels_list[0], self.total_embed_dim))
+            # Subsequent blocks
+            for i in range(len(channels_list) - 1):
+                self.shared_processor.append(ModulatedResidualBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
 
-        # Use ModulatedResidualBlock2D for subsequent blocks
-        self.blocks = nn.ModuleList()
-        for i in range(len(channels_list) - 1):
-            self.blocks.append(ModulatedResidualBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
-            
-        # Final projection back to 1 channel, preserving F and T dimensions
-        # The output_dim parameter is not directly used here, final freq dim is determined by upsampling + convs
+        # --- Smoothing Layer (Optional, for separate bands) ---
+        self.smoothing_conv = ConvBlock2D(channels_list[-1], channels_list[-1], kernel_size=(3, 1), padding=(1, 0))
+
+        # --- Final Projection (Common to all bands after concatenation) ---
+        # Input channels = last channel size in channels_list
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
         
-    # Updated forward to accept original embeddings
+    # Updated forward for multi-band processing
     def forward(self, x, f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig):
         # x shape: [B, T_downsampled, F_mid] (Output from MidResUpsampler)
         # Embeddings shape: [B, T_orig, Dim]
 
-        # --- Process Spectrogram ---
+        # --- Process Spectrogram (Initial Upsampling) ---
         # Permute x to [B, F_mid, T_downsampled]
         x = x.permute(0, 2, 1)
         # Unsqueeze x to [B, 1, F_mid, T_downsampled] for 2D operations
         x = x.unsqueeze(1)
-        # Upsample Frequency: [B, 1, F_mid, T_downsampled] -> [B, 1, F_high, T_downsampled]
-        x_upsampled = self.upsample_conv(x)
+        # Upsample Frequency using ConvTranspose2d: [B, 1, F_mid, T] -> [B, 1, F_high, T]
+        x_upsampled = self.upsample_conv(x) # Shape: [B, 1, F_high, T]
 
-        # --- Process Embeddings ---
+        # --- Process Embeddings (Common Conditioning) ---
         # Concatenate original embeddings along feature dim: [B, T_orig, TotalDim]
         all_embeddings_orig = torch.cat((f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig), dim=2)
-        # Permute for 1D pooling: [B, TotalDim, T_orig]
+        # Permute for 1D pooling/conv: [B, TotalDim, T_orig]
         all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
         # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
         if self.downsample_stride > 1:
@@ -380,20 +496,59 @@ class HighResUpsampler(nn.Module):
                                                       stride=self.downsample_stride)
         else:
             all_embeddings_downsampled = all_embeddings_orig_permuted
-        # all_embeddings_downsampled shape: [B, TotalDim, T_downsampled]
+        # cond_signal shape: [B, TotalDim, T_downsampled]
+        cond_signal = all_embeddings_downsampled
 
-        # --- Modulated Convolutions ---
-        # Initial modulated convolution
-        # Input: x_upsampled [B, 1, F_high, T], Cond: all_embeddings_downsampled [B, TotalDim, T]
-        x = self.initial_conv(x_upsampled, all_embeddings_downsampled)
+        # --- Multi-Band Processing ---
+        if self.num_bands > 1:
+            # Squeeze channel dim before splitting: [B, F_high, T]
+            x_squeezed = x_upsampled.squeeze(1)
+            # Split into bands along frequency dim (dim=1)
+            band_tensors = torch.chunk(x_squeezed, self.num_bands, dim=1)
 
-        # Subsequent modulated convolution blocks
-        for block in self.blocks:
-            x = block(x, all_embeddings_downsampled)
-            
-        # Output projection: [B, Clast, F, T] -> [B, 1, F_high, T]
-        x = self.output_proj(x)
-        
+            processed_bands = []
+            for i, band_tensor in enumerate(band_tensors):
+                # Unsqueeze channel dim for processing: [B, 1, F_band, T]
+                band_input = band_tensor.unsqueeze(1)
+
+                if self.band_processing == 'separate':
+                    if not hasattr(self, 'band_processors'):
+                         raise AttributeError("HighResUpsampler configured for separate bands, but band_processors not initialized.")
+                    processor = self.band_processors[i]
+                else: # Shared processor
+                    if not hasattr(self, 'shared_processor'):
+                         raise AttributeError("HighResUpsampler configured for shared bands, but shared_processor not initialized.")
+                    processor = self.shared_processor
+
+                # Process the band
+                processed_band = band_input
+                for block in processor:
+                    processed_band = block(processed_band, cond_signal)
+                # processed_band shape: [B, C_last, F_band, T]
+                processed_bands.append(processed_band)
+
+            # Concatenate processed bands along frequency dim (dim=2)
+            x_processed = torch.cat(processed_bands, dim=2) # Shape: [B, C_last, F_high, T]
+
+            # --- Apply Smoothing if Separate Bands ---
+            if self.band_processing == 'separate':
+                if not hasattr(self, 'smoothing_conv'):
+                     raise AttributeError("HighResUpsampler configured for separate bands, but smoothing_conv not initialized.")
+                x_processed = self.smoothing_conv(x_processed) # Apply smoothing
+
+        else: # Single band processing (original path, but using shared_processor)
+            if not hasattr(self, 'shared_processor'):
+                 raise AttributeError("HighResUpsampler configured for single band, but shared_processor not initialized.")
+            processor = self.shared_processor
+            x_processed = x_upsampled # Start with [B, 1, F_high, T]
+            for block in processor:
+                x_processed = block(x_processed, cond_signal)
+            # x_processed shape: [B, C_last, F_high, T]
+
+        # --- Final Projection ---
+        # Output projection: [B, C_last, F_high, T] -> [B, 1, F_high, T]
+        x = self.output_proj(x_processed)
+
         # Squeeze channel dim: [B, 1, F_high, T] -> [B, F_high, T]
         x = x.squeeze(1)
         # Permute back to [B, T, F_high]

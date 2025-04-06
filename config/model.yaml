@@ -48,7 +48,15 @@ model:
   # Format: List of output channels for each ConvBlock in the stage
   low_res_channels: [256, 256, 128]
   mid_res_channels: [128, 128, 64]
-  high_res_channels: [64, 64, 64, 32]
+  high_res_channels: [64, 64, 32] # Updated channel config
+
+  # --- Multi-band Config (NEW) ---
+  num_bands_stage1: 2                 # Default for multi-band output projection
+  num_bands_stage2: 3
+  band_processing_stage2: 'separate' # Options: 'separate', 'shared'
+  num_bands_stage3: 4                 # Default, same as stage 2
+  band_processing_stage3: 'separate'    # Default, same as stage 2
+  # --- End Multi-band Config ---
 
   # Initial training stage (1, 2, or 3)
   current_stage: 1
@@ -56,9 +64,10 @@ model:
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
+  unvoiced_weight: 0.5  # Weight for unvoiced frames in loss calculation (NEW)
   epochs_per_stage:
     stage1: 150         #ideal 200
-    stage2: 100         #ideal 150
+    stage2: 120         #ideal 150
     stage3: 100         #ideal 150
   
   val_interval: 1       # Run validation every N epochs
@@ -71,8 +80,8 @@ train:
   # --- Stage-Specific Learning Rates ---
   learning_rate_per_stage:
     stage1: 0.0005  # Example LR for stage 1 (Adjusted from 0.001)
-    stage2: 0.0005  # Example LR for stage 2
-    stage3: 0.0002  # Example LR for stage 3
+    stage2: 0.0007  # Example LR for stage 2
+    stage3: 0.0009  # Example LR for stage 3
   # --- End Stage-Specific Learning Rates ---
 
   # --- Global Optimizer/Scheduler Params ---
