@@ -185,21 +185,30 @@ class H5Dataset(Dataset):
 
             for name, h5_key in self.data_keys.items():
                 if h5_key in group:
-                    data_np = group[h5_key][()] # Read data from the group dataset
-                    # Convert to tensor with appropriate type
-                    # Add other potential integer keys from your config/preprocessing
-                    # Add 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag' to integer/bool types
-                    if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag']:
-                        # Convert voiced_mask to bool, unvoiced_flag to float, others to long
-                        if name == 'voiced_mask':
-                            sample[name] = torch.from_numpy(data_np).bool()
-                        elif name == 'unvoiced_flag':
-                             # Keep as float for potential linear projection later
+                    # Special handling for scalar original_unpadded_length
+                    if name == 'original_unpadded_length':
+                         # Read the scalar value directly
+                         scalar_value = group[h5_key][()]
+                         # Store as a Python int or a 0-dim tensor. Let's use int for now.
+                         # inference.py already converts it to a tensor later.
+                         sample[name] = int(scalar_value)
+                    else:
+                         # Existing logic for array types
+                         data_np = group[h5_key][()] # Read data from the group dataset
+                         # Convert to tensor with appropriate type
+                         # Add other potential integer keys from your config/preprocessing
+                         # Add 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag' to integer/bool types
+                         if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag']:
+                             # Convert voiced_mask to bool, unvoiced_flag to float, others to long
+                             if name == 'voiced_mask':
+                                 sample[name] = torch.from_numpy(data_np).bool()
+                             elif name == 'unvoiced_flag':
+                                  # Keep as float for potential linear projection later
+                                  sample[name] = torch.from_numpy(data_np).float()
+                             else:
+                                  sample[name] = torch.from_numpy(data_np).long()
+                         else: # Assuming float types (mel, f0)
                              sample[name] = torch.from_numpy(data_np).float()
-                        else:
-                             sample[name] = torch.from_numpy(data_np).long()
-                    else: # Assuming float types (mel, f0)
-                        sample[name] = torch.from_numpy(data_np).float()
                 else:
                     print(f"Warning: Key '{h5_key}' not found in group '{group_name}' for index {idx}.")
                     sample[name] = None # Handle missing key

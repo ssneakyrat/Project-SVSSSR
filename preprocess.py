@@ -588,7 +588,8 @@ def preprocess_data(config_path='config/model.yaml'):
             'duration_sequence': np.array(adjusted_durations, dtype=np.int32),
             'initial_duration_sequence': np.array(initial_durations, dtype=np.int32), # Keep for potential analysis/vis
             'voiced_mask': padded_voiced_mask, # Store padded voiced mask (as uint8)
-            'unvoiced_flag': padded_unvoiced_flag # Store padded unvoiced flag (as uint8)
+            'unvoiced_flag': padded_unvoiced_flag, # Store padded unvoiced flag (as uint8)
+            'original_unpadded_length': original_mel_frames # Store the original length
         }
 
         # Store unnormalized data for the *first* successfully processed file for visualization
@@ -701,6 +702,13 @@ def preprocess_data(config_path='config/model.yaml'):
                 else:
                     logging.warning(f"Key 'unvoiced_flag' not found in processed_data for {base_filename} during HDF5 saving.")
 
+                # Save original unpadded length (correctly indented)
+                if 'original_unpadded_length' in data:
+                    logging.debug(f"Attempting to create dataset 'original_unpadded_length' in group '{base_filename}'")
+                    group.create_dataset('original_unpadded_length', data=data['original_unpadded_length'], dtype='i4') # Save as integer
+                else:
+                    # This warning should ideally not trigger if the previous step worked
+                    logging.warning(f"Key 'original_unpadded_length' not found in processed_data for {base_filename} during HDF5 saving.")
 
         logging.info("HDF5 file saved successfully.")
 
