@@ -272,12 +272,12 @@ class MidResUpsampler(nn.Module):
 
         # Use ModulatedConvBlock2D for initial conv
         # Input is upsampled spec (1 channel), output is channels_list[0]
-        self.initial_conv = ModulatedResidualBlock2D(1, channels_list[0], self.total_embed_dim)
+        self.initial_conv = ModulatedConvBlock2D(1, channels_list[0], self.total_embed_dim)
 
         # Use ModulatedConvBlock2D for subsequent blocks
         self.blocks = nn.ModuleList()
         for i in range(len(channels_list) - 1):
-            self.blocks.append(ModulatedResidualBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
+            self.blocks.append(ModulatedConvBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
 
         # Final projection back to 1 channel (standard Conv2D)
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)

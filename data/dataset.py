@@ -496,31 +496,47 @@ class DataModule(pl.LightningDataModule):
             # Note: File remains open via H5FileManager if lazy loading, closed in teardown.
             # If not lazy loading, H5Dataset handles its own handle.
 
-            # --- Continue with dataset splitting ---
-            full_dataset_size = len(self.dataset)
-            subset_size = full_dataset_size
+            # --- Perform dataset subsetting and splitting only if not already done ---
+            if self.train_dataset is None or self.val_dataset is None:
+                print("Performing train/validation split...") # Add log message
+                full_dataset_size = len(self.dataset)
+                dataset_to_split = self.dataset # Start with the full dataset
 
-            if self.max_samples and self.max_samples > 0:
-                subset_size = min(self.max_samples, full_dataset_size)
-            elif self.sample_percentage and 0.0 < self.sample_percentage <= 1.0:
-                subset_size = int(full_dataset_size * self.sample_percentage)
+                # Apply subsetting if configured
+                subset_size = full_dataset_size
+                if self.max_samples and self.max_samples > 0:
+                    subset_size = min(self.max_samples, full_dataset_size)
+                elif self.sample_percentage and 0.0 < self.sample_percentage <= 1.0:
+                    subset_size = int(full_dataset_size * self.sample_percentage)
 
-            if subset_size < full_dataset_size:
-                generator = torch.Generator().manual_seed(42)
-                indices = torch.randperm(full_dataset_size, generator=generator)[:subset_size].tolist()
-                self.dataset = torch.utils.data.Subset(self.dataset, indices)
+                if subset_size < full_dataset_size:
+                    print(f"Applying subset: Using {subset_size} samples out of {full_dataset_size}.")
+                    generator_subset = torch.Generator().manual_seed(42) # Use separate generator for subsetting consistency
+                    indices = torch.randperm(full_dataset_size, generator=generator_subset)[:subset_size].tolist()
+                    dataset_to_split = torch.utils.data.Subset(self.dataset, indices)
+                # else: # Use the full dataset if no subsetting applied
+                    # dataset_to_split = self.dataset # Already assigned
 
-            dataset_size = len(self.dataset)
-            val_size = int(dataset_size * self.validation_split)
-            train_size = dataset_size - val_size
+                # Perform the split on the (potentially subsetted) dataset
+                dataset_size = len(dataset_to_split)
+                val_size = int(dataset_size * self.validation_split)
+                train_size = dataset_size - val_size
 
-            generator = torch.Generator().manual_seed(42)
+                # Ensure sizes are valid
+                if train_size <= 0 or val_size <= 0:
+                     raise ValueError(f"Calculated train_size ({train_size}) or val_size ({val_size}) is not positive. Check dataset size ({dataset_size}) and validation_split ({self.validation_split}).")
 
-            self.train_dataset, self.val_dataset = random_split(
-                self.dataset,
-                [train_size, val_size],
-                generator=generator
-            )
+
+                generator_split = torch.Generator().manual_seed(42) # Use separate generator for splitting consistency
+
+                self.train_dataset, self.val_dataset = random_split(
+                    dataset_to_split,
+                    [train_size, val_size],
+                    generator=generator_split
+                )
+                print(f"Split complete: Train size={train_size}, Validation size={val_size}")
+            else:
+                 print("Train/validation datasets already exist, skipping split.") # Add log message
     
     def train_dataloader(self):
         return DataLoader(
