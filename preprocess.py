@@ -507,24 +507,64 @@ def preprocess_data(config_path='config/model.yaml'):
         scale_factor = original_mel_frames / max_end_time
         logging.debug(f"{base_filename}: Original Frames={original_mel_frames}, Max Lab Time={max_end_time:.4f}, Scale Factor={scale_factor:.4f}")
 
+        # --- MODIFICATION START: Calculate, Round, and Borrow ---
+        phones_sequence = []
+        calculated_durations = []
         last_calculated_end_frame = 0
+
+        # 1. Calculate scaled frames and durations for ALL phones
         for start_sec, end_sec, phone in lab_entries:
             start_frame = round(start_sec * scale_factor)
             end_frame = round(end_sec * scale_factor)
+            # Ensure frames don't overlap due to rounding/tiny segments
             start_frame = max(start_frame, last_calculated_end_frame)
             end_frame = max(end_frame, start_frame)
 
             duration = end_frame - start_frame
-            if duration > 0:
-                initial_phones.append(phone)
-                initial_durations.append(duration)
-                last_calculated_end_frame = end_frame
-            else:
-                 logging.warning(f"Skipping zero duration phone '{phone}' after scaling in {base_filename} ({start_sec:.3f}-{end_sec:.3f}) -> Frames ({start_frame}-{end_frame})")
+            phones_sequence.append(phone)
+            calculated_durations.append(duration)
+            last_calculated_end_frame = end_frame
 
+        # 2. Apply borrowing logic
+        final_durations = list(calculated_durations) # Copy to modify
+        num_phones = len(final_durations)
+        for i in range(num_phones):
+            if final_durations[i] <= 0: # Check for <= 0 just in case
+                original_duration = final_durations[i]
+                borrowed = False
+                phone_symbol = phones_sequence[i]
+                # Try borrowing from next
+                if i + 1 < num_phones and final_durations[i+1] > 1:
+                    final_durations[i] = 1
+                    final_durations[i+1] -= 1
+                    borrowed = True
+                    logging.debug(f"Borrowing from next: Phone {i} ('{phone_symbol}') duration {original_duration} -> 1, Phone {i+1} ('{phones_sequence[i+1]}') duration {calculated_durations[i+1]} -> {final_durations[i+1]} in {base_filename}")
+                # Else, try borrowing from previous
+                elif i - 1 >= 0 and final_durations[i-1] > 1:
+                    final_durations[i] = 1
+                    final_durations[i-1] -= 1
+                    borrowed = True
+                    logging.debug(f"Borrowing from previous: Phone {i} ('{phone_symbol}') duration {original_duration} -> 1, Phone {i-1} ('{phones_sequence[i-1]}') duration {calculated_durations[i-1]} -> {final_durations[i-1]} in {base_filename}")
+
+                # Else, force to 1
+                if not borrowed:
+                    final_durations[i] = 1
+                    logging.warning(f"Forcing duration to 1 for phone {i} ('{phone_symbol}') (original: {original_duration}) in {base_filename} as neighbours cannot lend.")
+
+        # 3. Populate initial_phones and initial_durations
+        initial_phones = phones_sequence
+        initial_durations = final_durations
+
+        # Check if any durations are still invalid *after* borrowing (shouldn't happen)
+        if any(d <= 0 for d in initial_durations):
+             logging.error(f"Error: Found zero or negative duration after borrowing logic for {base_filename}. Durations: {initial_durations}. Skipping file.")
+             continue # Skip this file for safety
+
+        # Check if the list is empty (e.g., original lab file was empty)
         if not initial_phones:
-             logging.warning(f"Skipping {base_filename} as no phones with positive duration remained after scaling.")
+             logging.warning(f"Skipping {base_filename} as no phones remained after processing (original lab might be empty or invalid).")
              continue
+        # --- MODIFICATION END ---
 
         # 6. Adjust Scaled Durations to Match Target Frames
         adjusted_durations = adjust_durations(initial_phones, initial_durations, target_frames)
