@@ -9,11 +9,11 @@ import argparse
 import h5py
 from PIL import Image
 import matplotlib.pyplot as plt
-from typing import Tuple, TYPE_CHECKING
+from typing import Tuple, TYPE_CHECKING, Optional # Added Optional
 import pytorch_lightning as pl # For seed_everything
 
 # Import local modules
-from utils.plotting import plot_spectrograms_to_figure
+from utils.plotting import plot_spectrograms_to_figure, plot_single_spectrogram_to_figure # Added plot_single_spectrogram_to_figure
 from data.dataset import H5Dataset, H5FileManager # Import dataset components
 from models.progressive_svs import ProgressiveSVS # Import the model directly
 
@@ -28,15 +28,16 @@ def inference(
     phone_duration: torch.Tensor,
     midi_label: torch.Tensor,
     unvoiced_flag: torch.Tensor,
-    mel_spec_gt: torch.Tensor, # Ground truth for comparison
-    length: torch.Tensor,      # Original length before padding (scalar tensor)
-    config: dict,              # Model configuration (needed for potential stage info, though we assume stage 3)
-    device: torch.device
+    length: torch.Tensor,                       # Original length before padding (scalar tensor)
+    config: dict,                               # Model configuration (needed for potential stage info, though we assume stage 3)
+    device: torch.device,
+    mel_spec_gt: Optional[torch.Tensor] = None  # Ground truth (optional, moved to end)
 ) -> Tuple[Image.Image, torch.Tensor]:
     """
-    Performs inference using the ProgressiveSVS model, generates a comparison
-    plot of the predicted vs. ground truth mel spectrogram (without padding),
-    and returns the plot and the unpadded predicted spectrogram.
+    Performs inference using the ProgressiveSVS model.
+    If ground truth (mel_spec_gt) is provided, generates a comparison plot.
+    Otherwise, generates a plot of only the predicted spectrogram.
+    Returns the plot image and the unpadded predicted spectrogram.
 
     Assumes the model is configured to output at Stage 3 (full frequency resolution).
     Assumes input tensors are for a single batch item (B=1).
@@ -48,14 +49,14 @@ def inference(
         phone_duration: Phone duration tensor (B=1, T_orig).
         midi_label: MIDI label tensor (B=1, T_orig, 1 or B=1, T_orig).
         unvoiced_flag: Unvoiced flag tensor (B=1, T_orig, 1 or B=1, T_orig).
-        mel_spec_gt: Ground truth mel spectrogram (B=1, T_orig, F_full).
         length: Original, unpadded length of the sequence (scalar tensor).
         config: Model configuration dictionary.
         device: The torch device ('cpu' or 'cuda:X') to run inference on.
+        mel_spec_gt: Optional ground truth mel spectrogram (B=1, T_orig, F_full). If None, comparison is skipped.
 
     Returns:
         A tuple containing:
-        - PIL.Image.Image: Comparison plot (predicted vs GT, unpadded).
+        - PIL.Image.Image: Plot image (comparison or prediction-only, unpadded).
         - torch.Tensor: Predicted mel spectrogram, unpadded (T_unpadded, F_full).
     """
     model.eval()
@@ -67,7 +68,8 @@ def inference(
     phone_duration = phone_duration.to(device)
     midi_label = midi_label.to(device)
     unvoiced_flag = unvoiced_flag.to(device)
-    mel_spec_gt = mel_spec_gt.to(device)
+    if mel_spec_gt is not None:
+        mel_spec_gt = mel_spec_gt.to(device)
     length = length.to(device) # Keep length on device for calculations if needed
 
     with torch.no_grad():
@@ -76,60 +78,74 @@ def inference(
         # Output shape: (B=1, T_downsampled, F_out)
         mel_pred = model(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
 
-        # --- Generate Target Mel (Matching Prediction Resolution) ---
-        # We need the target mel at the same temporal resolution as the prediction
-        original_max_len = mel_spec_gt.shape[1] # T_orig
-        target_time_dim = mel_pred.shape[1]     # T_downsampled
-        freq_dim = mel_pred.shape[2]            # F_out (should be F_full for stage 3)
-
-        # Ensure mel_spec_gt has 3 dims (B, T, F)
-        if mel_spec_gt.dim() != 3:
-             raise ValueError(f"Expected mel_spec_gt to have 3 dimensions (B, T, F), but got shape {mel_spec_gt.shape}")
-        if mel_spec_gt.shape[0] != 1:
-             print(f"Warning: Expected batch size 1 for mel_spec_gt, but got {mel_spec_gt.shape[0]}. Using first item.")
-             mel_spec_gt = mel_spec_gt[0:1] # Keep batch dim
-
-        # Reshape GT for interpolation: (B=1, F_full, T_orig) -> (B=1, 1, F_full, T_orig)
-        mel_spec_gt_permuted = mel_spec_gt.permute(0, 2, 1)
-        mel_spec_gt_4d = mel_spec_gt_permuted.unsqueeze(1)
-
-        # Interpolate GT to match prediction's temporal resolution (T_downsampled)
-        # We assume the frequency dimension (F_out) already matches F_full (Stage 3)
-        mel_target = F.interpolate(
-            mel_spec_gt_4d,
-            size=(freq_dim, target_time_dim), # Target shape (F_full, T_downsampled)
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(1) # Back to (B=1, F_full, T_downsampled)
-
-        # Permute back to (B=1, T_downsampled, F_full)
-        mel_target = mel_target.permute(0, 2, 1)
-
         # --- Calculate Unpadded Length in Target Time Dimension ---
         # Ensure length is a scalar
         if not (length.ndim == 0 or (length.ndim == 1 and length.numel() == 1)):
              raise ValueError(f"Expected length to be a scalar tensor, but got shape {length.shape}")
         original_length_scalar = length.item() # Length derived from duration sum
-        target_length = int(original_length_scalar // model.downsample_stride)
+        target_length = int(original_length_scalar // model.downsample_stride) # Unpadded length in downsampled time dim
 
-        # --- Slice to Remove Padding ---
+        # --- Slice Prediction to Remove Padding ---
         # Remove batch dimension (B=1) and slice time dimension
-        #mel_pred = mel_pred.T
-        #mel_target = mel_target.T
         mel_pred_unpadded = mel_pred[0, :target_length, :]   # Shape: (T_unpadded, F_full)
-        mel_target_unpadded = mel_target[0, :target_length, :] # Shape: (T_unpadded, F_full)
 
-        # --- Generate Comparison Plot ---
-        # The plotting function handles tensor conversion internally.
-        # Pass the tensors directly: ground_truth (target) first, then prediction.
-        # Pass the tensors directly: ground_truth (target) first, then prediction.
-        vmin = mel_pred_unpadded.min()
-        vmax = mel_pred_unpadded.max()
+        # Determine min/max for plotting color scale based on prediction
+        vmin = mel_pred_unpadded.min().item() # Use .item() to get scalar value
+        vmax = mel_pred_unpadded.max().item()
 
+        # Transpose prediction for plotting (Freq, Time)
         mel_pred_unpadded = mel_pred_unpadded.T
-        mel_target_unpadded = mel_target_unpadded.T
 
-        fig = plot_spectrograms_to_figure(mel_target_unpadded, mel_pred_unpadded, "Infer", -2, 4)
+        # --- Process Ground Truth (if available) and Generate Plot ---
+        if mel_spec_gt is not None:
+            # --- Generate Target Mel (Matching Prediction Resolution) ---
+            target_time_dim = mel_pred.shape[1]     # T_downsampled (from model output)
+            freq_dim = mel_pred.shape[2]            # F_out (should be F_full for stage 3)
+
+            # Ensure mel_spec_gt has 3 dims (B, T, F)
+            if mel_spec_gt.dim() != 3:
+                 raise ValueError(f"Expected mel_spec_gt to have 3 dimensions (B, T, F), but got shape {mel_spec_gt.shape}")
+            if mel_spec_gt.shape[0] != 1:
+                 print(f"Warning: Expected batch size 1 for mel_spec_gt, but got {mel_spec_gt.shape[0]}. Using first item.")
+                 mel_spec_gt = mel_spec_gt[0:1] # Keep batch dim
+
+            # Reshape GT for interpolation: (B=1, F_full, T_orig) -> (B=1, 1, F_full, T_orig)
+            mel_spec_gt_permuted = mel_spec_gt.permute(0, 2, 1)
+            mel_spec_gt_4d = mel_spec_gt_permuted.unsqueeze(1)
+
+            # Interpolate GT to match prediction's temporal resolution (T_downsampled)
+            mel_target = F.interpolate(
+                mel_spec_gt_4d,
+                size=(freq_dim, target_time_dim), # Target shape (F_full, T_downsampled)
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1) # Back to (B=1, F_full, T_downsampled)
+
+            # Permute back to (B=1, T_downsampled, F_full)
+            mel_target = mel_target.permute(0, 2, 1)
+
+            # --- Slice Target to Remove Padding ---
+            mel_target_unpadded = mel_target[0, :target_length, :] # Shape: (T_unpadded, F_full)
+
+            # Transpose target for plotting (Freq, Time)
+            mel_target_unpadded = mel_target_unpadded.T
+
+            # --- Generate Comparison Plot ---
+            fig = plot_spectrograms_to_figure(
+                ground_truth=mel_target_unpadded,
+                prediction=mel_pred_unpadded,
+                title="Spectrogram Comparison (Unpadded)",
+                vmin=vmin, # Use calculated vmin/vmax
+                vmax=vmax
+            )
+        else:
+            # --- Generate Prediction-Only Plot ---
+            fig = plot_single_spectrogram_to_figure(
+                prediction=mel_pred_unpadded,
+                title="Predicted Spectrogram (Unpadded)",
+                vmin=vmin, # Use calculated vmin/vmax
+                vmax=vmax
+            )
 
         # --- Convert Figure to PIL Image ---
         buf = io.BytesIO()
@@ -153,6 +169,7 @@ if __name__ == "__main__":
     parser.add_argument('--output_image', type=str, required=True, help='Path to save the output comparison image (e.g., output/comparison.png).')
     parser.add_argument('--output_tensor', type=str, default=None, help='Optional path to save the predicted mel tensor (.pt).')
     parser.add_argument('--device', type=str, default=None, choices=['cpu', 'cuda'], help='Device to use (cpu or cuda). Auto-detects if not specified.')
+    parser.add_argument('--use_ground_truth', action='store_true', help='Load ground truth mel spectrogram for comparison plotting.')
     args = parser.parse_args()
 
     # --- 1. Load Configuration ---
@@ -220,17 +237,24 @@ if __name__ == "__main__":
     print(f"Loading sample index {args.sample_index} from dataset: {h5_path}")
     try:
         # Define data keys needed based on config (mirroring DataModule)
+        # Define base data keys needed regardless of ground truth
         data_keys = {
-            'mel_spectrogram': config['data']['mel_key'],
             'f0_contour': config['data']['f0_key'],
-            'phone_sequence': config['data']['phoneme_key'], # Frame-level IDs from HDF5
+            # 'phone_sequence': config['data']['phoneme_key'], # Frame-level IDs not directly used
             'adjusted_durations': config['data']['duration_key'], # Phoneme-level durations
             'phone_sequence_ids': 'phone_sequence_ids', # Phoneme-level IDs
             'midi_pitch_estimated': 'midi_pitch_estimated',
             'original_unpadded_length': 'original_unpadded_length', # Add key for true length
-            'voiced_mask': 'voiced_mask',
+            # 'voiced_mask': 'voiced_mask', # Not directly used by model? Check ProgressiveSVS input
             'unvoiced_flag': 'unvoiced_flag'
         }
+        # Conditionally add mel spectrogram key if ground truth is needed
+        # Conditionally add mel spectrogram key ONLY if ground truth comparison is requested
+        if args.use_ground_truth:
+            print("Ground truth comparison requested, adding mel spectrogram key.")
+            data_keys['mel_spectrogram'] = config['data']['mel_key']
+        else:
+            print("Running inference without ground truth (default).")
         dataset = H5Dataset(h5_path=h5_path, data_keys=data_keys, lazy_load=True) # Use lazy load
 
         if args.sample_index < 0 or args.sample_index >= len(dataset):
@@ -254,15 +278,31 @@ if __name__ == "__main__":
 
     # --- 6. Prepare Inputs for Inference Function ---
     try:
-        # Extract tensors using config keys and rename/prepare
-        mel_spec_gt_orig = sample_dict[config['data']['mel_key']]
+        # Extract tensors common to both modes
         f0_orig = sample_dict[config['data']['f0_key']]
+        if f0_orig is None: raise KeyError(f"Required key '{config['data']['f0_key']}' (f0_contour) not found in sample.")
         midi_label_orig = sample_dict['midi_pitch_estimated']
+        if midi_label_orig is None: raise KeyError("'midi_pitch_estimated' not found in sample.")
         unvoiced_flag_orig = sample_dict['unvoiced_flag']
-        # Note: 'phoneme' key from HDF5 contains frame-level IDs, not needed directly for model input
-        # We need phoneme-level IDs and durations to create the frame-level 'phone_label'
+        if unvoiced_flag_orig is None: raise KeyError("'unvoiced_flag' not found in sample.")
         phoneme_level_ids = sample_dict['phone_sequence_ids']
+        if phoneme_level_ids is None: raise KeyError("'phone_sequence_ids' not found in sample.")
         phone_duration_orig = sample_dict[config['data']['duration_key']] # Phoneme-level durations
+        if phone_duration_orig is None: raise KeyError(f"Required key '{config['data']['duration_key']}' (duration) not found in sample.")
+
+        # Initialize GT variables
+        mel_spec_gt_orig = None
+        mel_spec_gt_batch = None
+
+        # Load GT only if requested
+        # Load GT only if requested via flag
+        if args.use_ground_truth:
+            mel_key = config['data']['mel_key']
+            if mel_key not in sample_dict or sample_dict[mel_key] is None:
+                raise KeyError(f"Ground truth comparison requested via flag, but key '{mel_key}' not found or is None in sample.")
+            print("Loading ground truth mel spectrogram for comparison.")
+            mel_spec_gt_orig = sample_dict[mel_key]
+            mel_spec_gt_batch = mel_spec_gt_orig.unsqueeze(0) # Add batch dim for GT
 
         # Load the true original unpadded length stored during preprocessing
         if 'original_unpadded_length' not in sample_dict:
@@ -273,8 +313,16 @@ if __name__ == "__main__":
              original_length = original_length.item()
              original_length = torch.tensor(original_length, dtype=torch.long) # Convert back to scalar tensor
 
-        # Expand phoneme IDs to frame-level 'phone_label'
-        target_frame_len = mel_spec_gt_orig.shape[0] # Use PADDED length for model input consistency
+        # Determine target frame length (padded length) for expanding phonemes
+        # Use GT shape if available, otherwise use F0 shape (assuming they are padded identically)
+        if mel_spec_gt_orig is not None:
+            target_frame_len = mel_spec_gt_orig.shape[0]
+            print(f"Using target_frame_len from mel_spec_gt: {target_frame_len}")
+        else:
+            target_frame_len = f0_orig.shape[0] # Assumes f0 is padded to the same length
+            print(f"Using target_frame_len from f0_contour: {target_frame_len}")
+
+        # Expand phoneme IDs to frame-level 'phone_label' using target_frame_len
         phone_duration_orig = torch.clamp(phone_duration_orig, min=0)
         total_duration = phone_duration_orig.sum()
 
@@ -310,7 +358,7 @@ if __name__ == "__main__":
         phone_duration_batch = phone_duration_orig.unsqueeze(0) # Keep phoneme-level duration for model input
         midi_label_batch = midi_label_orig.unsqueeze(0)
         unvoiced_flag_batch = unvoiced_flag_orig.unsqueeze(0)
-        mel_spec_gt_batch = mel_spec_gt_orig.unsqueeze(0)
+        # mel_spec_gt_batch is already prepared (or None)
         # length remains a scalar tensor
 
         print("Input tensors prepared for inference function.")
@@ -330,6 +378,7 @@ if __name__ == "__main__":
     # --- 7. Run Inference ---
     print("Running inference...")
     try:
+        # Call inference, passing mel_spec_gt_batch which might be None
         comparison_image, predicted_mel_unpadded = inference(
             model=model,
             f0=f0_batch,
@@ -337,10 +386,10 @@ if __name__ == "__main__":
             phone_duration=phone_duration_batch, # Pass phoneme-level duration
             midi_label=midi_label_batch,
             unvoiced_flag=unvoiced_flag_batch,
-            mel_spec_gt=mel_spec_gt_batch,
             length=original_length, # Pass scalar original length
             config=config,
-            device=device
+            device=device,
+            mel_spec_gt=mel_spec_gt_batch # Pass GT (or None) as the last argument
         )
         print("Inference completed.")
     except Exception as e:
@@ -359,7 +408,7 @@ if __name__ == "__main__":
     # Save image
     try:
         comparison_image.save(args.output_image)
-        print(f"Comparison image saved to: {args.output_image}")
+        print(f"Output image saved to: {args.output_image}")
     except Exception as e:
         print(f"Error saving comparison image: {e}")
 
