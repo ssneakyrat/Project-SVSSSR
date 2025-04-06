@@ -129,7 +129,7 @@ def inference(
         mel_pred_unpadded = mel_pred_unpadded.T
         mel_target_unpadded = mel_target_unpadded.T
 
-        fig = plot_spectrograms_to_figure(mel_target_unpadded, mel_pred_unpadded, vmin, vmax)
+        fig = plot_spectrograms_to_figure(mel_target_unpadded, mel_pred_unpadded, "Infer", -2, 4)
 
         # --- Convert Figure to PIL Image ---
         buf = io.BytesIO()
