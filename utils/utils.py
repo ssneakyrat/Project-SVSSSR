@@ -3,6 +3,10 @@ import numpy as np
 import librosa
 import os
 import math
+import logging
+import sys
+
+logger = logging.getLogger(__name__)
 
 def load_config(config_path="config/default.yaml"):
     try:
@@ -10,10 +14,10 @@ def load_config(config_path="config/default.yaml"):
             config = yaml.safe_load(f)
         return config
     except FileNotFoundError:
-        print(f"Warning: Configuration file {config_path} not found. Using default configuration.")
+        logger.warning(f"Configuration file {config_path} not found. Using default configuration.")
         return {}
     except yaml.YAMLError as e:
-        print(f"Error parsing YAML configuration: {e}")
+        logger.error(f"Error parsing YAML configuration: {e}")
         return {}
 
 def extract_mel_spectrogram(wav_path, config):
@@ -36,24 +40,21 @@ def extract_mel_spectrogram(wav_path, config):
         return mel_spec
         
     except Exception as e:
-        print(f"Error extracting mel spectrogram from {wav_path}: {e}")
+        logger.error(f"Error extracting mel spectrogram from {wav_path}: {e}")
         return None
 
 def extract_mel_spectrogram_variable_length(wav_path, config):
     """Extract variable-length mel spectrogram with maximum length constraint"""
     try:
-        # Load audio
         y, sr = librosa.load(wav_path, sr=config['audio']['sample_rate'])
         
-        # Check if audio exceeds maximum length
         max_audio_length = config['audio'].get('max_audio_length', 10.0)  # Default 10 seconds
         max_samples = int(max_audio_length * sr)
         
         if len(y) > max_samples:
-            print(f"Warning: Audio file {wav_path} exceeds maximum length of {max_audio_length}s. Truncating.")
+            logger.warning(f"Audio file {wav_path} exceeds maximum length of {max_audio_length}s. Truncating.")
             y = y[:max_samples]
         
-        # Extract mel spectrogram
         mel_spec = librosa.feature.melspectrogram(
             y=y,
             sr=sr,
@@ -67,21 +68,20 @@ def extract_mel_spectrogram_variable_length(wav_path, config):
         
         mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
         
-        # Ensure correct shape (freq_bins, time_frames)
+        # Ensure correct shape (Freq, Time)
         if mel_spec.shape[0] > mel_spec.shape[1]:
             mel_spec = mel_spec.T
             
         return mel_spec
         
     except Exception as e:
-        print(f"Error extracting variable-length mel spectrogram from {wav_path}: {e}")
+        logger.error(f"Error extracting variable-length mel spectrogram from {wav_path}: {e}")
         return None
 
 def extract_f0(wav_path, config):
     try:
         y, sr = librosa.load(wav_path, sr=config['audio']['sample_rate'])
         
-        # Check if audio exceeds maximum length
         max_audio_length = config['audio'].get('max_audio_length', 10.0)
         max_samples = int(max_audio_length * sr)
         
@@ -100,7 +100,7 @@ def extract_f0(wav_path, config):
         return f0
         
     except Exception as e:
-        print(f"Error extracting F0 from {wav_path}: {e}")
+        logger.error(f"Error extracting F0 from {wav_path}: {e}")
         return None
 
 def normalize_mel_spectrogram(mel_spec):
@@ -129,11 +129,9 @@ def pad_or_truncate_mel(mel_spec, target_length=128, target_bins=80):
 
 def calculate_mel_frames_from_audio_length(audio_length_seconds, sample_rate, hop_length):
     """Calculate number of mel spectrogram frames from audio length in seconds"""
-    # Calculate number of samples
     num_samples = int(audio_length_seconds * sample_rate)
     
-    # Calculate number of frames
-    # The formula accounts for the frame centered at each hop_length interval
+    # Calculate number of frames (librosa convention)
     num_frames = 1 + (num_samples - 1) // hop_length
     
     return num_frames
@@ -142,18 +140,16 @@ def prepare_mel_for_model(mel_spec, target_length=None, target_bins=80, variable
     """Prepare mel spectrogram for model input, with optional variable length support"""
     import torch
     
-    # Make sure mel_spec is in the correct orientation (freq bins, time frames)
-    # Typically mel_spec should have shape (freq_bins, time_frames)
-    # If it's transposed, fix it
+    # Ensure mel_spec is in (Freq, Time) orientation
     if isinstance(mel_spec, np.ndarray):
         if mel_spec.shape[0] > mel_spec.shape[1]:  # If time > freq, transpose
-            print(f"Warning: Transposing mel spectrogram from {mel_spec.shape} to {mel_spec.shape[::-1]}")
+            logger.warning(f"Transposing mel spectrogram from {mel_spec.shape} to {mel_spec.shape[::-1]}")
             mel_spec = mel_spec.T
     
     mel_spec = normalize_mel_spectrogram(mel_spec)
     
     if variable_length:
-        # For variable length, we just ensure freq dimension matches target
+        # For variable length, only resize frequency dimension if needed
         if mel_spec.shape[0] != target_bins:
             # Resize frequency dimension if needed
             resized = np.zeros((target_bins, mel_spec.shape[1]), dtype=mel_spec.dtype)
@@ -161,14 +157,34 @@ def prepare_mel_for_model(mel_spec, target_length=None, target_bins=80, variable
             resized[:freq_bins_to_copy, :] = mel_spec[:freq_bins_to_copy, :]
             mel_spec = resized
     else:
-        # For fixed length, we apply standard padding/truncation
+        # For fixed length, apply standard padding/truncation
         if target_length is not None:
             mel_spec = pad_or_truncate_mel(mel_spec, target_length, target_bins)
     
     # Convert to tensor
     mel_tensor = torch.from_numpy(mel_spec).float()
     
-    # Add batch and channel dimensions: [freq, time] -> [1, 1, freq, time]
+    # Add batch and channel dimensions for model input: (F, T) -> (1, 1, F, T)
     mel_tensor = mel_tensor.unsqueeze(0).unsqueeze(0)
     
     return mel_tensor
+
+def setup_logging(level=logging.INFO, log_file=None):
+    """
+    Configures basic logging to stream to stdout and optionally a file.
+
+    Args:
+        level (int): The minimum logging level to output (e.g., logging.INFO, logging.DEBUG).
+        log_file (str, optional): Path to a file to save logs. Defaults to None (no file logging).
+    """
+    log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        # Ensure log directory exists
+        log_dir = os.path.dirname(log_file)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file))
+
+    logging.basicConfig(level=level, format=log_format, handlers=handlers)
+    logger.info(f"Logging configured. Level: {logging.getLevelName(level)}. File: {log_file}")

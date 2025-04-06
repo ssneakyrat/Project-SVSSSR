@@ -89,7 +89,7 @@ train:
   lr_factor: 0.5          # Factor by which the learning rate will be reduced (scheduler)
   lr_patience: 10         # Number of epochs with no improvement after which learning rate will be reduced (scheduler)
   # gradient_clip_val: 1.0 # Optional: Gradient clipping value
-  freeze_loaded_weights: true # Default: Freeze weights when loading from ckpt
+  freeze_loaded_weights: false # Default: Freeze weights when loading from ckpt
 
   # log_interval defines log_every_n_steps in Trainer
   log_interval: 50        # Log training metrics every N steps
