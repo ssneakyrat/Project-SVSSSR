@@ -324,8 +324,8 @@ class ProgressiveSVS(pl.LightningModule):
         vmax = target_mel.max()
 
         # Transpose tensors from (Time, Freq) to (Freq, Time) for the plotting function
-        pred_mel_t = pred_mel.T
-        target_mel_t = target_mel.T
+        pred_mel_t = pred_mel
+        target_mel_t = target_mel
 
         # Use the utility function to create the plot
         fig = plot_spectrograms_to_figure(
