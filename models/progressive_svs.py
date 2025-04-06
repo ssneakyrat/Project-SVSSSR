@@ -17,6 +17,7 @@ class FeatureEncoder(nn.Module):
         self.f0_embed_dim = config['model']['f0_embed_dim']
         self.phone_embed_dim = config['model']['phone_embed_dim']
         self.midi_embed_dim = config['model']['midi_embed_dim']
+        self.unvoiced_embed_dim = 16 # Define dimension for unvoiced flag embedding
         
         # F0 encoding (continuous value)
         self.f0_projection = nn.Linear(1, self.f0_embed_dim)
@@ -30,8 +31,11 @@ class FeatureEncoder(nn.Module):
         # MIDI encoding (categorical)
         num_midi_notes = 128  # MIDI standard
         self.midi_embedding = nn.Embedding(num_midi_notes, self.midi_embed_dim)
+
+        # Unvoiced flag encoding (continuous value 0.0 or 1.0)
+        self.unvoiced_projection = nn.Linear(1, self.unvoiced_embed_dim)
         
-    def forward(self, f0, phone_label, phone_duration, midi_label):
+    def forward(self, f0, phone_label, phone_duration, midi_label, unvoiced_flag):
         # f0 has shape (B, T, 1), get B and T correctly
         batch_size = f0.size(0)
         seq_len = f0.size(1)
@@ -53,7 +57,14 @@ class FeatureEncoder(nn.Module):
         
         # Concatenate all features [B, T, F0_dim + P_dim + M_dim]
         # Concatenate features
-        features = torch.cat([f0_encoded, phone_encoded, midi_encoded], dim=2)
+        # Encode unvoiced flag (frame-level)
+        # Ensure unvoiced_flag has shape [B, T, 1]
+        if unvoiced_flag.dim() == 2:
+            unvoiced_flag = unvoiced_flag.unsqueeze(-1)
+        unvoiced_encoded = self.unvoiced_projection(unvoiced_flag) # [B, T, U_dim]
+
+        # Concatenate all features [B, T, F0_dim + P_dim + M_dim + U_dim]
+        features = torch.cat([f0_encoded, phone_encoded, midi_encoded, unvoiced_encoded], dim=2)
         
         # Reshape to [B, F, T] for 1D convolution
         features = features.transpose(1, 2)
@@ -72,7 +83,7 @@ class ProgressiveSVS(pl.LightningModule):
         self.feature_encoder = FeatureEncoder(config)
         
         # Progressive stages
-        input_dim = self.feature_encoder.f0_embed_dim + self.feature_encoder.phone_embed_dim + self.feature_encoder.midi_embed_dim
+        input_dim = self.feature_encoder.f0_embed_dim + self.feature_encoder.phone_embed_dim + self.feature_encoder.midi_embed_dim + self.feature_encoder.unvoiced_embed_dim
         
         # Calculate frequency dimensions for each stage
         full_mel_bins = config['model']['mel_bins']
@@ -103,9 +114,9 @@ class ProgressiveSVS(pl.LightningModule):
         # Loss function
         self.loss_fn = nn.L1Loss(reduction='none')
         
-    def forward(self, f0, phone_label, phone_duration, midi_label):
+    def forward(self, f0, phone_label, phone_duration, midi_label, unvoiced_flag):
         # Encode input features
-        features = self.feature_encoder(f0, phone_label, phone_duration, midi_label)
+        features = self.feature_encoder(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
         
         
         # Stage 1: Low-Resolution Model (20×216)
@@ -134,9 +145,11 @@ class ProgressiveSVS(pl.LightningModule):
         phone_duration = batch['phone_duration']
         midi_label = batch['midi_label']
         lengths = batch['length']
+        voiced_mask = batch['voiced_mask'] # Get the voiced mask
+        unvoiced_flag = batch['unvoiced_flag'] # Get the unvoiced flag
         
         # Forward pass
-        mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        mel_pred = self(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
         
         # Create masks for variable length
         max_len = mel_specs.shape[1] # Use time dimension (dim 1)
@@ -216,14 +229,27 @@ class ProgressiveSVS(pl.LightningModule):
         if mel_target.dim() == 3 and mel_pred.dim() == 2:
             mel_pred = mel_pred.unsqueeze(0)
         
-        # Compute masked loss
-        loss = self.loss_fn(mel_pred, mel_target)
-        
-        # Apply mask to loss - only consider valid timesteps
-        loss = loss * mask.float()
+        # Compute element-wise loss
+        loss_elementwise = self.loss_fn(mel_pred, mel_target)
 
-        # Normalize by actual lengths
-        loss = loss.sum() / (mask.sum() + 1e-8)
+        # --- Apply Weighted Loss ---
+        unvoiced_weight = 2.0 # Weight for unvoiced frames
+        # Ensure voiced_mask has shape (B, T) before unsqueezing
+        if voiced_mask.dim() == 3 and voiced_mask.shape[-1] == 1:
+             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T)
+        # Create weights: shape (B, T, 1), broadcastable to (B, T, F)
+        loss_weights = torch.where(voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
+        loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
+
+        # Apply length mask and loss weights
+        # mask has shape (B, T, F)
+        weighted_loss = loss_elementwise * mask.float() * loss_weights
+
+        # Normalize by the sum of applied weights within the mask
+        # This keeps the loss magnitude somewhat consistent
+        total_weight_sum = (mask.float() * loss_weights).sum()
+        loss = weighted_loss.sum() / total_weight_sum.clamp(min=1e-8)
+        # --- End Weighted Loss ---
         
         self.log('train_loss', loss, prog_bar=True)
         return loss # Revert to returning raw tensor for diagnostics
@@ -235,9 +261,11 @@ class ProgressiveSVS(pl.LightningModule):
         phone_duration = batch['phone_duration']
         midi_label = batch['midi_label']
         lengths = batch['length']
+        voiced_mask = batch['voiced_mask'] # Get the voiced mask
+        unvoiced_flag = batch['unvoiced_flag'] # Get the unvoiced flag
         
         # Forward pass
-        mel_pred = self(f0, phone_label, phone_duration, midi_label)
+        mel_pred = self(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
         
         # Create masks for variable length
         max_len = mel_specs.shape[1] # Use time dimension (dim 1)
@@ -322,14 +350,26 @@ class ProgressiveSVS(pl.LightningModule):
         
         # --- End logging ---
         
-        # Compute masked loss
-        loss = self.loss_fn(mel_pred, mel_target)
-        
-        # Apply mask to loss - only consider valid timesteps
-        loss = loss * mask.float()
+        # Compute element-wise loss
+        loss_elementwise = self.loss_fn(mel_pred, mel_target)
 
-        # Normalize by actual lengths
-        loss = loss.sum() / (mask.sum() + 1e-8)
+        # --- Apply Weighted Loss ---
+        unvoiced_weight = 2.0 # Weight for unvoiced frames (same as training)
+        # Ensure voiced_mask has shape (B, T) before unsqueezing
+        if voiced_mask.dim() == 3 and voiced_mask.shape[-1] == 1:
+             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T)
+        # Create weights: shape (B, T, 1), broadcastable to (B, T, F)
+        loss_weights = torch.where(voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
+        loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
+
+        # Apply length mask and loss weights
+        # mask has shape (B, T, F)
+        weighted_loss = loss_elementwise * mask.float() * loss_weights
+
+        # Normalize by the sum of applied weights within the mask
+        total_weight_sum = (mask.float() * loss_weights).sum()
+        loss = weighted_loss.sum() / total_weight_sum.clamp(min=1e-8)
+        # --- End Weighted Loss ---
         self.log('val_loss', loss, prog_bar=True)
         
         # Visualize first sample in batch at appropriate intervals
@@ -380,9 +420,20 @@ class ProgressiveSVS(pl.LightningModule):
         plt.close(fig)
     
     def configure_optimizers(self):
+        # Determine the learning rate for the current stage
+        stage_key = f'stage{self.current_stage}'
+        try:
+            current_lr = self.config['train']['learning_rate_per_stage'][stage_key]
+            print(f"Using learning rate {current_lr} for stage {self.current_stage}") # Added logging
+        except KeyError:
+            # Fallback or error handling if the key is missing
+            print(f"Warning: Learning rate for '{stage_key}' not found in config. Falling back to default 0.001.")
+            # Using a default LR as fallback
+            current_lr = 0.001
+
         optimizer = torch.optim.Adam(
-            self.parameters(), 
-            lr=self.config['train']['learning_rate'],
+            self.parameters(),
+            lr=current_lr, # Use the stage-specific learning rate
             weight_decay=self.config['train']['weight_decay']
         )
         

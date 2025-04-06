@@ -149,9 +149,16 @@ class H5Dataset(Dataset):
                               if tensor is not None:
                                   # Infer type (simple heuristic, may need refinement)
                                   # Add other potential integer keys from your config/preprocessing
-                                  # Add 'midi_pitch_estimated' to integer types
-                                  if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated']:
-                                      sample[name] = tensor.long()
+                                  # Add 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag' to integer/bool types
+                                  if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag']:
+                                      # Convert voiced_mask to bool, unvoiced_flag to float (for potential projection), others to long
+                                      if name == 'voiced_mask':
+                                          sample[name] = tensor.bool()
+                                      elif name == 'unvoiced_flag':
+                                           # Keep as float for potential linear projection later
+                                           sample[name] = tensor.float()
+                                      else:
+                                          sample[name] = tensor.long()
                                   else: # Assuming mel, f0 are float types
                                       sample[name] = tensor.float()
                           if self.transform:
@@ -181,9 +188,16 @@ class H5Dataset(Dataset):
                     data_np = group[h5_key][()] # Read data from the group dataset
                     # Convert to tensor with appropriate type
                     # Add other potential integer keys from your config/preprocessing
-                    # Add 'midi_pitch_estimated' to integer types
-                    if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated']:
-                        sample[name] = torch.from_numpy(data_np).long()
+                    # Add 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag' to integer/bool types
+                    if name in ['phoneme', 'duration', 'phone_sequence', 'initial_duration_sequence', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag']:
+                        # Convert voiced_mask to bool, unvoiced_flag to float, others to long
+                        if name == 'voiced_mask':
+                            sample[name] = torch.from_numpy(data_np).bool()
+                        elif name == 'unvoiced_flag':
+                             # Keep as float for potential linear projection later
+                             sample[name] = torch.from_numpy(data_np).float()
+                        else:
+                             sample[name] = torch.from_numpy(data_np).long()
                     else: # Assuming float types (mel, f0)
                         sample[name] = torch.from_numpy(data_np).float()
                 else:
@@ -237,7 +251,7 @@ def collate_fn_pad(batch):
     # Determine max lengths for each sequence type
     max_len = {}
     # Determine max lengths for frame-level and phoneme-level sequences
-    frame_level_keys = ['mel', 'f0', 'midi_pitch_estimated'] # Keys that are frame-level
+    frame_level_keys = ['mel', 'f0', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag'] # Add voiced_mask, unvoiced_flag
     # 'phoneme' key holds frame-level IDs loaded from HDF5, remove it from here
     phoneme_level_keys = ['duration', 'phone_sequence_ids'] # Keys that are phoneme-level
     max_len_frame = 0
@@ -328,8 +342,15 @@ def collate_fn_pad(batch):
             # Use shape[0] for time dimension length for frame-level keys
             current_len = data.shape[0] if key in frame_level_keys else data.shape[0]
             target_len = max_len.get(key, current_len) # Use max_len calculated earlier
-            # Determine pad value (0 for IDs/indices, 0.0 for floats)
-            pad_value = 0 if key in ['phoneme', 'duration', 'midi_pitch_estimated'] else 0.0
+            # Determine pad value (0 for IDs/indices, 0.0 for floats, False for bool)
+            if key == 'voiced_mask':
+                pad_value = False # Pad bool with False
+            elif key == 'unvoiced_flag':
+                pad_value = 0.0 # Pad float flag with 0.0
+            elif key in ['phoneme', 'duration', 'midi_pitch_estimated']:
+                pad_value = 0 # Pad integer IDs with 0
+            else: # mel, f0
+                pad_value = 0.0 # Pad float features with 0.0
 
             if current_len < target_len:
                 padding_size = target_len - current_len
@@ -375,7 +396,9 @@ def collate_fn_pad(batch):
         'f0': 'f0',
         'midi_pitch_estimated': 'midi_label', # Rename 'midi_pitch_estimated' to 'midi_label'
         'phone_label': 'phone_label', # Keep expanded phoneme label key
-        'duration': 'phone_duration' # Rename original duration key
+        'duration': 'phone_duration', # Rename original duration key
+        'voiced_mask': 'voiced_mask', # Keep voiced_mask key
+        'unvoiced_flag': 'unvoiced_flag' # Keep unvoiced_flag key
         # 'phoneme' key (original phoneme sequence) is not explicitly renamed/included
         # unless needed later.
     }
@@ -417,6 +440,8 @@ class DataModule(pl.LightningDataModule):
             'duration': config['data']['duration_key'], # e.g., 'adjusted_durations' (PHONEME-level durations)
             'phone_sequence_ids': 'phone_sequence_ids', # Key for PHONEME-level IDs
             'midi_pitch_estimated': 'midi_pitch_estimated', # Key for estimated MIDI pitch
+            'voiced_mask': 'voiced_mask', # Key for the voiced mask
+            'unvoiced_flag': 'unvoiced_flag' # Key for the unvoiced flag
         }
         self.lazy_load = config['data'].get('lazy_load', True)
         self.max_samples = config['data'].get('max_samples', None)

@@ -480,6 +480,11 @@ def preprocess_data(config_path='config/model.yaml'):
         padded_norm_mel = pad_or_truncate(norm_log_mel, target_frames, pad_value=0.0)
         padded_norm_f0 = pad_or_truncate(norm_log_f0, target_frames, pad_value=0.0)
         padded_midi_pitch = pad_or_truncate(midi_pitch, target_frames, pad_value=0) # Pad MIDI with 0 (unvoiced)
+        # Pad voiced mask (boolean -> int for padding, pad with 0/False)
+        padded_voiced_mask = pad_or_truncate(voiced_mask.astype(np.uint8), target_frames, pad_value=0)
+        # Create and pad unvoiced flag (1 for unvoiced, 0 for voiced)
+        unvoiced_flag = (~voiced_mask).astype(np.uint8)
+        padded_unvoiced_flag = pad_or_truncate(unvoiced_flag, target_frames, pad_value=0)
 
         # 4. Parse Labels (get timestamps and phones)
         lab_entries, unique_phones_in_file, max_end_time = parse_lab_file(lab_path)
@@ -581,7 +586,9 @@ def preprocess_data(config_path='config/model.yaml'):
             'midi_pitch_estimated': padded_midi_pitch, # Store padded MIDI pitch
             'phone_sequence': initial_phones,
             'duration_sequence': np.array(adjusted_durations, dtype=np.int32),
-            'initial_duration_sequence': np.array(initial_durations, dtype=np.int32) # Keep for potential analysis/vis
+            'initial_duration_sequence': np.array(initial_durations, dtype=np.int32), # Keep for potential analysis/vis
+            'voiced_mask': padded_voiced_mask, # Store padded voiced mask (as uint8)
+            'unvoiced_flag': padded_unvoiced_flag # Store padded unvoiced flag (as uint8)
         }
 
         # Store unnormalized data for the *first* successfully processed file for visualization
@@ -679,6 +686,20 @@ def preprocess_data(config_path='config/model.yaml'):
                      group.create_dataset('midi_pitch_estimated', data=data['midi_pitch_estimated'], compression="gzip")
                 else:
                      logging.warning(f"Key 'midi_pitch_estimated' not found in processed_data for {base_filename} during HDF5 saving.")
+
+                # Save voiced mask
+                if 'voiced_mask' in data:
+                    logging.debug(f"Attempting to create dataset 'voiced_mask' in group '{base_filename}'")
+                    group.create_dataset('voiced_mask', data=data['voiced_mask'], compression="gzip") # Save as uint8
+                else:
+                    logging.warning(f"Key 'voiced_mask' not found in processed_data for {base_filename} during HDF5 saving.")
+
+                # Save unvoiced flag
+                if 'unvoiced_flag' in data:
+                    logging.debug(f"Attempting to create dataset 'unvoiced_flag' in group '{base_filename}'")
+                    group.create_dataset('unvoiced_flag', data=data['unvoiced_flag'], compression="gzip") # Save as uint8
+                else:
+                    logging.warning(f"Key 'unvoiced_flag' not found in processed_data for {base_filename} during HDF5 saving.")
 
 
         logging.info("HDF5 file saved successfully.")

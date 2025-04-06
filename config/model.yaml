@@ -67,8 +67,14 @@ train:
   num_workers: 4        # DataLoader workers
   log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps
 
-  # Optimizer and Scheduler parameters for ProgressiveSVS (Adam + ReduceLROnPlateau)
-  learning_rate: 0.0002   # Initial learning rate
+  # --- Stage-Specific Learning Rates ---
+  learning_rate_per_stage:
+    stage1: 0.0005  # Example LR for stage 1 (Adjusted from 0.001)
+    stage2: 0.0005  # Example LR for stage 2
+    stage3: 0.0002  # Example LR for stage 3
+  # --- End Stage-Specific Learning Rates ---
+
+  # --- Global Optimizer/Scheduler Params ---
   weight_decay: 0.0001    # Adam weight decay
   lr_factor: 0.5          # Factor by which the learning rate will be reduced (scheduler)
   lr_patience: 10         # Number of epochs with no improvement after which learning rate will be reduced (scheduler)
