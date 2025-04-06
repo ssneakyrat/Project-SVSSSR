@@ -17,7 +17,7 @@ class FeatureEncoder(nn.Module):
         self.f0_embed_dim = config['model']['f0_embed_dim']
         self.phone_embed_dim = config['model']['phone_embed_dim']
         self.midi_embed_dim = config['model']['midi_embed_dim']
-        self.unvoiced_embed_dim = 16 # Define dimension for unvoiced flag embedding
+        self.unvoiced_embed_dim = config['model']['unvoiced_embed_dim'] # Read from config
         
         # F0 encoding (continuous value)
         self.f0_projection = nn.Linear(1, self.f0_embed_dim)
@@ -57,14 +57,9 @@ class FeatureEncoder(nn.Module):
             unvoiced_flag = unvoiced_flag.unsqueeze(-1)
         unvoiced_encoded = self.unvoiced_projection(unvoiced_flag) # [B, T, U_dim]
 
-        # Concatenate main features (F0, phone, MIDI)
-        main_features_cat = torch.cat([f0_encoded, phone_encoded, midi_encoded], dim=2)
-        
-        # Reshape main features and unvoiced embedding for 1D convolution (B, C, T)
-        main_features = main_features_cat.transpose(1, 2) # Shape: [B, F0+P+M_dim, T]
-        unvoiced_embedding = unvoiced_encoded.transpose(1, 2) # Shape: [B, U_dim, T]
-        
-        return main_features, unvoiced_embedding
+        # Return individual embeddings before concatenation/transposition
+        # Shapes: [B, T, Dim]
+        return f0_encoded, phone_encoded, midi_encoded, unvoiced_encoded
 
 class ProgressiveSVS(pl.LightningModule):
     def __init__(self, config):
@@ -73,65 +68,103 @@ class ProgressiveSVS(pl.LightningModule):
         
         self.config = config
         self.current_stage = config['model'].get('current_stage', 1)
-        
+
         # Feature encoder
         self.feature_encoder = FeatureEncoder(config)
+        # Store individual embedding dims for later use
+        self.f0_embed_dim = self.feature_encoder.f0_embed_dim
+        self.phone_embed_dim = self.feature_encoder.phone_embed_dim
+        self.midi_embed_dim = self.feature_encoder.midi_embed_dim
+        self.unvoiced_embed_dim = self.feature_encoder.unvoiced_embed_dim
         
         # Progressive stages
-        # Input dim for LowResModel is now only the main features (F0, phone, MIDI)
-        input_dim_main = self.feature_encoder.f0_embed_dim + self.feature_encoder.phone_embed_dim + self.feature_encoder.midi_embed_dim
-        unvoiced_embed_dim = self.feature_encoder.unvoiced_embed_dim # Get unvoiced dim separately
+        # Input dim for LowResModel (still uses concatenated main features)
+        input_dim_main = self.f0_embed_dim + self.phone_embed_dim + self.midi_embed_dim
+        # We stored individual dims earlier (self.f0_embed_dim, etc.)
         
         # Calculate frequency dimensions for each stage
         full_mel_bins = config['model']['mel_bins']
         low_res_freq_bins = int(full_mel_bins / config['model']['low_res_scale'])
         mid_res_freq_bins = int(full_mel_bins / config['model']['mid_res_scale'])
         
-        # Stage 1: Low-Resolution Model (20×216) - Pass unvoiced_embed_dim
+        # Stage 1: Low-Resolution Model
+        # Determine the stride used in the first block of LowResModel for downsampling
+        # Assuming stride=2 for the first block as per LowResModel implementation
+        self.downsample_stride = 2 if len(config['model']['low_res_channels']) > 0 else 1
+
         self.low_res_model = LowResModel(
             input_dim=input_dim_main,
             channels_list=config['model']['low_res_channels'],
             output_dim=low_res_freq_bins,
-            unvoiced_embed_dim=unvoiced_embed_dim # Pass the dimension here
+            unvoiced_embed_dim=self.unvoiced_embed_dim # Pass only unvoiced dim here
         )
         
         # Stage 2: Mid-Resolution Upsampler (40×432)
+        # Stage 2: Mid-Resolution Upsampler - Pass all embedding dims and stride
         self.mid_res_upsampler = MidResUpsampler(
-            low_res_freq_bins,  # Input is output of previous stage
-            config['model']['mid_res_channels'], 
-            output_dim=mid_res_freq_bins
+            input_dim=low_res_freq_bins, # Freq dim from previous stage
+            channels_list=config['model']['mid_res_channels'],
+            output_dim=mid_res_freq_bins,
+            f0_embed_dim=self.f0_embed_dim,
+            phone_embed_dim=self.phone_embed_dim,
+            midi_embed_dim=self.midi_embed_dim,
+            unvoiced_embed_dim=self.unvoiced_embed_dim,
+            downsample_stride=self.downsample_stride
         )
         
         # Stage 3: High-Resolution Upsampler (80×864)
+        # Stage 3: High-Resolution Upsampler - Pass all embedding dims and stride
         self.high_res_upsampler = HighResUpsampler(
-            mid_res_freq_bins,  # Input is output of previous stage
-            config['model']['high_res_channels'], 
-            output_dim=full_mel_bins
+            input_dim=mid_res_freq_bins, # Freq dim from previous stage
+            channels_list=config['model']['high_res_channels'],
+            output_dim=full_mel_bins,
+            f0_embed_dim=self.f0_embed_dim,
+            phone_embed_dim=self.phone_embed_dim,
+            midi_embed_dim=self.midi_embed_dim,
+            unvoiced_embed_dim=self.unvoiced_embed_dim,
+            downsample_stride=self.downsample_stride # Same stride as MidRes
         )
         
         # Loss function
         self.loss_fn = nn.L1Loss(reduction='none')
         
     def forward(self, f0, phone_label, phone_duration, midi_label, unvoiced_flag):
-        # Encode input features - Now returns main_features and unvoiced_embedding
-        main_features, unvoiced_embedding = self.feature_encoder(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
-        
-        
-        # Stage 1: Low-Resolution Model (20×216) - Pass both feature sets
-        low_res_output = self.low_res_model(main_features, unvoiced_embedding)
+        # Encode input features - Returns individual embeddings [B, T_orig, Dim]
+        f0_enc, phone_enc, midi_enc, unvoiced_enc = self.feature_encoder(
+            f0, phone_label, phone_duration, midi_label, unvoiced_flag
+        )
+
+        # --- Prepare inputs for Stage 1 ---
+        # Concatenate main features (F0, phone, MIDI) [B, T_orig, F0+P+M_dim]
+        main_features_cat = torch.cat([f0_enc, phone_enc, midi_enc], dim=2)
+        # Transpose for Conv1D: [B, F0+P+M_dim, T_orig]
+        main_features_s1 = main_features_cat.transpose(1, 2)
+        # Transpose unvoiced embedding for Conv1D: [B, U_dim, T_orig]
+        unvoiced_embedding_s1 = unvoiced_enc.transpose(1, 2)
+
+        # --- Stage 1: Low-Resolution Model ---
+        # Input: Transposed main features and unvoiced embedding
+        # Output: Low-res spectrogram [B, T_downsampled, F_low]
+        low_res_output = self.low_res_model(main_features_s1, unvoiced_embedding_s1)
         
         
         if self.current_stage == 1:
             return low_res_output
         
-        # Stage 2: Mid-Resolution Upsampler (40×432)
-        mid_res_output = self.mid_res_upsampler(low_res_output)
+        # --- Stage 2: Mid-Resolution Upsampler ---
+        # Input: Low-res spec and ORIGINAL embeddings
+        mid_res_output = self.mid_res_upsampler(
+            low_res_output, f0_enc, phone_enc, midi_enc, unvoiced_enc
+        )
         
         if self.current_stage == 2:
             return mid_res_output
         
-        # Stage 3: High-Resolution Upsampler (80×864)
-        high_res_output = self.high_res_upsampler(mid_res_output)
+        # --- Stage 3: High-Resolution Upsampler ---
+        # Input: Mid-res spec and ORIGINAL embeddings
+        high_res_output = self.high_res_upsampler(
+            mid_res_output, f0_enc, phone_enc, midi_enc, unvoiced_enc
+        )
         
         
         return high_res_output

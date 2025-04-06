@@ -160,19 +160,27 @@ class LowResModel(nn.Module):
             x = block(x, cond_embedding)
         
         x = self.output_proj(x)
-        # Permute output from (B, F', T) to (B, T, F')
+        # Permute output from (B, F', T_downsampled) to (B, T_downsampled, F')
+        # Ensure LowResModel only returns the spectrogram
         return x.permute(0, 2, 1)
 
 class MidResUpsampler(nn.Module):
-    def __init__(self, input_dim, channels_list, output_dim):
+    # Updated __init__ to accept embedding dimensions and stride
+    def __init__(self, input_dim, channels_list, output_dim,
+                 f0_embed_dim, phone_embed_dim, midi_embed_dim, unvoiced_embed_dim,
+                 downsample_stride=2):
         super().__init__()
         
+        # Store stride and calculate total embedding dimension
+        self.downsample_stride = downsample_stride
+        self.total_embed_dim = f0_embed_dim + phone_embed_dim + midi_embed_dim + unvoiced_embed_dim
+
         # Upsample only frequency dimension (dim 2), preserve time (dim 3)
         # Input shape expected by Upsample: [B, C, F, T]
         self.upsample = nn.Upsample(scale_factor=(2, 1), mode='bilinear', align_corners=False)
-        
-        # First ConvBlock adapts from 1 channel (after unsqueeze) to channels_list[0]
-        self.initial_conv = ConvBlock2D(1, channels_list[0])
+
+        # First ConvBlock adapts from (1 + total_embed_dim) channels to channels_list[0]
+        self.initial_conv = ConvBlock2D(1 + self.total_embed_dim, channels_list[0])
         
         self.blocks = nn.ModuleList()
         for i in range(len(channels_list) - 1):
@@ -181,18 +189,40 @@ class MidResUpsampler(nn.Module):
         # Final projection back to 1 channel, preserving F and T dimensions
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
         
-    def forward(self, x):
-        # Input shape: [B, T, F_in]
-        # Permute to [B, F_in, T]
+    # Updated forward to accept original embeddings
+    def forward(self, x, f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig):
+        # x shape: [B, T_downsampled, F_in] (Output from LowResModel)
+        # Embeddings shape: [B, T_orig, Dim]
+
+        # --- Process Spectrogram ---
+        # Permute x to [B, F_in, T_downsampled]
         x = x.permute(0, 2, 1)
-        # Unsqueeze to [B, 1, F_in, T] for 2D operations
+        # Unsqueeze x to [B, 1, F_in, T_downsampled] for 2D operations
         x = x.unsqueeze(1)
-        
-        # Upsample Frequency: [B, 1, F_in, T] -> [B, 1, 2*F_in, T]
-        x = self.upsample(x)
-        
-        # Initial convolution: [B, 1, F_mid_approx, T] -> [B, C0, F_mid_approx, T]
-        x = self.initial_conv(x)
+        # Upsample Frequency: [B, 1, F_in, T_downsampled] -> [B, 1, F_mid, T_downsampled]
+        x_upsampled = self.upsample(x)
+
+        # --- Process Embeddings ---
+        # Concatenate original embeddings along feature dim: [B, T_orig, TotalDim]
+        all_embeddings_orig = torch.cat((f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig), dim=2)
+        # Permute for 1D pooling: [B, TotalDim, T_orig]
+        all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
+        # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
+        if self.downsample_stride > 1:
+            all_embeddings_downsampled = F.avg_pool1d(all_embeddings_orig_permuted,
+                                                      kernel_size=self.downsample_stride,
+                                                      stride=self.downsample_stride)
+        else:
+            all_embeddings_downsampled = all_embeddings_orig_permuted
+        # Expand frequency dimension to match x_upsampled: [B, TotalDim, F_mid, T_downsampled]
+        target_freq_dim = x_upsampled.shape[2]
+        expanded_embeddings = all_embeddings_downsampled.unsqueeze(2).expand(-1, -1, target_freq_dim, -1)
+
+        # --- Concatenate and Convolve ---
+        # Concatenate along channel dim: [B, 1 + TotalDim, F_mid, T_downsampled]
+        concat_features = torch.cat((x_upsampled, expanded_embeddings), dim=1)
+        # Initial convolution: [B, 1 + TotalDim, F_mid, T] -> [B, C0, F_mid, T]
+        x = self.initial_conv(concat_features)
         
         # Conv blocks: [B, C0, F, T] -> [B, Clast, F, T]
         for block in self.blocks:
@@ -207,15 +237,22 @@ class MidResUpsampler(nn.Module):
         return x.permute(0, 2, 1)
 
 class HighResUpsampler(nn.Module):
-    def __init__(self, input_dim, channels_list, output_dim):
+    # Updated __init__ to accept embedding dimensions and stride
+    def __init__(self, input_dim, channels_list, output_dim,
+                 f0_embed_dim, phone_embed_dim, midi_embed_dim, unvoiced_embed_dim,
+                 downsample_stride=2): # Assuming stride matches LowResModel's first block
         super().__init__()
         
+        # Store stride and calculate total embedding dimension
+        self.downsample_stride = downsample_stride
+        self.total_embed_dim = f0_embed_dim + phone_embed_dim + midi_embed_dim + unvoiced_embed_dim
+
         # Upsample only frequency dimension (dim 2), preserve time (dim 3)
         # Input shape expected by Upsample: [B, C, F, T]
         self.upsample = nn.Upsample(scale_factor=(2, 1), mode='bilinear', align_corners=False)
-        
-        # First ConvBlock adapts from 1 channel (input_dim is freq dim here, but input has 1 channel after unsqueeze)
-        self.initial_conv = ConvBlock2D(1, channels_list[0])
+
+        # First ConvBlock adapts from (1 + total_embed_dim) channels to channels_list[0]
+        self.initial_conv = ConvBlock2D(1 + self.total_embed_dim, channels_list[0])
         
         self.blocks = nn.ModuleList()
         for i in range(len(channels_list) - 1):
@@ -225,18 +262,40 @@ class HighResUpsampler(nn.Module):
         # The output_dim parameter is not directly used here, final freq dim is determined by upsampling + convs
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
         
-    def forward(self, x):
-        # Input shape: [B, T, F_mid]
-        # Permute to [B, F_mid, T]
+    # Updated forward to accept original embeddings
+    def forward(self, x, f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig):
+        # x shape: [B, T_downsampled, F_mid] (Output from MidResUpsampler)
+        # Embeddings shape: [B, T_orig, Dim]
+
+        # --- Process Spectrogram ---
+        # Permute x to [B, F_mid, T_downsampled]
         x = x.permute(0, 2, 1)
-        # Unsqueeze to [B, 1, F_mid, T] for 2D operations
+        # Unsqueeze x to [B, 1, F_mid, T_downsampled] for 2D operations
         x = x.unsqueeze(1)
-        
-        # Upsample Frequency: [B, 1, F_mid, T] -> [B, 1, 2*F_mid, T]
-        x = self.upsample(x)
-        
-        # Initial convolution: [B, 1, F_high_approx, T] -> [B, C0, F_high_approx, T]
-        x = self.initial_conv(x)
+        # Upsample Frequency: [B, 1, F_mid, T_downsampled] -> [B, 1, F_high, T_downsampled]
+        x_upsampled = self.upsample(x)
+
+        # --- Process Embeddings ---
+        # Concatenate original embeddings along feature dim: [B, T_orig, TotalDim]
+        all_embeddings_orig = torch.cat((f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig), dim=2)
+        # Permute for 1D pooling: [B, TotalDim, T_orig]
+        all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
+        # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
+        if self.downsample_stride > 1:
+            all_embeddings_downsampled = F.avg_pool1d(all_embeddings_orig_permuted,
+                                                      kernel_size=self.downsample_stride,
+                                                      stride=self.downsample_stride)
+        else:
+            all_embeddings_downsampled = all_embeddings_orig_permuted
+        # Expand frequency dimension to match x_upsampled: [B, TotalDim, F_high, T_downsampled]
+        target_freq_dim = x_upsampled.shape[2]
+        expanded_embeddings = all_embeddings_downsampled.unsqueeze(2).expand(-1, -1, target_freq_dim, -1)
+
+        # --- Concatenate and Convolve ---
+        # Concatenate along channel dim: [B, 1 + TotalDim, F_high, T_downsampled]
+        concat_features = torch.cat((x_upsampled, expanded_embeddings), dim=1)
+        # Initial convolution: [B, 1 + TotalDim, F_high, T] -> [B, C0, F_high, T]
+        x = self.initial_conv(concat_features)
         
         # Conv blocks: [B, C0, F, T] -> [B, Clast, F, T]
         for block in self.blocks:

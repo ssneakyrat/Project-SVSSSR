@@ -38,7 +38,7 @@ model:
   f0_embed_dim: 64
   phone_embed_dim: 256
   midi_embed_dim: 64
-
+  unvoiced_embed_dim: 16 # Dimension for unvoiced flag embedding
   # Resolution scaling factors (relative to full mel_bins)
   # Example: low_res_scale=4 means low-res has mel_bins/4 frequency bins
   low_res_scale: 4
