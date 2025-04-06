@@ -240,8 +240,8 @@ class ProgressiveSVS(pl.LightningModule):
             mel_target = F.interpolate(
                 mel_specs_4d,
                 size=(freq_dim, target_time_dim), # Target shape (Freq', Time/stride)
-                mode='bilinear',
-                align_corners=False
+                mode='nearest' # Changed from bilinear to preserve high-freq target details
+                # align_corners=False # Removed as it's incompatible with mode='nearest'
             ).squeeze(1)  # Back to (B, F', T/stride)
 
             # Permute back to (B, T, F')
@@ -411,8 +411,8 @@ class ProgressiveSVS(pl.LightningModule):
             mel_target = F.interpolate(
                 mel_specs_4d,
                 size=(freq_dim, target_time_dim), # Target shape (Freq', Time/stride)
-                mode='bilinear',
-                align_corners=False
+                mode='nearest' # Changed from bilinear to preserve high-freq target details
+                # align_corners=False # Removed as it's incompatible with mode='nearest'
             ).squeeze(1)  # Back to (B, F', T/stride)
 
             # Permute back to (B, T, F')

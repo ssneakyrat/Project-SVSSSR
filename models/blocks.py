@@ -303,8 +303,8 @@ class MidResUpsampler(nn.Module):
         print(f"MidResUpsampler: Using {self.num_bands} bands with '{self.band_processing}' processing.")
 
         # --- Upsampling (Common to all bands) ---
-        self.upsample = nn.Upsample(scale_factor=(2, 1), mode='nearest') # Upsample Frequency only
-        self.refine_conv = ConvBlock2D(in_channels=1, out_channels=1, kernel_size=3, padding=1) # Refine after upsampling
+        # Replace Upsample + ConvBlock with ConvTranspose2d for learnable frequency upsampling
+        self.upsample_conv = nn.ConvTranspose2d(in_channels=1, out_channels=1, kernel_size=(4, 1), stride=(2, 1), padding=(1, 0))
 
         # --- Band Processing Blocks ---
         if self.num_bands > 1 and self.band_processing == 'separate':
@@ -343,9 +343,8 @@ class MidResUpsampler(nn.Module):
         x = x.permute(0, 2, 1)
         # Unsqueeze x to [B, 1, F_in, T_downsampled] for 2D operations
         x = x.unsqueeze(1)
-        # Upsample + Refine (Frequency): [B, 1, F_in, T_downsampled] -> [B, 1, F_mid, T_downsampled]
-        x_upsampled_raw = self.upsample(x)
-        x_upsampled = self.refine_conv(x_upsampled_raw) # Shape: [B, 1, F_mid, T]
+        # Upsample Frequency using ConvTranspose2d: [B, 1, F_in, T] -> [B, 1, F_mid, T]
+        x_upsampled = self.upsample_conv(x) # Shape: [B, 1, F_mid, T]
 
         # --- Process Embeddings (Common Conditioning) ---
         # Concatenate original embeddings along feature dim: [B, T_orig, TotalDim]
