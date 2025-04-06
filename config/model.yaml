@@ -57,7 +57,7 @@ model:
 train:
   batch_size: 16        # Adjust based on GPU memory
   epochs_per_stage:
-    stage1: 200
+    stage1: 150         #ideal 200
     stage2: 100
     stage3: 150
   val_interval: 1       # Run validation every N epochs

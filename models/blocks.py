@@ -69,11 +69,17 @@ class ResidualBlock(nn.Module):
 
 # Residual Block with Modulation for 1D data
 class ResidualBlock1D(nn.Module):
+    # Added stride parameter
     def __init__(self, in_channels, out_channels, unvoiced_embed_dim, kernel_size=3, stride=1):
         super().__init__()
-        # Ensure padding keeps sequence length the same for stride=1
+        # Adjust padding based on stride to try and maintain dimensions where possible,
+        # but exact length matching with stride > 1 can be tricky.
+        # For stride=1, padding = kernel_size // 2 maintains length.
+        # For stride=2, output_len = floor((input_len + 2*padding - kernel_size)/stride) + 1
+        # Let's keep padding = kernel_size // 2 for simplicity for now.
         padding = kernel_size // 2
 
+        # Use the passed stride in the first convolution
         self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
         self.bn1 = nn.BatchNorm1d(out_channels)
         self.relu = nn.ReLU(inplace=True)
@@ -84,11 +90,12 @@ class ResidualBlock1D(nn.Module):
         # Use Conv1d to potentially capture temporal variations in modulation
         self.mod_conv = nn.Conv1d(unvoiced_embed_dim, out_channels * 2, kernel_size=1) # Output gamma and beta
 
-        # Shortcut connection if channels or stride change
+        # Shortcut connection: Apply stride if stride > 1 OR if channels change
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride),
+                # Use the same stride in the shortcut's convolution
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm1d(out_channels)
             )
 
@@ -129,9 +136,9 @@ class LowResModel(nn.Module):
         # Iterate through all target channels to define blocks
         for i in range(len(channels_list)):
             out_channels = channels_list[i] # Target channel for this block
-            # Use ResidualBlock1D instead of ConvBlock1D
-            # Note: Stride is assumed to be 1 here. If stride > 1 is needed, it should be handled.
-            self.blocks.append(ResidualBlock1D(current_channels, out_channels, unvoiced_embed_dim))
+            # Use stride=2 for the first block to downsample time, stride=1 otherwise
+            stride = 2 if i == 0 else 1
+            self.blocks.append(ResidualBlock1D(current_channels, out_channels, unvoiced_embed_dim, stride=stride))
             current_channels = out_channels # Update current channels for the next block
         
         # Output projection uses the last channel size from the list
@@ -140,9 +147,17 @@ class LowResModel(nn.Module):
     def forward(self, x, unvoiced_embedding): # Added unvoiced_embedding
         x = self.reshape(x)
         
-        # Pass unvoiced_embedding to each block
+        # Downsample unvoiced_embedding if the first block uses stride > 1
+        cond_embedding = unvoiced_embedding
+        if len(self.blocks) > 0:
+            first_block_stride = self.blocks[0].conv1.stride[0] # Get stride value
+            if first_block_stride > 1:
+                # Use functional avg_pool1d for downsampling
+                cond_embedding = F.avg_pool1d(unvoiced_embedding, kernel_size=first_block_stride, stride=first_block_stride)
+
+        # Pass potentially downsampled embedding to each block
         for block in self.blocks:
-            x = block(x, unvoiced_embedding)
+            x = block(x, cond_embedding)
         
         x = self.output_proj(x)
         # Permute output from (B, F', T) to (B, T, F')

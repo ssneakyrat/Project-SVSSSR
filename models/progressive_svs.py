@@ -149,9 +149,11 @@ class ProgressiveSVS(pl.LightningModule):
         # Forward pass
         mel_pred = self(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
         
-        # Create masks for variable length
-        max_len = mel_specs.shape[1] # Use time dimension (dim 1)
-        mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
+        # Create masks for variable length based on ORIGINAL time dimension
+        original_max_len = mel_specs.shape[1] # Use time dimension (dim 1), e.g., 862
+        original_mask = torch.arange(original_max_len, device=lengths.device).expand(len(lengths), original_max_len) < lengths.unsqueeze(1)
+        # Target time dimension after downsampling
+        target_time_dim = original_max_len // 2
         
         # Adjust target resolution based on current stage
         if self.current_stage == 1:
@@ -160,66 +162,83 @@ class ProgressiveSVS(pl.LightningModule):
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
             # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # Correct unpacking
+            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
             mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
             mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
 
-            # Downsample keeping original time dimension (t)
+            # Downsample BOTH frequency and time
             mel_target = F.interpolate(
                 mel_specs_4d,
-                size=(freq_dim, t), # Target shape (Freq, Time)
+                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/2)
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to (B, F', T)
+            ).squeeze(1)  # Back to (B, F', T/2)
 
             # Permute back to (B, T, F')
             mel_target = mel_target.permute(0, 2, 1)
             
-            # Resize mask to match new frequency dimension
-            # Expand mask to match mel_target shape (B, T, F')
-            mask = mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T, F')
-            
+            # Downsample original_mask to match target_time_dim (T/2)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            downsampled_mask = F.interpolate(
+                mask_float,
+                size=(1, target_time_dim), # Target shape (1, Time/2)
+                mode='nearest'
+            ).squeeze(1).squeeze(1) # Back to (B, T/2)
+            # Expand mask to match mel_target shape (B, T/2, F')
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/2, F')
         elif self.current_stage == 2:
             # Downsample ground truth for mid-res stage
             scale_factor = 1/self.config['model']['mid_res_scale']
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
             # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # Correct unpacking
+            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
             mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
             mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
 
-            # Upsample time dimension by factor of 2 (assuming 862*2=1724)
-            target_time_dim = t * 2
+            # Downsample BOTH frequency and time (target_time_dim = t // 2)
             mel_target = F.interpolate(
                 mel_specs_4d,
-                size=(freq_dim, target_time_dim), # Target shape (Freq, Time * 2)
+                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/2)
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to (B, F', T*2)
+            ).squeeze(1)  # Back to (B, F', T/2)
 
             # Permute back to (B, T, F')
             mel_target = mel_target.permute(0, 2, 1)
             
-            # Upsample mask along time dimension to match target_time_dim (T*2)
-            # Original mask shape: (B, T) where T=862
-            # Target mask shape: (B, T*2, F') where T*2=1724
-            mask_float = mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            upsampled_mask = F.interpolate(
+            # Downsample original_mask to match target_time_dim (T/2)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            downsampled_mask = F.interpolate(
                 mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time*2)
+                size=(1, target_time_dim), # Target shape (1, Time/2)
                 mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T*2)
-
-            # Expand upsampled mask to match mel_target frequency dimension (F')
-            mask = upsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T*2, F')
-            
+            ).squeeze(1).squeeze(1) # Back to (B, T/2)
+            # Expand mask to match mel_target shape (B, T/2, F')
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/2, F')
         else:
-            # Full resolution for final stage
-            mel_target = mel_specs
-            # Expand mask to match mel_target shape (B, T, F)
-            mask = mask.unsqueeze(2).expand(-1, -1, mel_specs.shape[2]) # Expand to (B, T, F)
-        
+            # Stage 3: Full frequency resolution, but DOWNsampled time
+            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
+            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
+            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
+
+            mel_target = F.interpolate(
+                mel_specs_4d,
+                size=(c, target_time_dim), # Target shape (Freq_full, Time/2)
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1) # Back to (B, F_full, T/2)
+            mel_target = mel_target.permute(0, 2, 1) # Back to (B, T/2, F_full)
+
+            # Downsample original_mask to match target_time_dim (T/2)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            downsampled_mask = F.interpolate(
+                mask_float,
+                size=(1, target_time_dim), # Target shape (1, Time/2)
+                mode='nearest'
+            ).squeeze(1).squeeze(1) # Back to (B, T/2)
+            # Expand mask to match mel_target shape (B, T/2, F_full)
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c) # Expand to (B, T/2, F_full)
         # Handle dimensionality issues
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
             mel_pred = mel_pred.squeeze(1)
@@ -234,11 +253,20 @@ class ProgressiveSVS(pl.LightningModule):
         unvoiced_weight = 2.0 # Weight for unvoiced frames
         # Ensure voiced_mask has shape (B, T) before unsqueezing
         if voiced_mask.dim() == 3 and voiced_mask.shape[-1] == 1:
-             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T)
-        # Create weights: shape (B, T, 1), broadcastable to (B, T, F)
-        loss_weights = torch.where(voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
-        loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
+             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T_original)
 
+        # Downsample voiced_mask to match target time dimension (T/2)
+        voiced_mask_float = voiced_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T_original)
+        downsampled_voiced_mask = F.interpolate(
+            voiced_mask_float,
+            size=(1, target_time_dim), # Target shape (1, Time/2)
+            mode='nearest' # Use nearest to keep boolean-like nature
+        ).squeeze(1).squeeze(1) # Back to (B, T/2)
+        downsampled_voiced_mask = downsampled_voiced_mask > 0.5 # Convert back to boolean-like (0. or 1.)
+
+        # Create weights: shape (B, T/2, 1), broadcastable to (B, T/2, F)
+        loss_weights = torch.where(downsampled_voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
+        loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
         # Apply length mask and loss weights
         # mask has shape (B, T, F)
         weighted_loss = loss_elementwise * mask.float() * loss_weights
@@ -265,9 +293,11 @@ class ProgressiveSVS(pl.LightningModule):
         # Forward pass
         mel_pred = self(f0, phone_label, phone_duration, midi_label, unvoiced_flag)
         
-        # Create masks for variable length
-        max_len = mel_specs.shape[1] # Use time dimension (dim 1)
-        mask = torch.arange(max_len, device=lengths.device).expand(len(lengths), max_len) < lengths.unsqueeze(1)
+        # Create masks for variable length based on ORIGINAL time dimension
+        original_max_len = mel_specs.shape[1] # Use time dimension (dim 1), e.g., 862
+        original_mask = torch.arange(original_max_len, device=lengths.device).expand(len(lengths), original_max_len) < lengths.unsqueeze(1)
+        # Target time dimension after downsampling
+        target_time_dim = original_max_len // 2
         
         # Adjust target resolution based on current stage
         if self.current_stage == 1:
@@ -276,24 +306,29 @@ class ProgressiveSVS(pl.LightningModule):
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
             # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # Correct unpacking
+            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
             mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
             mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
 
-            # Downsample keeping original time dimension (t)
+            # Downsample BOTH frequency and time
             mel_target = F.interpolate(
                 mel_specs_4d,
-                size=(freq_dim, t), # Target shape (Freq, Time)
+                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/2)
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to (B, F', T)
+            ).squeeze(1)  # Back to (B, F', T/2)
 
             # Permute back to (B, T, F')
             mel_target = mel_target.permute(0, 2, 1)
-            
-            # Resize mask to match new frequency dimension
-            # Expand mask to match mel_target shape (B, T, F')
-            mask = mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T, F')
+            # Downsample original_mask to match target_time_dim (T/2)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            downsampled_mask = F.interpolate(
+                mask_float,
+                size=(1, target_time_dim), # Target shape (1, Time/2)
+                mode='nearest'
+            ).squeeze(1).squeeze(1) # Back to (B, T/2)
+            # Expand mask to match mel_target shape (B, T/2, F')
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/2, F')
             
         elif self.current_stage == 2:
             # Downsample ground truth for mid-res stage
@@ -301,41 +336,53 @@ class ProgressiveSVS(pl.LightningModule):
             freq_dim = int(self.config['model']['mel_bins'] * scale_factor)
             
             # Reshape to [B, 1, F, T] for 2D interpolation (F=Freq, T=Time)
-            b, t, c = mel_specs.shape # Correct unpacking
+            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
             mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
             mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
 
-            # Upsample time dimension by factor of 2 (assuming 862*2=1724)
-            target_time_dim = t * 2
+            # Downsample BOTH frequency and time (target_time_dim = t // 2)
             mel_target = F.interpolate(
                 mel_specs_4d,
-                size=(freq_dim, target_time_dim), # Target shape (Freq, Time * 2)
+                size=(freq_dim, target_time_dim), # Target shape (Freq', Time/2)
                 mode='bilinear',
                 align_corners=False
-            ).squeeze(1)  # Back to (B, F', T*2)
+            ).squeeze(1)  # Back to (B, F', T/2)
 
             # Permute back to (B, T, F')
             mel_target = mel_target.permute(0, 2, 1)
-            
-            # Upsample mask along time dimension to match target_time_dim (T*2)
-            # Original mask shape: (B, T) where T=862
-            # Target mask shape: (B, T*2, F') where T*2=1724
-            mask_float = mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
-            upsampled_mask = F.interpolate(
+            # Downsample original_mask to match target_time_dim (T/2)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            downsampled_mask = F.interpolate(
                 mask_float,
-                size=(1, target_time_dim), # Target shape (1, Time*2)
+                size=(1, target_time_dim), # Target shape (1, Time/2)
                 mode='nearest'
-            ).squeeze(1).squeeze(1) # Back to (B, T*2)
-
-            # Expand upsampled mask to match mel_target frequency dimension (F')
-            mask = upsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T*2, F')
+            ).squeeze(1).squeeze(1) # Back to (B, T/2)
+            # Expand mask to match mel_target shape (B, T/2, F')
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/2, F')
             
         else:
-            # Full resolution for final stage
-            mel_target = mel_specs
-            # Expand mask to match mel_target shape (B, T, F)
-            mask = mask.unsqueeze(2).expand(-1, -1, mel_specs.shape[2]) # Expand to (B, T, F)
-        
+            # Stage 3: Full frequency resolution, but DOWNsampled time
+            b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
+            mel_specs_permuted = mel_specs.permute(0, 2, 1) # Shape (B, F, T)
+            mel_specs_4d = mel_specs_permuted.unsqueeze(1) # Shape (B, 1, F, T)
+
+            mel_target = F.interpolate(
+                mel_specs_4d,
+                size=(c, target_time_dim), # Target shape (Freq_full, Time/2)
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1) # Back to (B, F_full, T/2)
+            mel_target = mel_target.permute(0, 2, 1) # Back to (B, T/2, F_full)
+
+            # Downsample original_mask to match target_time_dim (T/2)
+            mask_float = original_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T)
+            downsampled_mask = F.interpolate(
+                mask_float,
+                size=(1, target_time_dim), # Target shape (1, Time/2)
+                mode='nearest'
+            ).squeeze(1).squeeze(1) # Back to (B, T/2)
+            # Expand mask to match mel_target shape (B, T/2, F_full)
+            mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c) # Expand to (B, T/2, F_full)
         # Handle dimensionality issues
         if mel_pred.dim() == 4 and mel_pred.size(1) == 1:
             mel_pred = mel_pred.squeeze(1) # Shape becomes [B, F, T_pred]
@@ -355,9 +402,19 @@ class ProgressiveSVS(pl.LightningModule):
         unvoiced_weight = 2.0 # Weight for unvoiced frames (same as training)
         # Ensure voiced_mask has shape (B, T) before unsqueezing
         if voiced_mask.dim() == 3 and voiced_mask.shape[-1] == 1:
-             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T)
-        # Create weights: shape (B, T, 1), broadcastable to (B, T, F)
-        loss_weights = torch.where(voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
+             voiced_mask = voiced_mask.squeeze(-1) # Make it (B, T_original)
+
+        # Downsample voiced_mask to match target time dimension (T/2)
+        voiced_mask_float = voiced_mask.float().unsqueeze(1).unsqueeze(1) # Shape (B, 1, 1, T_original)
+        downsampled_voiced_mask = F.interpolate(
+            voiced_mask_float,
+            size=(1, target_time_dim), # Target shape (1, Time/2)
+            mode='nearest' # Use nearest to keep boolean-like nature
+        ).squeeze(1).squeeze(1) # Back to (B, T/2)
+        downsampled_voiced_mask = downsampled_voiced_mask > 0.5 # Convert back to boolean-like (0. or 1.)
+
+        # Create weights: shape (B, T/2, 1), broadcastable to (B, T/2, F)
+        loss_weights = torch.where(downsampled_voiced_mask.unsqueeze(-1), 1.0, unvoiced_weight)
         loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
 
         # Apply length mask and loss weights
@@ -373,10 +430,12 @@ class ProgressiveSVS(pl.LightningModule):
         # Visualize first sample in batch at appropriate intervals
         if batch_idx == 0 and self.current_epoch % 5 == 0:
             # Get the actual length
-            length = lengths[0].item()
+            length = lengths[0].item() # Original length, e.g., 862
+            # Adjust length for downsampled time dimension
+            downsampled_length = length // 2 # e.g., 431
             self._log_mel_comparison(
-                mel_pred[0, :, :length].detach().cpu(), 
-                mel_target[0, :, :length].detach().cpu()
+                mel_pred[0, :downsampled_length, :].detach().cpu(),
+                mel_target[0, :downsampled_length, :].detach().cpu()
             )
         
         return loss
