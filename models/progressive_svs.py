@@ -195,6 +195,7 @@ class ProgressiveSVS(pl.LightningModule):
         target_time_dim = original_max_len // self.downsample_stride # Use stored stride
 
         # Adjust target resolution based on current stage
+        freq_weights_tensor = None # Initialize frequency weights
         if self.current_stage == 1:
             # Downsample ground truth for low-res stage
             scale_factor = 1/self.config['model']['low_res_scale']
@@ -255,6 +256,11 @@ class ProgressiveSVS(pl.LightningModule):
             ).squeeze(1).squeeze(1) # Back to (B, T/stride)
             # Expand mask to match mel_target shape (B, T/stride, F')
             mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/stride, F')
+            # --- Define Frequency Weights for Stage 2 ---
+            freq_weights = torch.linspace(1.0, 2.0, freq_dim, device=self.device)
+            # Reshape for broadcasting: [F] -> [1, 1, F]
+            freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
+            # --- End Frequency Weights ---
         else: # Stage 3
             # Stage 3: Full frequency resolution, but DOWNsampled time
             b, t, c = mel_specs.shape # t is original time dim (e.g., 862)
@@ -278,6 +284,12 @@ class ProgressiveSVS(pl.LightningModule):
             ).squeeze(1).squeeze(1) # Back to (B, T/stride)
             # Expand mask to match mel_target shape (B, T/stride, F_full)
             mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c) # Expand to (B, T/stride, F_full)
+            # --- Define Frequency Weights for Stage 3 ---
+            # Note: c is the full frequency dimension here
+            freq_weights = torch.linspace(1.0, 2.0, c, device=self.device)
+            # Reshape for broadcasting: [F] -> [1, 1, F]
+            freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
+            # --- End Frequency Weights ---
 
         # Handle dimensionality issues if mel_pred shape is unexpected
         if mel_pred.dim() != mel_target.dim():
@@ -320,11 +332,14 @@ class ProgressiveSVS(pl.LightningModule):
         loss_weights = loss_weights.to(loss_elementwise.device) # Ensure same device
         # Apply length mask and loss weights
         # mask has shape (B, T/stride, F)
-        weighted_loss = loss_elementwise * mask.float() * loss_weights
+        # Apply frequency weights if defined (for stages 2 and 3)
+        if freq_weights_tensor is not None:
+            weighted_loss = loss_elementwise * mask.float() * loss_weights * freq_weights_tensor
+            total_weight_sum = (mask.float() * loss_weights * freq_weights_tensor).sum()
+        else: # Stage 1 (no frequency weighting)
+            weighted_loss = loss_elementwise * mask.float() * loss_weights
+            total_weight_sum = (mask.float() * loss_weights).sum()
 
-        # Normalize by the sum of applied weights within the mask
-        # This keeps the loss magnitude somewhat consistent
-        total_weight_sum = (mask.float() * loss_weights).sum()
         loss = weighted_loss.sum() / total_weight_sum.clamp(min=1e-8)
         # --- End Weighted Loss ---
 
@@ -351,6 +366,7 @@ class ProgressiveSVS(pl.LightningModule):
         target_time_dim = original_max_len // self.downsample_stride # Use stored stride
 
         # Adjust target resolution based on current stage
+        freq_weights_tensor = None # Initialize frequency weights
         if self.current_stage == 1:
             # Downsample ground truth for low-res stage
             scale_factor = 1/self.config['model']['low_res_scale']
@@ -410,6 +426,11 @@ class ProgressiveSVS(pl.LightningModule):
             ).squeeze(1).squeeze(1) # Back to (B, T/stride)
             # Expand mask to match mel_target shape (B, T/stride, F')
             mask = downsampled_mask.unsqueeze(2).expand(-1, -1, freq_dim) # Expand to (B, T/stride, F')
+            # --- Define Frequency Weights for Stage 2 ---
+            freq_weights = torch.linspace(1.0, 2.0, freq_dim, device=self.device)
+            # Reshape for broadcasting: [F] -> [1, 1, F]
+            freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
+            # --- End Frequency Weights ---
 
         else: # Stage 3
             # Stage 3: Full frequency resolution, but DOWNsampled time
@@ -434,6 +455,12 @@ class ProgressiveSVS(pl.LightningModule):
             ).squeeze(1).squeeze(1) # Back to (B, T/stride)
             # Expand mask to match mel_target shape (B, T/stride, F_full)
             mask = downsampled_mask.unsqueeze(2).expand(-1, -1, c) # Expand to (B, T/stride, F_full)
+            # --- Define Frequency Weights for Stage 3 ---
+            # Note: c is the full frequency dimension here
+            freq_weights = torch.linspace(1.0, 2.0, c, device=self.device)
+            # Reshape for broadcasting: [F] -> [1, 1, F]
+            freq_weights_tensor = freq_weights.unsqueeze(0).unsqueeze(0)
+            # --- End Frequency Weights ---
 
         # Handle dimensionality issues if mel_pred shape is unexpected
         if mel_pred.dim() != mel_target.dim():
@@ -478,10 +505,14 @@ class ProgressiveSVS(pl.LightningModule):
 
         # Apply length mask and loss weights
         # mask has shape (B, T/stride, F)
-        weighted_loss = loss_elementwise * mask.float() * loss_weights
+        # Apply frequency weights if defined (for stages 2 and 3)
+        if freq_weights_tensor is not None:
+            weighted_loss = loss_elementwise * mask.float() * loss_weights * freq_weights_tensor
+            total_weight_sum = (mask.float() * loss_weights * freq_weights_tensor).sum()
+        else: # Stage 1 (no frequency weighting)
+            weighted_loss = loss_elementwise * mask.float() * loss_weights
+            total_weight_sum = (mask.float() * loss_weights).sum()
 
-        # Normalize by the sum of applied weights within the mask
-        total_weight_sum = (mask.float() * loss_weights).sum()
         loss = weighted_loss.sum() / total_weight_sum.clamp(min=1e-8)
         # --- End Weighted Loss ---
         self.log('val_loss', loss, prog_bar=True)
