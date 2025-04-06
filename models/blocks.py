@@ -163,33 +163,69 @@ class LowResModel(nn.Module):
         # Permute output from (B, F', T_downsampled) to (B, T_downsampled, F')
         # Ensure LowResModel only returns the spectrogram
         return x.permute(0, 2, 1)
+# New ModulatedConvBlock2D class definition
+class ModulatedConvBlock2D(nn.Module):
+    def __init__(self, in_channels, out_channels, conditioning_dim, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        # Use Conv1d to generate modulation params per time step from conditioning input
+        self.modulation_conv = nn.Conv1d(conditioning_dim, out_channels * 2, kernel_size=1)
 
+    def forward(self, x, cond):
+        # x shape: [B, C_in, F, T]
+        # cond shape: [B, cond_dim, T]
+
+        # Standard convolution path
+        h = self.conv(x)
+        h = self.bn(h) # Apply BN before modulation
+
+        # Generate modulation parameters (gamma, beta)
+        mod_params = self.modulation_conv(cond) # Shape: [B, 2 * out_channels, T]
+        gamma, beta = torch.chunk(mod_params, 2, dim=1) # Each: [B, out_channels, T]
+
+        # Expand gamma and beta for broadcasting with h's shape [B, C_out, F, T]
+        # Add frequency dimension: [B, out_channels, 1, T]
+        gamma = gamma.unsqueeze(2)
+        beta = beta.unsqueeze(2)
+
+        # Apply modulation (FiLM-like)
+        h = gamma * h + beta
+
+        # Apply activation
+        h = self.relu(h)
+        return h
+
+
+# Modify MidResUpsampler
 class MidResUpsampler(nn.Module):
     # Updated __init__ to accept embedding dimensions and stride
     def __init__(self, input_dim, channels_list, output_dim,
                  f0_embed_dim, phone_embed_dim, midi_embed_dim, unvoiced_embed_dim,
                  downsample_stride=2):
         super().__init__()
-        
+
         # Store stride and calculate total embedding dimension
         self.downsample_stride = downsample_stride
         self.total_embed_dim = f0_embed_dim + phone_embed_dim + midi_embed_dim + unvoiced_embed_dim
 
-        # Upsample only frequency dimension (dim 2), preserve time (dim 3)
-        # Input shape expected by Upsample: [B, C, F, T]
-        self.upsample = nn.Upsample(scale_factor=(2, 1), mode='bilinear', align_corners=False)
+        # Learnable Upsampling for frequency dimension (dim 2), preserve time (dim 3)
+        self.upsample_conv = nn.ConvTranspose2d(in_channels=1, out_channels=1, kernel_size=(4, 1), stride=(2, 1), padding=(1, 0))
 
-        # First ConvBlock adapts from (1 + total_embed_dim) channels to channels_list[0]
-        self.initial_conv = ConvBlock2D(1 + self.total_embed_dim, channels_list[0])
-        
+        # Use ModulatedConvBlock2D for initial conv
+        # Input is upsampled spec (1 channel), output is channels_list[0]
+        self.initial_conv = ModulatedConvBlock2D(1, channels_list[0], self.total_embed_dim)
+
+        # Use ModulatedConvBlock2D for subsequent blocks
         self.blocks = nn.ModuleList()
         for i in range(len(channels_list) - 1):
-            self.blocks.append(ConvBlock2D(channels_list[i], channels_list[i+1]))
-            
-        # Final projection back to 1 channel, preserving F and T dimensions
+            self.blocks.append(ModulatedConvBlock2D(channels_list[i], channels_list[i+1], self.total_embed_dim))
+
+        # Final projection back to 1 channel (standard Conv2D)
         self.output_proj = nn.Conv2d(channels_list[-1], 1, kernel_size=1)
         
-    # Updated forward to accept original embeddings
+    # Updated forward for modulation
     def forward(self, x, f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig):
         # x shape: [B, T_downsampled, F_in] (Output from LowResModel)
         # Embeddings shape: [B, T_orig, Dim]
@@ -199,34 +235,32 @@ class MidResUpsampler(nn.Module):
         x = x.permute(0, 2, 1)
         # Unsqueeze x to [B, 1, F_in, T_downsampled] for 2D operations
         x = x.unsqueeze(1)
-        # Upsample Frequency: [B, 1, F_in, T_downsampled] -> [B, 1, F_mid, T_downsampled]
-        x_upsampled = self.upsample(x)
+        # Learnable Upsampling (Frequency): [B, 1, F_in, T_downsampled] -> [B, 1, F_mid, T_downsampled]
+        x_upsampled = self.upsample_conv(x)
 
         # --- Process Embeddings ---
         # Concatenate original embeddings along feature dim: [B, T_orig, TotalDim]
         all_embeddings_orig = torch.cat((f0_enc_orig, phone_enc_orig, midi_enc_orig, unvoiced_enc_orig), dim=2)
-        # Permute for 1D pooling: [B, TotalDim, T_orig]
+        # Permute for 1D pooling/conv: [B, TotalDim, T_orig]
         all_embeddings_orig_permuted = all_embeddings_orig.permute(0, 2, 1)
         # Downsample time dimension if needed: [B, TotalDim, T_downsampled]
         if self.downsample_stride > 1:
+            # Use avg_pool1d for downsampling conditioning signal
             all_embeddings_downsampled = F.avg_pool1d(all_embeddings_orig_permuted,
                                                       kernel_size=self.downsample_stride,
                                                       stride=self.downsample_stride)
         else:
             all_embeddings_downsampled = all_embeddings_orig_permuted
-        # Expand frequency dimension to match x_upsampled: [B, TotalDim, F_mid, T_downsampled]
-        target_freq_dim = x_upsampled.shape[2]
-        expanded_embeddings = all_embeddings_downsampled.unsqueeze(2).expand(-1, -1, target_freq_dim, -1)
+        # all_embeddings_downsampled shape: [B, TotalDim, T_downsampled]
 
-        # --- Concatenate and Convolve ---
-        # Concatenate along channel dim: [B, 1 + TotalDim, F_mid, T_downsampled]
-        concat_features = torch.cat((x_upsampled, expanded_embeddings), dim=1)
-        # Initial convolution: [B, 1 + TotalDim, F_mid, T] -> [B, C0, F_mid, T]
-        x = self.initial_conv(concat_features)
-        
-        # Conv blocks: [B, C0, F, T] -> [B, Clast, F, T]
+        # --- Modulated Convolutions ---
+        # Initial modulated convolution
+        # Input: x_upsampled [B, 1, F_mid, T], Cond: all_embeddings_downsampled [B, TotalDim, T]
+        x = self.initial_conv(x_upsampled, all_embeddings_downsampled)
+
+        # Subsequent modulated convolution blocks
         for block in self.blocks:
-            x = block(x)
+            x = block(x, all_embeddings_downsampled)
             
         # Output projection: [B, Clast, F, T] -> [B, 1, F_mid, T]
         x = self.output_proj(x)
