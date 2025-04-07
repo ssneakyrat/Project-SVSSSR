@@ -140,7 +140,7 @@ train:
     
   # --- Vocoder Logging ---
   log_vocoder_audio_epoch_interval: 5 # Log audio every N validation epochs
-  log_n_vocoder_audio_samples: 2      # Number of audio samples to log from validation batch
+  log_n_vocoder_audio_samples: 1      # Number of audio samples to log from validation batch
   log_vocoder_spectrograms: true      # Whether to log spectrogram comparison plots
-  vocoder_learning_rate: 0.0001       # Learning rate for vocoder training
+  vocoder_learning_rate: 0.0001 #0.0001       # Learning rate for vocoder training
   # --- End Vocoder Params ---

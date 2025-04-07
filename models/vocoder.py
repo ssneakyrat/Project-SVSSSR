@@ -783,7 +783,7 @@ class VocoderModel(pl.LightningModule):
                 # Safety check for [-1, 1] range
                 audio = np.clip(audio, -1.0, 1.0)
                 
-                logger.info(f"Converted audio from {original_dtype} {original_range} to float32 [{audio.min()}, {audio.max()}]")
+                #logger.info(f"Converted audio from {original_dtype} {original_range} to float32 [{audio.min()}, {audio.max()}]")
             else:
                 # If not numpy array, convert explicitly
                 audio = np.array(audio, dtype=np.float32)
