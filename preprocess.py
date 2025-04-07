@@ -448,7 +448,8 @@ def preprocess_data(config_path='config/model.yaml'):
     first_file_data_for_vis = None # Store unnormalized data for the first valid file
 
     target_frames = math.ceil(audio_config['max_audio_length'] * audio_config['sample_rate'] / audio_config['hop_length'])
-    logger.info(f"Target frames per file: %d", target_frames)
+    target_samples = target_frames * audio_config['hop_length'] # Calculate target samples for audio
+    logger.info(f"Target frames per file: %d, Target samples: %d", target_frames, target_samples)
 
     for pair in tqdm(file_pairs, desc="Pass 2: Processing & Normalizing"):
         base_filename = pair['id']
@@ -469,6 +470,14 @@ def preprocess_data(config_path='config/model.yaml'):
 
         original_mel_frames = log_mel.shape[0] # Frames before padding/truncation
 
+        # 1.5 Load Raw Audio
+        try:
+            raw_audio, _ = librosa.load(wav_path, sr=audio_config['sample_rate'])
+            raw_audio = raw_audio.astype(np.float32) # Ensure float32 for consistency
+        except Exception as e:
+            logger.error(f"Error loading raw audio for {wav_path}: {e}. Skipping file.")
+            continue
+
         # 2. Normalize features
         norm_log_mel = (log_mel - mel_mean) / mel_std
         norm_log_f0 = np.zeros_like(log_f0) # Initialize with zeros (unvoiced)
@@ -485,6 +494,8 @@ def preprocess_data(config_path='config/model.yaml'):
         # Create and pad unvoiced flag (1 for unvoiced, 0 for voiced)
         unvoiced_flag = (~voiced_mask).astype(np.uint8)
         padded_unvoiced_flag = pad_or_truncate(unvoiced_flag, target_frames, pad_value=0)
+        # Pad/Truncate RAW AUDIO to target_samples
+        padded_raw_audio = pad_or_truncate(raw_audio, target_samples, pad_value=0.0)
 
         # 4. Parse Labels (get timestamps and phones)
         lab_entries, unique_phones_in_file, max_end_time = parse_lab_file(lab_path)
@@ -589,7 +600,8 @@ def preprocess_data(config_path='config/model.yaml'):
             'initial_duration_sequence': np.array(initial_durations, dtype=np.int32), # Keep for potential analysis/vis
             'voiced_mask': padded_voiced_mask, # Store padded voiced mask (as uint8)
             'unvoiced_flag': padded_unvoiced_flag, # Store padded unvoiced flag (as uint8)
-            'original_unpadded_length': original_mel_frames # Store the original length
+            'original_unpadded_length': original_mel_frames, # Store the original length
+            'raw_audio': padded_raw_audio # Store padded/truncated raw audio
         }
 
         # Store unnormalized data for the *first* successfully processed file for visualization
@@ -645,70 +657,72 @@ def preprocess_data(config_path='config/model.yaml'):
             for base_filename, data in tqdm(processed_data.items(), desc="Saving to HDF5"):
                 group = f.create_group(base_filename)
                 # Convert phone sequence to IDs
-                phone_sequence = data['phone_sequence']
-                duration_sequence = data['duration_sequence']
+                phone_sequence = data.get('phone_sequence') # Use .get for safety
+                duration_sequence = data.get('duration_sequence') # Use .get for safety
 
-                # --- Add Assertion ---
+                # --- Add Assertion & ID Conversion ---
+                if phone_sequence is None or duration_sequence is None:
+                    logging.error(f"Missing phone_sequence or duration_sequence for {base_filename}. Skipping.")
+                    continue
                 if len(phone_sequence) != len(duration_sequence):
                      logging.error(f"ASSERTION FAILED for {base_filename}: len(phone_sequence)={len(phone_sequence)} != len(duration_sequence)={len(duration_sequence)}")
                      # Skip this file if lengths don't match to avoid saving bad data
                      continue
 
                 phone_sequence_ids = np.array([phone_to_id[p] for p in phone_sequence], dtype=np.int32)
+                # Save the phone sequence IDs (phoneme-level)
+                group.create_dataset('phone_sequence_ids', data=phone_sequence_ids)
 
-                # Create frame-level phone IDs from adjusted durations
-                # Use the validated duration_sequence variable here
-                frame_level_phone_ids = np.repeat(phone_sequence_ids, duration_sequence)
-                # Ensure final length is exactly target_frames
-                if len(frame_level_phone_ids) != target_frames:
-                     logging.warning(f"Frame-level phone ID length mismatch for {base_filename}. Got {len(frame_level_phone_ids)}, expected {target_frames}. Clamping.")
-                     frame_level_phone_ids = pad_or_truncate(frame_level_phone_ids, target_frames, pad_value=phone_to_id["<PAD>"])
+                # --- Define mapping from internal keys to HDF5 dataset names ---
+                internal_key_to_hdf5_name = {
+                    'mel': data_config.get('mel_key', 'mel'),
+                    'f0': data_config.get('f0_key', 'f0'),
+                    'duration_sequence': data_config.get('duration_key', 'duration_sequence'),
+                    'midi_pitch_estimated': data_config.get('midi_pitch_key', 'midi_pitch_estimated'),
+                    'raw_audio': data_config.get('raw_audio_key', 'raw_audio'),
+                    'voiced_mask': 'voiced_mask', # Assuming internal key matches desired HDF5 name
+                    'unvoiced_flag': 'unvoiced_flag', # Assuming internal key matches desired HDF5 name
+                    'initial_duration_sequence': 'initial_duration_sequence', # Assuming internal key matches desired HDF5 name
+                    'original_unpadded_length': 'original_unpadded_length', # Assuming internal key matches desired HDF5 name
+                }
 
+                # --- Save all other data items using mapped names ---
+                for key, value in data.items():
+                    # Skip phone_sequence as we saved phone_sequence_ids instead
+                    if key == 'phone_sequence':
+                        continue
+                    try:
+                        # Ensure value is suitable for saving
+                        if isinstance(value, (np.ndarray, list, int, float)):
+                            # Get the target HDF5 dataset name from the map
+                            hdf5_dataset_name = internal_key_to_hdf5_name.get(key)
+                            if hdf5_dataset_name: # Only save if key is in our map
+                                group.create_dataset(hdf5_dataset_name, data=value)
+                            # else: # Optional: Warn if a key in data isn't in our map
+                            #    logging.warning(f"Key '{key}' found in processed data but not in internal_key_to_hdf5_name map for {base_filename}. Skipping save.")
+                        else:
+                            logging.warning(f"Skipping key '{key}' for {base_filename}: Unsupported data type {type(value)}")
+                    except Exception as e:
+                        logging.error(f"Error saving key '{key}' (mapped to '{hdf5_dataset_name}') for {base_filename}: {e}")
 
-                # Save datasets (using keys from config)
-                logging.debug(f"Attempting to create dataset '{data_config['mel_key']}' in group '{base_filename}'")
-                group.create_dataset(data_config['mel_key'], data=data['mel'], compression="gzip") # Normalized mel
-
-                logging.debug(f"Attempting to create dataset '{data_config['f0_key']}' in group '{base_filename}'")
-                group.create_dataset(data_config['f0_key'], data=data['f0'], compression="gzip")   # Normalized f0
-
-                logging.debug(f"Attempting to create dataset '{data_config['phoneme_key']}' in group '{base_filename}'")
-                group.create_dataset(data_config['phoneme_key'], data=frame_level_phone_ids, compression="gzip") # Frame-level IDs
-
-                logging.debug(f"Attempting to create dataset '{data_config['duration_key']}' in group '{base_filename}'")
-                # Use the validated duration_sequence variable here
-                group.create_dataset(data_config['duration_key'], data=duration_sequence, compression="gzip") # Adjusted durations per phone
-
-                logging.debug(f"Attempting to create dataset 'phone_sequence_ids' in group '{base_filename}'") # Renamed hardcoded name
-                group.create_dataset('phone_sequence_ids', data=phone_sequence_ids, compression="gzip") # IDs corresponding to durations
-                # group.create_dataset('initial_duration_sequence', data=data['initial_duration_sequence'], compression="gzip") # Optional: Save initial durations
-                if 'midi_pitch_estimated' in data:
-                     logging.debug(f"Attempting to create dataset 'midi_pitch_estimated' in group '{base_filename}'")
-                     group.create_dataset('midi_pitch_estimated', data=data['midi_pitch_estimated'], compression="gzip")
+                # --- Calculate and Save Frame-Level Phone IDs (using the key from config) ---
+                # This happens *after* the loop saving other keys from the data dict
+                if 'duration_sequence' in data:
+                    try:
+                        # Use the duration sequence already saved in the HDF5 group by the loop above
+                        # Or retrieve from data dict again if needed: duration_sequence_val = data['duration_sequence']
+                        frame_level_phone_ids = np.repeat(phone_sequence_ids, data['duration_sequence'])
+                        # Ensure final length is exactly target_frames
+                        if len(frame_level_phone_ids) != target_frames:
+                            logging.warning(f"Frame-level phone ID length mismatch for {base_filename}. Got {len(frame_level_phone_ids)}, expected {target_frames}. Clamping.")
+                            frame_level_phone_ids = pad_or_truncate(frame_level_phone_ids, target_frames, pad_value=phone_to_id["<PAD>"])
+                        # Save using the key specified in the config
+                        group.create_dataset(data_config['phoneme_key'], data=frame_level_phone_ids, compression="gzip")
+                    except Exception as e:
+                        logging.error(f"Error creating/saving frame-level phone IDs ('{data_config['phoneme_key']}') for {base_filename}: {e}")
                 else:
-                     logging.warning(f"Key 'midi_pitch_estimated' not found in processed_data for {base_filename} during HDF5 saving.")
-
-                # Save voiced mask
-                if 'voiced_mask' in data:
-                    logging.debug(f"Attempting to create dataset 'voiced_mask' in group '{base_filename}'")
-                    group.create_dataset('voiced_mask', data=data['voiced_mask'], compression="gzip") # Save as uint8
-                else:
-                    logging.warning(f"Key 'voiced_mask' not found in processed_data for {base_filename} during HDF5 saving.")
-
-                # Save unvoiced flag
-                if 'unvoiced_flag' in data:
-                    logging.debug(f"Attempting to create dataset 'unvoiced_flag' in group '{base_filename}'")
-                    group.create_dataset('unvoiced_flag', data=data['unvoiced_flag'], compression="gzip") # Save as uint8
-                else:
-                    logging.warning(f"Key 'unvoiced_flag' not found in processed_data for {base_filename} during HDF5 saving.")
-
-                # Save original unpadded length (correctly indented)
-                if 'original_unpadded_length' in data:
-                    logging.debug(f"Attempting to create dataset 'original_unpadded_length' in group '{base_filename}'")
-                    group.create_dataset('original_unpadded_length', data=data['original_unpadded_length'], dtype='i4') # Save as integer
-                else:
-                    # This warning should ideally not trigger if the previous step worked
-                    logging.warning(f"Key 'original_unpadded_length' not found in processed_data for {base_filename} during HDF5 saving.")
+                     logging.error(f"Cannot create frame-level phone IDs for {base_filename} as 'duration_sequence' is missing from processed data.")
+                # End of the main loop for base_filename, data in processed_data.items()
 
         logging.info("HDF5 file saved successfully.")
 

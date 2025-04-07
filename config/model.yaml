@@ -1,4 +1,3 @@
-# config/model.yaml
 
 data:
   bin_dir: datasets
@@ -14,6 +13,7 @@ data:
   sample_percentage: null
   variable_length: true
   min_phones_in_lab: 5 # Minimum number of phone entries required in a .lab file to process it
+  raw_audio_key: raw_audio # Key for the raw audio waveform (NEW)
 
 audio:
   sample_rate: 22050
@@ -61,6 +61,30 @@ model:
   # Initial training stage (1, 2, or 3)
   current_stage: 1
 
+# Vocoder specific parameters (NEW)
+vocoder:
+  name: LightweightNSF
+  # Parameters for the source generation module
+  source_model:
+    hidden_dim: 256       # Hidden dimension for MLPs predicting source params (Increased from 128)
+    num_harmonics: 60     # Number of harmonics for sine synthesis (voiced)
+    noise_mlp_layers: 2   # Number of layers in MLP predicting noise shape/level
+    # Add other source params as needed (e.g., noise band definitions)
+    lstm_num_layers: 2    # Number of layers in the source predictor LSTM
+
+  # Parameters for the filter prediction module
+  filter_model:
+    hidden_dim: 256       # Hidden dimension for MLP predicting filter params (Increased from 128)
+    filter_type: "SimpleFIR" # Type of filter to predict (e.g., FIR gains, LPC) - Needs implementation
+    num_filter_bands: 30 # Example: Number of bands if using a filter bank approach (Increased from 30)
+    # Add other filter params as needed (e.g., LPC order)
+    lstm_num_layers: 2    # Number of layers in the filter predictor LSTM
+
+  # Parameters for the NEW Audio-Rate F0 Predictor
+  f0_predictor_audio_rate:
+    hidden_channels: 64 # Hidden channels in Conv1d layers
+    kernel_size: 3      # Kernel size for Conv1d layers
+
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
@@ -88,10 +112,24 @@ train:
   weight_decay: 0.0001    # Adam weight decay
   lr_factor: 0.5          # Factor by which the learning rate will be reduced (scheduler)
   lr_patience: 10         # Number of epochs with no improvement after which learning rate will be reduced (scheduler)
-  # gradient_clip_val: 1.0 # Optional: Gradient clipping value
+  gradient_clip_val: 0.5 # Optional: Gradient clipping value (Reduced from 1.0 for stability)
   freeze_loaded_weights: false # Default: Freeze weights when loading from ckpt
 
   # log_interval defines log_every_n_steps in Trainer
   log_interval: 50        # Log training metrics every N steps
 
-  # Removed: GAN specific params (lr_g, lr_d, betas, lambda_recon)
+  # --- Vocoder Training Specific Params (NEW) ---
+  vocoder_loss: 'MultiResolutionSTFT' # Type of loss function
+  stft_loss_fft_sizes: [1024, 2048, 512] # FFT sizes for MR-STFT loss
+  stft_loss_hop_sizes: [120, 240, 50]   # Hop sizes for MR-STFT loss
+  stft_loss_win_lengths: [600, 1200, 240] # Window lengths for MR-STFT loss
+  loss_lambda_sc: 0.5 # Weight for spectral convergence loss component (Reduced from 1.0)
+  loss_lambda_mag: 1.0 # Weight for log STFT magnitude loss component
+  loss_lambda_td: 1.0 # Weight for time-domain L1 loss component (NEW)
+  loss_lambda_f0: 0.5 # Weight for audio-rate F0 prediction loss (NEW)
+  vocoder_max_epochs: 100 # Maximum epochs for vocoder training (NEW)
+  log_vocoder_audio_epoch_interval: 1 # Log audio every N validation epochs (NEW)
+  log_n_vocoder_audio_samples: 1    # Number of audio samples to log from the first batch (NEW)
+  log_vocoder_spectrograms: true    # Whether to log spectrogram comparison plots (NEW)
+  vocoder_learning_rate: 0.0001  # Increased LR slightly (from 1e-5) to speed up convergence
+  # --- End Vocoder Training Specific Params ---

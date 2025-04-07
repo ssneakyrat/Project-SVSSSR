@@ -187,4 +187,8 @@ def setup_logging(level=logging.INFO, log_file=None):
         handlers.append(logging.FileHandler(log_file))
 
     logging.basicConfig(level=level, format=log_format, handlers=handlers)
+
+    # Set higher level for noisy libraries like matplotlib
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+
     logger.info(f"Logging configured. Level: {logging.getLevelName(level)}. File: {log_file}")

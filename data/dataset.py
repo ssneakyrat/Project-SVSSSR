@@ -277,10 +277,12 @@ def collate_fn_pad(batch):
     max_len = {} # Store max lengths for padding
     # Determine max lengths for frame-level and phoneme-level sequences
     frame_level_keys = ['mel', 'f0', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag'] # Add voiced_mask, unvoiced_flag
+    sample_level_keys = ['raw_audio'] # NEW: Keys that are sample-level (audio waveform)
     # 'phoneme' key holds frame-level IDs loaded from HDF5, remove it from here
     phoneme_level_keys = ['duration', 'phone_sequence_ids'] # Keys that are phoneme-level
     max_len_frame = 0
     max_len_phoneme = 0
+    max_len_sample = 0 # NEW: Max length for sample-level data
 
     # --- Determine Max Lengths ---
     # Calculate max frame length (e.g., mel, f0) across the batch
@@ -311,6 +313,14 @@ def collate_fn_pad(batch):
         if key in keys:
              max_len_phoneme = max(max_len_phoneme, max(item[key].shape[0] for item in batch))
 
+    # Calculate max sample length (e.g., raw_audio) across the batch
+    for key in sample_level_keys:
+        if key in keys:
+            # Ensure item[key] is not None and has shape before accessing shape[0]
+            valid_items = [item[key] for item in batch if item.get(key) is not None and hasattr(item.get(key), 'shape')]
+            if valid_items: # Check if there are any valid items for this key
+                max_len_sample = max(max_len_sample, max(item.shape[0] for item in valid_items))
+
     # Set target lengths for padding based on calculated maximums
     max_len['phone_label'] = max_len_frame # Expanded phonemes match frame length
     for key in frame_level_keys:
@@ -319,6 +329,9 @@ def collate_fn_pad(batch):
     for key in phoneme_level_keys:
         if key in keys:
             max_len[key] = max_len_phoneme
+    for key in sample_level_keys: # NEW: Set max length for sample-level keys
+        if key in keys:
+            max_len[key] = max_len_sample
 
     # Pad each item in the batch
     # Process each item in the batch: expand phonemes, pad sequences
@@ -366,8 +379,11 @@ def collate_fn_pad(batch):
         # --- Pad Original Loaded Data ---
         for key in keys: # Iterate through original keys loaded from HDF5
             data = item[key]
-            # Use shape[0] for time dimension length for frame-level keys
-            current_len = data.shape[0] if key in frame_level_keys else data.shape[0]
+            # Determine current length based on key type (frame, phoneme, or sample level)
+            if key in frame_level_keys or key in phoneme_level_keys or key in sample_level_keys:
+                current_len = data.shape[0]
+            else: # Should not happen if keys are categorized correctly
+                current_len = 0 # Or handle error
             target_len = max_len.get(key, current_len) # Use max_len calculated earlier
             # Determine pad value based on data type
             if key == 'voiced_mask':
@@ -376,8 +392,8 @@ def collate_fn_pad(batch):
                 pad_value = 0.0 # Pad float flag with 0.0
             elif key in ['phoneme', 'duration', 'midi_pitch_estimated']:
                 pad_value = 0 # Pad integer IDs with 0
-            else: # mel, f0
-                pad_value = 0.0 # Pad float features with 0.0
+            else: # mel, f0, raw_audio
+                pad_value = 0.0 # Pad float features (mel, f0, raw_audio) with 0.0
 
             # Pad sequence if its current length is less than the target max length
             if current_len < target_len:
@@ -400,6 +416,8 @@ def collate_fn_pad(batch):
                          padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value)
                 elif key in phoneme_level_keys: # Pad sequence dimension
                     padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value) # Pad 1D phoneme-level sequence
+                elif key in sample_level_keys: # NEW: Pad sample dimension (audio)
+                    padded_data = torch.nn.functional.pad(data, (0, padding_size), mode='constant', value=pad_value) # Pad 1D audio sequence
                 else: # Data doesn't need padding based on keys
                     padded_data = data
             # Truncate sequence if its current length exceeds the target max length
@@ -408,6 +426,8 @@ def collate_fn_pad(batch):
                       padded_data = data[:target_len, ...] # Truncate first dim (time)
                  elif key in phoneme_level_keys:
                       padded_data = data[:target_len] # Truncate first dim (sequence)
+                 elif key in sample_level_keys: # NEW: Truncate sample dimension (audio)
+                      padded_data = data[:target_len] # Truncate 1D audio sequence
                  else:
                       padded_data = data
             else: # No padding needed
@@ -428,7 +448,8 @@ def collate_fn_pad(batch):
         'phone_label': 'phone_label', # Keep expanded phoneme label key
         'duration': 'phone_duration', # Rename original duration key
         'voiced_mask': 'voiced_mask', # Keep voiced_mask key
-        'unvoiced_flag': 'unvoiced_flag' # Keep unvoiced_flag key
+        'unvoiced_flag': 'unvoiced_flag', # Keep unvoiced_flag key
+        'raw_audio': 'target_audio' # NEW: Rename raw_audio to target_audio
         # 'phoneme' key (original phoneme sequence) is not explicitly renamed/included
         # unless needed later.
     }
@@ -472,7 +493,8 @@ class DataModule(pl.LightningDataModule):
             'phone_sequence_ids': 'phone_sequence_ids', # Key for PHONEME-level IDs
             'midi_pitch_estimated': 'midi_pitch_estimated', # Key for estimated MIDI pitch
             'voiced_mask': 'voiced_mask', # Key for the voiced mask
-            'unvoiced_flag': 'unvoiced_flag' # Key for the unvoiced flag
+            'unvoiced_flag': 'unvoiced_flag', # Key for the unvoiced flag
+            'raw_audio': config['data']['raw_audio_key'] # Key for raw audio (NEW)
         }
         self.lazy_load = config['data'].get('lazy_load', True)
         self.max_samples = config['data'].get('max_samples', None)
