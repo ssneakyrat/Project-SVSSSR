@@ -96,7 +96,7 @@ train:
   
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
-  tensorboard_log_dir: tensorboard # Subdirectory for TensorBoard logs
+  tensorboard_log_dir: logs # Subdirectory for TensorBoard logs
   checkpoint_dir: checkpoints # Subdirectory for model checkpoints
   num_workers: 4        # DataLoader workers
   log_spectrogram_every_n_val_steps: 5 # Log spectrogram comparison every N validation steps

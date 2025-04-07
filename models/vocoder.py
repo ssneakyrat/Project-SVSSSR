@@ -334,20 +334,20 @@ class TinyWaveRNN(nn.Module):
         self.register_buffer('inv_ulaw_table', self._create_inv_ulaw_table())
         
     def _create_ulaw_table(self):
-        """Create lookup table for u-law encoding."""
-        table = torch.zeros(2**16)
-        mu = 255.0  # μ-law parameter
+        """Create the μ-law encoding table for audio quantization."""
+        x = np.linspace(-1.0, 1.0, self.bits)
+        mu = self.bits - 1
         
-        for i in range(2**16):
-            # Scale to [-1, 1]
-            x = 2 * (i / (2**16 - 1)) - 1
-            # Apply μ-law formula
-            y = torch.sign(torch.tensor(x)) * torch.log(1 + mu * torch.abs(torch.tensor(x))) / torch.log(1 + mu)
-            # Scale to [0, 255] and quantize for 8-bit representation
-            ulaw_val = ((y + 1) / 2 * 255).round()
-            table[i] = ulaw_val
-            
-        return table
+        # Convert to tensor before applying log
+        x_tensor = torch.tensor(x)
+        mu_tensor = torch.tensor(float(mu))
+        
+        # Fix: Ensure all values are tensors for PyTorch operations
+        y = torch.sign(x_tensor) * torch.log(1 + mu_tensor * torch.abs(x_tensor)) / torch.log(torch.tensor(1 + mu))
+        
+        # Scale to [0, bits-1]
+        y = ((y + 1) / 2 * (self.bits - 1)).round()
+        return y
     
     def _create_inv_ulaw_table(self):
         """Create lookup table for u-law decoding."""
