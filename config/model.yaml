@@ -1,11 +1,10 @@
-
 data:
   bin_dir: datasets
   bin_file: mel_spectrograms.h5
-  mel_key: mel_spectrogram # Key for target mel spectrograms (Updated based on preprocess.py)
-  phoneme_key: phone_sequence # Key for input phoneme sequences (Updated based on preprocess.py)
-  duration_key: adjusted_durations # Key for input duration sequences (Updated based on preprocess.py)
-  f0_key: f0_contour        # Key for input F0 sequences (Updated based on preprocess.py)
+  mel_key: mel_spectrogram # Key for target mel spectrograms 
+  phoneme_key: phone_sequence # Key for input phoneme sequences
+  duration_key: adjusted_durations # Key for input duration sequences
+  f0_key: f0_contour # Key for input F0 sequences
   midi_pitch_key: midi_pitch_estimated # Key for estimated MIDI pitch
   lazy_load: true
   raw_dir: datasets/gin
@@ -13,7 +12,7 @@ data:
   sample_percentage: null
   variable_length: true
   min_phones_in_lab: 5 # Minimum number of phone entries required in a .lab file to process it
-  raw_audio_key: raw_audio # Key for the raw audio waveform (NEW)
+  raw_audio_key: raw_audio # Key for the raw audio waveform
 
 audio:
   sample_rate: 22050
@@ -29,70 +28,71 @@ audio:
 
 # Model specific parameters
 model:
-  name: ProgressiveSVS # New model name
+  name: ProgressiveSVS # Upstream model name
   mel_bins: 80        # Shared: Output dimension (should match audio.n_mels)
   vocab_size: null    # Shared: Will be dynamically set from data
 
   # --- ProgressiveSVS Specific Parameters ---
-  # Embedding dimensions (Adjust as needed)
+  # Embedding dimensions
   f0_embed_dim: 64
   phone_embed_dim: 256
   midi_embed_dim: 64
   unvoiced_embed_dim: 16 # Dimension for unvoiced flag embedding
   # Resolution scaling factors (relative to full mel_bins)
-  # Example: low_res_scale=4 means low-res has mel_bins/4 frequency bins
   low_res_scale: 4
   mid_res_scale: 2
 
-  # Channel configurations for each stage (Adjust based on complexity/memory)
-  # Format: List of output channels for each ConvBlock in the stage
+  # Channel configurations for each stage
   low_res_channels: [256, 256, 128]
   mid_res_channels: [128, 128, 64]
   high_res_channels: [64, 64, 32] # Updated channel config
 
-  # --- Multi-band Config (NEW) ---
-  num_bands_stage1: 2                 # Default for multi-band output projection
+  # --- Multi-band Config ---
+  num_bands_stage1: 2
   num_bands_stage2: 3
   band_processing_stage2: 'separate' # Options: 'separate', 'shared'
-  num_bands_stage3: 4                 # Default, same as stage 2
-  band_processing_stage3: 'separate'    # Default, same as stage 2
+  num_bands_stage3: 4
+  band_processing_stage3: 'separate'
   # --- End Multi-band Config ---
 
   # Initial training stage (1, 2, or 3)
   current_stage: 1
 
-# Vocoder specific parameters (NEW)
+# Vocoder specific parameters
 vocoder:
-  name: LightweightNSF
-  # Parameters for the source generation module
-  source_model:
-    hidden_dim: 256       # Hidden dimension for MLPs predicting source params (Increased from 128)
-    num_harmonics: 60     # Number of harmonics for sine synthesis (voiced)
-    noise_mlp_layers: 2   # Number of layers in MLP predicting noise shape/level
-    # Add other source params as needed (e.g., noise band definitions)
-    lstm_num_layers: 2    # Number of layers in the source predictor LSTM
-
-  # Parameters for the filter prediction module
-  filter_model:
-    hidden_dim: 256       # Hidden dimension for MLP predicting filter params (Increased from 128)
-    filter_type: "SimpleFIR" # Type of filter to predict (e.g., FIR gains, LPC) - Needs implementation
-    num_filter_bands: 30 # Example: Number of bands if using a filter bank approach (Increased from 30)
-    # Add other filter params as needed (e.g., LPC order)
-    lstm_num_layers: 2    # Number of layers in the filter predictor LSTM
-
-  # Parameters for the NEW Audio-Rate F0 Predictor
-  f0_predictor_audio_rate:
-    hidden_channels: 64 # Hidden channels in Conv1d layers
-    kernel_size: 3      # Kernel size for Conv1d layers
+  name: TinyWaveRNN # Updated to match our implementation
+  
+  # TinyWaveRNN core parameters
+  gru_dims: 256     # Hidden dimensions for GRU
+  gru_sparsity: 0.8 # Sparsity ratio for GRU weights (80%)
+  gru_block_size: 16 # Block size for structured sparsity
+  bits: 8           # Bits for audio quantization (μ-law)
+  cond_dims: 64     # Conditioning dimensions
+  
+  # Feature embeddings
+  use_f0: true      # Whether to use F0 conditioning
+  f0_dims: 16       # Dimension for F0 embedding
+  use_unvoiced: true # Whether to use unvoiced flag conditioning
+  unvoiced_dims: 16 # Dimension for unvoiced flag embedding
+  
+  # Training stages
+  teacher_forcing_ratio: 1.0 # Start with full teacher forcing
+  scheduled_sampling: true   # Enable scheduled sampling during training
+  
+  # Audio sample rate options
+  audio_rate_f0: true # Whether to predict F0 at audio rate (NEW)
+  
+  # Inference parameters
+  temperature: 0.6 # Temperature for sampling (lower = more deterministic)
 
 # Training Configuration
 train:
   batch_size: 16        # Adjust based on GPU memory
-  unvoiced_weight: 0.5  # Weight for unvoiced frames in loss calculation (NEW)
+  unvoiced_weight: 0.5  # Weight for unvoiced frames in loss calculation
   epochs_per_stage:
-    stage1: 150         #ideal 200
-    stage2: 120         #ideal 150
-    stage3: 100         #ideal 150
+    stage1: 150
+    stage2: 120
+    stage3: 100
   
   val_interval: 1       # Run validation every N epochs
   log_dir: logs         # Base directory for all logs
@@ -103,7 +103,7 @@ train:
 
   # --- Stage-Specific Learning Rates ---
   learning_rate_per_stage:
-    stage1: 0.0005  # Example LR for stage 1 (Adjusted from 0.001)
+    stage1: 0.0005  # Example LR for stage 1
     stage2: 0.0007  # Example LR for stage 2
     stage3: 0.0009  # Example LR for stage 3
   # --- End Stage-Specific Learning Rates ---
@@ -112,24 +112,35 @@ train:
   weight_decay: 0.0001    # Adam weight decay
   lr_factor: 0.5          # Factor by which the learning rate will be reduced (scheduler)
   lr_patience: 10         # Number of epochs with no improvement after which learning rate will be reduced (scheduler)
-  gradient_clip_val: 0.5 # Optional: Gradient clipping value (Reduced from 1.0 for stability)
+  gradient_clip_val: 0.5  # Gradient clipping value
   freeze_loaded_weights: false # Default: Freeze weights when loading from ckpt
 
   # log_interval defines log_every_n_steps in Trainer
   log_interval: 50        # Log training metrics every N steps
 
-  # --- Vocoder Training Specific Params (NEW) ---
-  vocoder_loss: 'MultiResolutionSTFT' # Type of loss function
+  # --- Vocoder Training Specific Params ---
+  vocoder_loss: 'CrossEntropy' # Primary loss function type
+  use_phase_loss: true    # Whether to use additional phase coherence loss for voiced regions
+  loss_lambda_phase: 0.1  # Weight for phase coherence loss component
+  # STFT loss parameters for audio reconstruction quality evaluation
   stft_loss_fft_sizes: [1024, 2048, 512] # FFT sizes for MR-STFT loss
-  stft_loss_hop_sizes: [120, 240, 50]   # Hop sizes for MR-STFT loss
+  stft_loss_hop_sizes: [120, 240, 50]    # Hop sizes for MR-STFT loss
   stft_loss_win_lengths: [600, 1200, 240] # Window lengths for MR-STFT loss
-  loss_lambda_sc: 0.5 # Weight for spectral convergence loss component (Reduced from 1.0)
-  loss_lambda_mag: 1.0 # Weight for log STFT magnitude loss component
-  loss_lambda_td: 1.0 # Weight for time-domain L1 loss component (NEW)
-  loss_lambda_f0: 0.5 # Weight for audio-rate F0 prediction loss (NEW)
-  vocoder_max_epochs: 100 # Maximum epochs for vocoder training (NEW)
-  log_vocoder_audio_epoch_interval: 1 # Log audio every N validation epochs (NEW)
-  log_n_vocoder_audio_samples: 1    # Number of audio samples to log from the first batch (NEW)
-  log_vocoder_spectrograms: true    # Whether to log spectrogram comparison plots (NEW)
-  vocoder_learning_rate: 0.0001  # Increased LR slightly (from 1e-5) to speed up convergence
-  # --- End Vocoder Training Specific Params ---
+  loss_lambda_sc: 0.5     # Weight for spectral convergence loss component
+  loss_lambda_mag: 1.0    # Weight for log STFT magnitude loss component
+  loss_lambda_td: 1.0     # Weight for time-domain L1 loss component
+  loss_lambda_f0: 0.5     # Weight for audio-rate F0 prediction loss
+  vocoder_max_epochs: 100 # Maximum epochs for vocoder training
+  
+  # --- Vocoder Training Schedule ---
+  teacher_forcing_schedule:
+    initial: 1.0          # Initial teacher forcing ratio
+    final: 0.5            # Final teacher forcing ratio
+    epochs: 50            # Epochs over which to decay teacher forcing
+    
+  # --- Vocoder Logging ---
+  log_vocoder_audio_epoch_interval: 1 # Log audio every N validation epochs
+  log_n_vocoder_audio_samples: 2      # Number of audio samples to log from validation batch
+  log_vocoder_spectrograms: true      # Whether to log spectrogram comparison plots
+  vocoder_learning_rate: 0.0001       # Learning rate for vocoder training
+  # --- End Vocoder Params ---
