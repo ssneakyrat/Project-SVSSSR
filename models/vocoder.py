@@ -291,23 +291,27 @@ class TinyWaveRNN(nn.Module):
         self.use_f0 = use_f0
         self.use_unvoiced = use_unvoiced
         
-        # Input conditioning dimensions
-        cond_input_dims = mel_bins
+        # Fix: Calculate total input dimensions including the embeddings
+        total_input_dims = mel_bins
+        
         if use_f0:
-            cond_input_dims += 1  # Add F0 dimension
+            # Add f0_dims instead of just 1
+            total_input_dims += f0_dims
             self.f0_embedding = nn.Linear(1, f0_dims)
             self.conditioning_dims = conditioning_dims + f0_dims
         else:
             self.conditioning_dims = conditioning_dims
             
         if use_unvoiced:
-            cond_input_dims += 1  # Add unvoiced flag dimension
+            # Add unvoiced_dims instead of just 1
+            total_input_dims += unvoiced_dims
             self.unvoiced_embedding = nn.Linear(1, unvoiced_dims)
             self.conditioning_dims += unvoiced_dims
-            
+                
         # Condition network for processing mel spectrograms
+        # Update to use total_input_dims which properly accounts for embedding dimensions
         self.condition_network = ConditionNetwork(
-            mel_bins=cond_input_dims,
+            mel_bins=total_input_dims,
             hidden_dims=conditioning_dims,
             out_dims=conditioning_dims
         )
@@ -426,13 +430,37 @@ class TinyWaveRNN(nn.Module):
             # Truncate to match mel length (in case of rounding issues)
             audio_frames = audio_frames[:, :mel_len]
             
-            # Apply μ-law encoding
-            audio_frames_16bit = audio_frames.long() + 2**15  # Convert from signed to unsigned
-            audio_ulaw = self.encode_ulaw(audio_frames_16bit)
+            # Apply μ-law encoding - using a different approach
+            # Remember device and shape for later
+            device = audio_frames.device
+            orig_shape = audio_frames.shape
             
-            # Split into coarse (MSB) and fine (LSB) parts
-            audio_coarse = audio_ulaw >> self.bits
-            audio_fine = audio_ulaw & ((1 << self.bits) - 1)
+            # Convert to numpy for safer bit operations
+            audio_np = audio_frames.detach().cpu().numpy()
+            
+            # Convert from signed to unsigned (add 2^15)
+            audio_np = audio_np.astype(np.int32) + (1 << 15)
+            
+            # Clamp to valid range 
+            audio_np = np.clip(audio_np, 0, (1 << 16) - 1)
+            
+            # Apply μ-law encoding (this would use the ulaw_table defined elsewhere)
+            # For simplicity, let's implement it directly here
+            mu = 255.0
+            # Scale to [-1, 1]
+            x = (audio_np / (1 << 15)) - 1.0
+            # Apply μ-law formula
+            y = np.sign(x) * np.log(1 + mu * np.abs(x)) / np.log(1 + mu)
+            # Scale to [0, 255]
+            audio_ulaw_np = np.round((y + 1) / 2 * 255).astype(np.uint8)
+            
+            # Split into coarse (high 4 bits) and fine (low 4 bits) components
+            audio_coarse_np = audio_ulaw_np >> 4  # High 4 bits (0-15)
+            audio_fine_np = audio_ulaw_np & 0x0F  # Low 4 bits (0-15)
+            
+            # Convert back to PyTorch tensors and move to original device
+            audio_coarse = torch.from_numpy(audio_coarse_np).long().to(device)
+            audio_fine = torch.from_numpy(audio_fine_np).long().to(device)
             
             # For training, we use the previous sample as input
             # Prepare previous frames for input (shift right, add zeros at start)
@@ -440,7 +468,7 @@ class TinyWaveRNN(nn.Module):
             prev_audio[:, 1:] = audio_frames[:, :-1]
             
             # Prepare GRU inputs: previous sample + conditioning
-            prev_audio_scaled = prev_audio.unsqueeze(-1) / 2**15  # Scale to [-1, 1]
+            prev_audio_scaled = prev_audio.unsqueeze(-1) / (1 << 15)  # Scale to [-1, 1]
             gru_input = torch.cat([prev_audio_scaled, conditioning], dim=-1)
             
             # Process through sparse GRU
@@ -463,7 +491,6 @@ class TinyWaveRNN(nn.Module):
             
         else:
             # Inference mode - generate audio sample by sample
-            
             # Start with silence
             audio_sample = torch.zeros(batch_size, 1, device=mel.device)
             generated_samples = []
@@ -474,18 +501,35 @@ class TinyWaveRNN(nn.Module):
                 frame_cond = conditioning[:, t:t+1, :]  # Get conditioning for this frame
                 
                 # Concatenate current audio sample with conditioning
-                audio_scaled = audio_sample.unsqueeze(-1) / 2**15  # Scale to [-1, 1]
+                audio_scaled = audio_sample.unsqueeze(-1) / (1 << 15)  # Scale to [-1, 1]
                 gru_input = torch.cat([audio_scaled, frame_cond], dim=-1)
                 
                 # Run through GRU
                 gru_output, hidden = self.sparse_gru(gru_input, hidden)
                 
                 # Sample from output distribution
-                coarse_sample, fine_sample, audio_16bit = self.output_layer.sample(gru_output, temperature=0.6)
+                coarse_sample, fine_sample, _ = self.output_layer.sample(gru_output, temperature=0.6)
                 
-                # Convert to audio sample (16-bit)
-                audio_sample = self.decode_ulaw(coarse_sample.squeeze(1) << self.bits | fine_sample.squeeze(1))
-                audio_sample = (audio_sample - 2**15).float()  # Convert back to signed
+                # Convert to audio sample (16-bit) using numpy
+                coarse_np = coarse_sample.detach().cpu().numpy()
+                fine_np = fine_sample.detach().cpu().numpy()
+                
+                # Combine coarse and fine components
+                combined_np = (coarse_np << 4) | fine_np
+                
+                # Apply inverse μ-law
+                # Scale to [-1, 1]
+                y = (combined_np.astype(np.float32) / 255.0) * 2 - 1
+                # Apply inverse μ-law formula
+                mu = 255.0
+                x = np.sign(y) * (1/mu) * ((1 + mu)**np.abs(y) - 1)
+                # Scale to [0, 2^16-1]
+                audio_16bit_np = ((x + 1) / 2 * ((1 << 16) - 1)).astype(np.int32)
+                # Convert back to signed
+                audio_sample_np = audio_16bit_np - (1 << 15)
+                
+                # Convert back to torch tensor
+                audio_sample = torch.from_numpy(audio_sample_np).float().to(mel.device)
                 
                 generated_samples.append(audio_sample)
                 
