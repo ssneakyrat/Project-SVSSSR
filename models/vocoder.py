@@ -273,51 +273,51 @@ class TinyWaveRNN(nn.Module):
     Tiny WaveRNN model with sparse GRU and dual softmax output.
     """
     def __init__(
-        self,
-        mel_bins=80,
-        conditioning_dims=64,
-        gru_dims=256,
-        gru_sparsity=0.8,
-        gru_block_size=16,
-        bits=8,
-        use_f0=True,
-        f0_dims=16,
-        use_unvoiced=True,
-        unvoiced_dims=16
-    ):
+    self,
+    mel_bins=80,
+    conditioning_dims=64,
+    gru_dims=256,
+    gru_sparsity=0.8,
+    gru_block_size=16,
+    bits=8,
+    use_f0=True,
+    f0_dims=16,
+    use_unvoiced=True,
+    unvoiced_dims=16
+):
         super().__init__()
         
         self.bits = bits
         self.use_f0 = use_f0
         self.use_unvoiced = use_unvoiced
         
-        # Fix: Calculate total input dimensions including the embeddings
+        # Calculate total input dimensions for mel processing
         total_input_dims = mel_bins
         
+        # Calculate the FINAL conditioning dimensions including all features
+        final_conditioning_dims = conditioning_dims
         if use_f0:
-            # Add f0_dims instead of just 1
             total_input_dims += f0_dims
             self.f0_embedding = nn.Linear(1, f0_dims)
-            self.conditioning_dims = conditioning_dims + f0_dims
-        else:
-            self.conditioning_dims = conditioning_dims
+            final_conditioning_dims += f0_dims
             
         if use_unvoiced:
-            # Add unvoiced_dims instead of just 1
             total_input_dims += unvoiced_dims
             self.unvoiced_embedding = nn.Linear(1, unvoiced_dims)
-            self.conditioning_dims += unvoiced_dims
+            final_conditioning_dims += unvoiced_dims
+        
+        # Store the final conditioning dimensions
+        self.conditioning_dims = final_conditioning_dims
                 
-        # Condition network for processing mel spectrograms
-        # Update to use total_input_dims which properly accounts for embedding dimensions
+        # Condition network now correctly outputs the final conditioning dimensions
         self.condition_network = ConditionNetwork(
             mel_bins=total_input_dims,
             hidden_dims=conditioning_dims,
-            out_dims=conditioning_dims
+            out_dims=final_conditioning_dims  # This is the key change!
         )
         
         # GRU input size: previous sample + conditioning
-        gru_input_size = 1 + self.conditioning_dims  # 1 for the audio sample
+        gru_input_size = 1 + final_conditioning_dims
         
         # Sparse GRU layer
         self.sparse_gru = SparseGRU(
