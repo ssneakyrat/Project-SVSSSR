@@ -354,17 +354,23 @@ class TinyWaveRNN(nn.Module):
         return y
     
     def _create_inv_ulaw_table(self):
-        """Create lookup table for u-law decoding."""
+        """Create lookup table for μ-law decoding with numerical stability improvements."""
         table = torch.zeros(256)
         mu = 255.0
         
         for i in range(256):
             # Scale to [-1, 1]
-            y = 2 * (i / 255) - 1
-            # Apply inverse μ-law formula
-            x = torch.sign(torch.tensor(y)) * (1 / mu) * ((1 + mu)**torch.abs(torch.tensor(y)) - 1)
-            # Scale to [0, 2^16-1]
-            pcm_val = ((x + 1) / 2 * (2**16 - 1)).round()
+            y = 2 * (i / 255.0) - 1
+            # Apply inverse μ-law formula with safety checks
+            if abs(y) > 0.999:  # Prevent extreme values that could cause overflow
+                x = torch.sign(torch.tensor(y))
+            else:
+                # Use log-based formula which is more stable for large values
+                x = torch.sign(torch.tensor(y)) * (1 / mu) * (
+                    torch.exp(torch.abs(torch.tensor(y)) * torch.log(torch.tensor(1 + mu))) - 1
+                )
+            # Scale to [0, 2^16-1] with safe clamping
+            pcm_val = ((x + 1) / 2 * 65535.0).clamp(0, 65535).round()
             table[i] = pcm_val
             
         return table
@@ -385,7 +391,7 @@ class TinyWaveRNN(nn.Module):
         
     def forward(self, batch, return_hidden=False):
         """
-        Forward pass through the model.
+        Forward pass through the model with improved numerical stability and audio format handling.
         
         Args:
             batch: Dictionary containing:
@@ -444,12 +450,12 @@ class TinyWaveRNN(nn.Module):
             # Clamp to valid range 
             audio_np = np.clip(audio_np, 0, (1 << 16) - 1)
             
-            # Apply μ-law encoding (this would use the ulaw_table defined elsewhere)
-            # For simplicity, let's implement it directly here
+            # Apply μ-law encoding with improved numerical stability
             mu = 255.0
             # Scale to [-1, 1]
             x = (audio_np / (1 << 15)) - 1.0
-            # Apply μ-law formula
+            # Apply μ-law formula with clipping to prevent extreme values
+            x = np.clip(x, -0.999, 0.999)  # Prevent extreme values
             y = np.sign(x) * np.log(1 + mu * np.abs(x)) / np.log(1 + mu)
             # Scale to [0, 255]
             audio_ulaw_np = np.round((y + 1) / 2 * 255).astype(np.uint8)
@@ -493,7 +499,8 @@ class TinyWaveRNN(nn.Module):
             # Inference mode - generate audio sample by sample
             # Start with silence
             audio_sample = torch.zeros(batch_size, 1, device=mel.device)
-            generated_samples = []
+            generated_samples_float = []  # For float values in [-1, 1]
+            generated_samples_int = []    # For int16 values
             hidden = None
             
             # Generate one sample at a time for each frame
@@ -510,33 +517,43 @@ class TinyWaveRNN(nn.Module):
                 # Sample from output distribution
                 coarse_sample, fine_sample, _ = self.output_layer.sample(gru_output, temperature=0.6)
                 
-                # Convert to audio sample (16-bit) using numpy
-                coarse_np = coarse_sample.detach().cpu().numpy()
-                fine_np = fine_sample.detach().cpu().numpy()
+                # Convert to audio sample using torch operations for better stability
+                coarse = coarse_sample.float()
+                fine = fine_sample.float()
                 
                 # Combine coarse and fine components
-                combined_np = (coarse_np << 4) | fine_np
+                combined = (coarse * 16.0 + fine) / 255.0  # Scale to [0, 1]
                 
-                # Apply inverse μ-law
-                # Scale to [-1, 1]
-                y = (combined_np.astype(np.float32) / 255.0) * 2 - 1
-                # Apply inverse μ-law formula
+                # Convert to [-1, 1] range
+                y = combined * 2.0 - 1.0
+                
+                # Apply inverse μ-law with numerical stability improvements
                 mu = 255.0
-                x = np.sign(y) * (1/mu) * ((1 + mu)**np.abs(y) - 1)
-                # Scale to [0, 2^16-1]
-                audio_16bit_np = ((x + 1) / 2 * ((1 << 16) - 1)).astype(np.int32)
-                # Convert back to signed
-                audio_sample_np = audio_16bit_np - (1 << 15)
+                # Clip values to valid range
+                y = torch.clamp(y, -0.999, 0.999)
                 
-                # Convert back to torch tensor
-                audio_sample = torch.from_numpy(audio_sample_np).float().to(mel.device)
+                # Stable inverse μ-law implementation
+                x = torch.sign(y) * (1.0/mu) * (torch.exp(torch.abs(y) * torch.log(torch.tensor(1.0 + mu, device=y.device))) - 1.0)
                 
-                generated_samples.append(audio_sample)
+                # Store float version (in [-1, 1] range)
+                audio_sample_float = x.clone()
+                generated_samples_float.append(audio_sample_float)
                 
-            # Concatenate all generated samples
-            generated_audio = torch.stack(generated_samples, dim=1).squeeze(-1)
+                # Convert to int16 for playback
+                audio_sample_int = torch.round(x * 32767.0).clamp(-32768, 32767).to(torch.int16)
+                generated_samples_int.append(audio_sample_int)
+                
+                # Use int16 for next frame input
+                audio_sample = audio_sample_int
+                
+            # Concatenate both versions
+            generated_audio_int = torch.stack(generated_samples_int, dim=1).squeeze(-1)
+            generated_audio_float = torch.stack(generated_samples_float, dim=1).squeeze(-1)
             
-            return {'generated_audio': generated_audio}
+            return {
+                'generated_audio': generated_audio_int,
+                'generated_audio_float': generated_audio_float
+            }
 
 class VocoderModel(pl.LightningModule):
     """
@@ -637,8 +654,8 @@ class VocoderModel(pl.LightningModule):
         self.log('train/fine_loss', losses['fine_loss'], on_step=True, on_epoch=True)
         
         # Log samples at intervals
-        if batch_idx % self.log_interval == 0:
-            self._log_audio_samples(batch, outputs, prefix='train', max_samples=1)
+        #if batch_idx % self.log_interval == 0:
+        #    self._log_audio_samples(batch, outputs, prefix='train', max_samples=1)
         
         return losses['loss']
     
@@ -659,7 +676,7 @@ class VocoderModel(pl.LightningModule):
         return losses['loss']
     
     def _log_audio_samples(self, batch, outputs, prefix='val', max_samples=1):
-        """Log audio samples and spectrograms to TensorBoard."""
+        """Log audio samples and spectrograms to TensorBoard with robust type handling."""
         if not self.logger:
             return
             
@@ -703,35 +720,104 @@ class VocoderModel(pl.LightningModule):
                     
                     # Log spectrograms if enabled
                     if self.log_spectrograms:
-                        # Create mel spectrograms for GT and generated audio
-                        mel_gt = self._audio_to_mel(audio_gt[i].detach().cpu().numpy())
-                        mel_gen = self._audio_to_mel(gen_audio.detach().cpu().numpy())
-                        
-                        # Create figure
-                        fig = plot_spectrograms_to_figure(
-                            ground_truth=torch.from_numpy(mel_gt),
-                            prediction=torch.from_numpy(mel_gen),
-                            title=f"Mel Spectrogram Comparison"
-                        )
-                        
-                        # Log figure
-                        self.logger.experiment.add_figure(
-                            f'{prefix}/spectrogram_{i}',
-                            fig,
-                            self.global_step
-                        )
+                        try:
+                            # Convert ground truth audio to float32 in [-1, 1] range
+                            #gt_audio_np = audio_gt[i].detach().cpu().numpy().astype(np.float32) / 32768.0
+                            gt_audio_np = audio_gt[i].detach().cpu().numpy()
+
+                            # Convert generated audio to float32 in [-1, 1] range
+                            if 'generated_audio_float' in gen_output:
+                                gen_audio_float = gen_output['generated_audio_float'][0].detach().cpu().numpy()
+                            else:
+                                gen_audio_float = gen_audio.detach().cpu().numpy().astype(np.float32) / 32768.0
+                            
+                            # Create mel spectrograms
+                            mel_gt = self._audio_to_mel(gt_audio_np)
+                            mel_gen = self._audio_to_mel(gen_audio_float)
+                            
+                            # Create figure
+                            fig = plot_spectrograms_to_figure(
+                                ground_truth=torch.from_numpy(mel_gt),
+                                prediction=torch.from_numpy(mel_gen),
+                                title=f"Mel Spectrogram Comparison"
+                            )
+                            
+                            # Log figure
+                            self.logger.experiment.add_figure(
+                                f'{prefix}/spectrogram_{i}',
+                                fig,
+                                self.global_step
+                            )
+                        except Exception as e:
+                            import traceback
+                            logger.error(f"Error generating spectrograms: {str(e)}")
+                            logger.error(traceback.format_exc())
     
     def _audio_to_mel(self, audio):
-        """Convert audio to mel spectrogram for visualization."""
+        """Convert audio to mel spectrogram for visualization with robust type handling."""
         try:
             import librosa
-            # Use librosa to compute mel spectrogram
+            import numpy as np
+            
+            # CRITICAL: Force conversion to float32 in [-1, 1] range
+            if isinstance(audio, np.ndarray):
+                # Save original dtype for debugging
+                original_dtype = audio.dtype
+                original_range = f"[{audio.min()}, {audio.max()}]"
+                
+                # Convert to float32
+                audio = audio.astype(np.float32)
+                
+                # Scale appropriately if outside [-1, 1]
+                if audio.max() > 1.0 or audio.min() < -1.0:
+                    # Determine proper scaling based on original dtype
+                    if original_dtype in [np.int16, np.uint16]:
+                        audio = audio / 32768.0
+                    elif original_dtype in [np.int32, np.uint32]:
+                        audio = audio / 2147483648.0  # 2^31
+                    else:
+                        # For unknown types, scale by max absolute value
+                        scale_factor = max(1.0, abs(audio.max()), abs(audio.min()))
+                        audio = audio / scale_factor
+                
+                # Safety check for [-1, 1] range
+                audio = np.clip(audio, -1.0, 1.0)
+                
+                logger.info(f"Converted audio from {original_dtype} {original_range} to float32 [{audio.min()}, {audio.max()}]")
+            else:
+                # If not numpy array, convert explicitly
+                audio = np.array(audio, dtype=np.float32)
+                if audio.max() > 1.0 or audio.min() < -1.0:
+                    audio = audio / max(1.0, abs(audio.max()), abs(audio.min()))
+                audio = np.clip(audio, -1.0, 1.0)
+            
+            # Get signal length
+            signal_length = len(audio)
+            
+            # Choose appropriate FFT size that doesn't exceed signal length
+            config_n_fft = self.config['audio']['n_fft']
+            n_fft = min(config_n_fft, signal_length)
+            
+            # If n_fft is very small, pad the signal to allow for reasonable STFT
+            if n_fft < 256:
+                n_fft = 256
+                # Zero-pad the audio if needed
+                if signal_length < n_fft:
+                    padded_audio = np.zeros(n_fft, dtype=np.float32)
+                    padded_audio[:signal_length] = audio
+                    audio = padded_audio
+            
+            # Verify before passing to librosa
+            assert audio.dtype == np.float32, f"Audio dtype must be float32, got {audio.dtype}"
+            assert -1.0 <= audio.max() <= 1.0 and -1.0 <= audio.min() <= 1.0, f"Audio range must be [-1, 1], got [{audio.min()}, {audio.max()}]"
+            
+            # Use librosa to compute mel spectrogram with adjusted n_fft
             mel = librosa.feature.melspectrogram(
                 y=audio,
                 sr=self.sample_rate,
-                n_fft=self.config['audio']['n_fft'],
+                n_fft=n_fft,
                 hop_length=self.config['audio']['hop_length'],
-                win_length=self.config['audio']['win_length'],
+                win_length=min(self.config['audio']['win_length'], n_fft),
                 n_mels=self.config['audio']['n_mels'],
                 fmin=self.config['audio']['fmin'],
                 fmax=self.config['audio']['fmax']
@@ -739,9 +825,11 @@ class VocoderModel(pl.LightningModule):
             # Convert to log scale
             mel = librosa.power_to_db(mel, ref=np.max)
             return mel
-        except ImportError:
-            logger.warning("Librosa not available for mel spectrogram conversion.")
-            # Return dummy spectrogram if librosa not available
+        except Exception as e:
+            import traceback
+            logger.error(f"Error in mel spectrogram conversion: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return dummy spectrogram if conversion fails
             return np.zeros((self.config['audio']['n_mels'], 128))
                 
     def configure_optimizers(self):

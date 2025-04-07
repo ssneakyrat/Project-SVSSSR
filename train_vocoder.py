@@ -115,8 +115,8 @@ def main(args):
         devices=args.devices,
         logger=tb_logger,
         callbacks=callbacks,
-        log_every_n_steps=config['train']['log_interval'],
-        val_check_interval=1.0,  # Validate once per epoch
+        #log_every_n_steps=config['train']['log_interval'],
+        #val_check_interval=config['train']['log_vocoder_audio_epoch_interval'], #1.0,  # Validate once per epoch
         precision=precision,
         gradient_clip_val=config['train'].get('gradient_clip_val', 0.5),
         accumulate_grad_batches=args.gradient_accumulation
