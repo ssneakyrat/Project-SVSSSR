@@ -17,12 +17,12 @@ data:
 
 audio:
   sample_rate: 22050
-  n_fft: 1024
+  n_fft: 2048 # Increased from 1024 to increase n_freqs for mel filters
   hop_length: 256
-  win_length: 1024
-  n_mels: 80
+  win_length: 2048 # Set equal to n_fft
+  n_mels: 80 # Changed back to 80, should be okay with n_fft=2048 and fmax=null
   fmin: 0
-  fmax: 8000
+  fmax: null # Set to null (None) to use default sample_rate / 2, ensuring filters cover full range up to Nyquist
   f0_min: 50
   f0_max: 600
   max_audio_length: 10.0
@@ -30,7 +30,7 @@ audio:
 # Model specific parameters
 model:
   name: ProgressiveSVS # New model name
-  mel_bins: 80        # Shared: Output dimension (should match audio.n_mels)
+  mel_bins: 80        # Shared: Output dimension (MUST match audio.n_mels)
   vocab_size: null    # Shared: Will be dynamically set from data
 
   # --- ProgressiveSVS Specific Parameters ---
@@ -50,6 +50,30 @@ model:
   mid_res_channels: [128, 128, 64]
   high_res_channels: [64, 64, 32] # Updated channel config
 
+  # --- Progressive Vocoder (NEW - For Stage 1 Experiment) ---
+  progressive_vocoder:
+    type: 'ProgressiveVocoder_v1' # Identifier
+    # Calculate based on low_res_scale: mel_bins / low_res_scale = 80 / 4 = 20 # Changed back
+    input_mel_bins: 20 # MUST match model.mel_bins / model.low_res_scale
+    # --- Progressive Vocoder Stages ---
+    # Stage 1 (Mel -> Low SR Audio)
+    v1_initial_upsample_factor: 128 # Upsample time dim (Aligned with SVS: 512 / (2*2))
+    v1_channels: [128, 64]        # Example channels for V1 convs
+    v1_kernel_size: 7             # Example kernel size
+    v1_output_sr_divisor: 4       # Example: Target SR / 4 = 22050 / 4 = 5512.5 (adjust based on implementation)
+    # Stage 2 (Low SR -> Mid SR Audio)
+    v2_upsample_factor: 2         # Upsample audio by 2x (Aligned with SVS Stage 1->2 Freq Upsample)
+    v2_channels: [64, 32]         # Example channels for V2 convs/resblocks
+    v2_kernel_size: 5             # Example kernel size
+    v2_num_res_blocks: 3          # Example: Use residual blocks
+    v2_output_sr_divisor: 2       # Example: Target SR / 2 = 11025
+    # Stage 3 (Mid SR -> Full SR Audio)
+    v3_upsample_factor: 2         # Upsample audio by 2x (Aligned with SVS Stage 2->3 Freq Upsample)
+    v3_channels: [32, 16]         # Example channels for V3 convs/resblocks
+    v3_kernel_size: 3             # Example kernel size
+    v3_num_res_blocks: 5          # Example: Use residual blocks
+    # --- End Progressive Vocoder Stages ---
+
   # --- Multi-band Config (NEW) ---
   num_bands_stage1: 2                 # Default for multi-band output projection
   num_bands_stage2: 3
@@ -62,11 +86,12 @@ model:
   current_stage: 1
 
 # Training Configuration
+  stage1_use_vocoder: true # NEW: Enable Stage 1 vocoder training experiment
 train:
   batch_size: 16        # Adjust based on GPU memory
   unvoiced_weight: 0.5  # Weight for unvoiced frames in loss calculation (NEW)
   epochs_per_stage:
-    stage1: 150         #ideal 200
+    stage1: 10         #ideal 200
     stage2: 120         #ideal 150
     stage3: 100         #ideal 150
   
@@ -93,5 +118,15 @@ train:
 
   # log_interval defines log_every_n_steps in Trainer
   log_interval: 50        # Log training metrics every N steps
+
+  # --- Audio Loss Config (NEW - For Stage 1 Vocoder Experiment) ---
+  audio_loss_type: 'stft' # Options: 'stft', 'multi_stft', 'l1_wav', etc.
+  stft_loss_params: # Example if using STFT loss
+    fft_sizes: [1024, 2048, 512]
+    hop_sizes: [120, 240, 50] # Must be less than fft_sizes
+    win_lengths: [600, 1200, 240] # Must be less than or equal to fft_sizes
+    loss_mag_weight: 1.0 # Weight for spectral magnitude loss component
+    loss_sc_weight: 1.0  # Weight for spectral convergence loss component
+  # --- End Audio Loss Config ---
 
   # Removed: GAN specific params (lr_g, lr_d, betas, lambda_recon)

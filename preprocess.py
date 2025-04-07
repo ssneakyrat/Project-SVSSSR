@@ -37,36 +37,79 @@ def load_config(config_path='config/model.yaml'):
         raise
 
 # --- Label Parsing and Duration Adjustment ---
-def parse_lab_file(lab_path):
-    """Parses a .lab file and returns timestamps, phones, and unique phones."""
-    lab_entries = []
+def parse_lab_file(lab_path, actual_duration_sec):
+    """
+    Parses a .lab file where times are ratios relative to the max end time in the file.
+    Converts these ratios to absolute seconds based on the actual audio duration.
+    Returns timestamps (in seconds), phones, and unique phones.
+    """
+    lines = []
+    max_end_ratio = 0.0
     unique_phones = set()
-    max_end_time = 0.0
+    lab_entries = []
+
+    # --- Pass 1: Read lines and find max_end_ratio ---
     try:
         with open(lab_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) == 3:
-                    start_time_str, end_time_str, phone = parts
-                    try:
-                        start_sec = float(start_time_str)
-                        end_sec = float(end_time_str)
-                        if start_sec < 0 or end_sec < start_sec:
-                             logger.warning(f"Skipping invalid time entry in {lab_path}: {line.strip()}")
-                             continue
-                        lab_entries.append((start_sec, end_sec, phone))
-                        unique_phones.add(phone)
-                        max_end_time = max(max_end_time, end_sec)
-                    except ValueError:
-                         logger.warning(f"Skipping non-numeric time entry in {lab_path}: {line.strip()}")
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            parts = line.strip().split()
+            if len(parts) == 3:
+                _, end_time_str, _ = parts
+                try:
+                    end_ratio = float(end_time_str)
+                    if end_ratio < 0:
+                         logger.warning(f"Skipping entry with negative end ratio in {lab_path} (line {i+1}): {line.strip()}")
                          continue
-                else:
-                     logger.warning(f"Skipping malformed line in {lab_path}: {line.strip()}")
+                    max_end_ratio = max(max_end_ratio, end_ratio)
+                except ValueError:
+                     logger.warning(f"Skipping non-numeric end ratio in {lab_path} (line {i+1}): {line.strip()}")
+                     continue
+            else:
+                 logger.warning(f"Skipping malformed line in {lab_path} (line {i+1}): {line.strip()}")
 
     except Exception as e:
-        logger.error(f"Error parsing lab file {lab_path}: {e}")
-        return [], [], set()
-    return lab_entries, unique_phones, max_end_time
+        logger.error(f"Error during Pass 1 parsing lab file {lab_path}: {e}")
+        return [], set() # Return only two values now
+
+    if max_end_ratio <= 0:
+        logger.error(f"Could not determine a valid positive max_end_ratio from {lab_path}. Found: {max_end_ratio}. Cannot calculate absolute times.")
+        return [], set()
+
+    # --- Pass 2: Calculate absolute times ---
+    try:
+        for i, line in enumerate(lines):
+            parts = line.strip().split()
+            if len(parts) == 3:
+                start_time_str, end_time_str, phone = parts
+                try:
+                    start_ratio = float(start_time_str)
+                    end_ratio = float(end_time_str)
+
+                    # Calculate absolute times in seconds
+                    start_sec = (start_ratio / max_end_ratio) * actual_duration_sec
+                    end_sec = (end_ratio / max_end_ratio) * actual_duration_sec
+
+                    # Validate calculated absolute times
+                    if start_sec < 0 or end_sec < start_sec:
+                         logger.warning(f"Skipping invalid calculated time entry in {lab_path} (line {i+1}): start={start_sec:.4f}s, end={end_sec:.4f}s. Original line: {line.strip()}")
+                         continue
+
+                    lab_entries.append((start_sec, end_sec, phone))
+                    unique_phones.add(phone)
+
+                except ValueError:
+                     # Already warned in Pass 1 about non-numeric, but catch just in case
+                     logger.warning(f"Skipping non-numeric ratio during Pass 2 in {lab_path} (line {i+1}): {line.strip()}")
+                     continue
+            # Malformed lines already warned in Pass 1
+
+    except Exception as e:
+        logger.error(f"Error during Pass 2 parsing lab file {lab_path}: {e}")
+        return [], set() # Return empty on error
+
+    return lab_entries, unique_phones
 
 def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', 'sp', '<SIL>'}):
     """Adjusts phone durations to match target_frames, handling gaps/mismatches."""
@@ -184,7 +227,7 @@ def adjust_durations(phones, durations, target_frames, silence_symbols={'sil', '
 
 # --- Feature Extraction ---
 def extract_features(audio_path, config):
-    """Extracts log Mel spectrogram, log F0, voiced mask, and estimated MIDI pitch."""
+    """Extracts log Mel spectrogram, log F0, voiced mask, estimated MIDI pitch, and raw audio waveform."""
     sr = config['audio']['sample_rate']
     hop_length = config['audio']['hop_length']
     win_length = config['audio']['win_length']
@@ -194,27 +237,45 @@ def extract_features(audio_path, config):
     fmax = config['audio']['fmax']
     f0_min = config['audio']['f0_min']
     f0_max = config['audio']['f0_max']
+    max_audio_len_sec = config['audio'].get('max_audio_length') # Get max length from config
 
     try:
         # Load audio
-        audio, _ = librosa.load(audio_path, sr=sr)
-        audio = audio.astype(np.float64) # PyWorld requires float64
+        audio_raw, sr_orig = librosa.load(audio_path, sr=None) # Load original sample rate
 
-        # Extract Mel spectrogram
+        # Resample if necessary
+        if sr_orig != sr:
+             audio_raw = librosa.resample(y=audio_raw, orig_sr=sr_orig, target_sr=sr)
+
+        # --- Truncate audio based on max_audio_length ---
+        if max_audio_len_sec is not None and max_audio_len_sec > 0:
+            max_samples = int(max_audio_len_sec * sr)
+            if len(audio_raw) > max_samples:
+                logger.debug(f"Truncating audio {audio_path} from {len(audio_raw)} samples to {max_samples} samples ({max_audio_len_sec}s)")
+                audio_raw = audio_raw[:max_samples]
+            # else: logger.debug(f"Audio {audio_path} ({len(audio_raw)} samples) is within max length {max_samples}") # Optional debug
+        # --- End Truncation ---
+
+        # Ensure audio is float64 for PyWorld (use potentially truncated audio)
+        audio_pw = audio_raw.astype(np.float64)
+        # Keep a float32 version for saving (use potentially truncated audio)
+        audio_to_save = audio_raw.astype(np.float32)
+
+        # Extract Mel spectrogram (use potentially truncated audio)
         mel_spectrogram = librosa.feature.melspectrogram(
-            y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length,
+            y=audio_raw, sr=sr, n_fft=n_fft, hop_length=hop_length,
             win_length=win_length, n_mels=n_mels, fmin=fmin, fmax=fmax
         )
-        # Log-scale Mel spectrogram (common practice)
+        # Log-scale Mel spectrogram
         log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
         log_mel_spectrogram = log_mel_spectrogram.T # Shape (T, n_mels)
 
-        # Extract F0 using PyWorld
-        _f0, t = pw.dio(audio, sr, f0_floor=f0_min, f0_ceil=f0_max,
+        # Extract F0 using PyWorld (use potentially truncated audio)
+        _f0, t = pw.dio(audio_pw, sr, f0_floor=f0_min, f0_ceil=f0_max,
                         frame_period=hop_length * 1000 / sr)
-        f0 = pw.stonemask(audio, _f0, t, sr) # Refine F0
+        f0 = pw.stonemask(audio_pw, _f0, t, sr) # Refine F0
 
-        # Ensure F0 length matches Mel length
+        # Ensure F0 length matches Mel length (after potential truncation)
         mel_frames = log_mel_spectrogram.shape[0]
         if len(f0) < mel_frames:
             f0 = np.pad(f0, (0, mel_frames - len(f0)), mode='constant', constant_values=0)
@@ -236,8 +297,6 @@ def extract_features(audio_path, config):
         midi_pitch = np.zeros_like(f0_hz)
         voiced_f0_hz = f0_hz[voiced_mask]
         # MIDI formula: midi = 69 + 12 * log2(f/440)
-        # Use np.log2 for base-2 logarithm
-        # Add small epsilon to avoid log2(0) for safety, although voiced_mask should prevent this
         midi_pitch[voiced_mask] = 69 + 12 * np.log2(voiced_f0_hz / 440.0 + 1e-12)
         # Round to nearest integer MIDI note
         midi_pitch = np.round(midi_pitch).astype(int)
@@ -246,12 +305,13 @@ def extract_features(audio_path, config):
         midi_pitch[~voiced_mask] = 0 # Ensure unvoiced frames are 0
         midi_pitch = midi_pitch[:, np.newaxis] # Shape (T, 1)
 
-        return log_mel_spectrogram, log_f0, voiced_mask.squeeze(), midi_pitch
+        # Return all features including the raw (potentially truncated) audio
+        return log_mel_spectrogram, log_f0, voiced_mask.squeeze(), midi_pitch, audio_to_save
 
     except Exception as e:
         logger.error(f"Error extracting features for {audio_path}: {e}")
         # Return None for all expected outputs on error
-        return None, None, None, None # Added None for midi_pitch
+        return None, None, None, None, None # Added None for audio
 
 # --- Padding/Truncating ---
 def pad_or_truncate(data, target_length, pad_value=0):
@@ -356,12 +416,14 @@ def preprocess_data(config_path='config/model.yaml'):
     min_phones_in_lab = data_config.get('min_phones_in_lab', 5)
     output_hdf5_path = os.path.join(bin_dir, bin_file)
     stats_file_path = os.path.join(bin_dir, "norm_stats.json") # File to save stats
+    vis_dir = os.path.join(bin_dir, "visualizations") # Directory for visualizations
 
     lab_dir = os.path.join(raw_dir, 'lab')
     wav_dir = os.path.join(raw_dir, 'wav')
 
-    # Create output directory if it doesn't exist
+    # Create output directories if they don't exist
     os.makedirs(bin_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=True) # Create visualization directory
 
     # Find file pairs
     lab_files = glob.glob(os.path.join(lab_dir, '*.lab'))
@@ -372,13 +434,13 @@ def preprocess_data(config_path='config/model.yaml'):
         if os.path.exists(wav_path):
             file_pairs.append({'id': base_filename, 'lab': lab_path, 'wav': wav_path})
         else:
-            logger.warning(f"Corresponding WAV file not found for %s, skipping.", lab_path)
+            logger.warning(f"Corresponding WAV file not found for {lab_path}, skipping.")
 
     if not file_pairs:
         logger.error("No valid (lab, wav) file pairs found. Exiting.")
         return
 
-    logger.info(f"Found %d file pairs to process.", len(file_pairs))
+    logger.info(f"Found {len(file_pairs)} file pairs to process.")
 
     # --- Pass 1: Extract all features and calculate normalization stats ---
     logger.info("Starting Pass 1: Extracting features and calculating normalization stats...")
@@ -386,16 +448,16 @@ def preprocess_data(config_path='config/model.yaml'):
     all_log_f0s_voiced = []
 
     for pair in tqdm(file_pairs, desc="Pass 1: Extracting Features"):
-        # MIDI pitch not needed for stats, ignore it here
-        log_mel, log_f0, voiced_mask, _ = extract_features(pair['wav'], config)
-        if log_mel is not None and log_f0 is not None and voiced_mask is not None: # Check original features
+        # MIDI pitch and raw audio not needed for stats, ignore them here
+        log_mel, log_f0, voiced_mask, _, _ = extract_features(pair['wav'], config)
+        if log_mel is not None and log_f0 is not None and voiced_mask is not None: # Check essential features for stats
             # Store features for stat calculation
             all_log_mels.append(log_mel)
             # Only consider voiced frames for F0 stats
             if np.any(voiced_mask):
                  all_log_f0s_voiced.append(log_f0[voiced_mask])
         else:
-            logger.warning(f"Feature extraction failed for %s, excluding from stats.", pair['id'])
+            logger.warning(f"Feature extraction failed for {pair['id']}, excluding from stats.")
             # Mark pair as failed? Or handle later. For now, just exclude from stats.
             pair['failed_extraction'] = True
 
@@ -418,11 +480,11 @@ def preprocess_data(config_path='config/model.yaml'):
     f0_mean = np.mean(all_log_f0s_voiced_np)
     f0_std = np.std(all_log_f0s_voiced_np)
     if f0_std < 1e-5:
-        logger.warning(f"F0 standard deviation is very low (%f). Setting to 1e-5.", f0_std)
+        logger.warning(f"F0 standard deviation is very low ({f0_std}). Setting to 1e-5.")
         f0_std = 1e-5
 
-    logger.info(f"Calculated Mel Mean shape: %s, Mel Std shape: %s", mel_mean.shape, mel_std.shape)
-    logger.info(f"Calculated F0 Mean (voiced, log): %.4f, F0 Std (voiced, log): %.4f", f0_mean, f0_std)
+    logger.info(f"Calculated Mel Mean shape: {mel_mean.shape}, Mel Std shape: {mel_std.shape}")
+    logger.info(f"Calculated F0 Mean (voiced, log): {f0_mean:.4f}, F0 Std (voiced, log): {f0_std:.4f}")
 
     # Save stats
     norm_stats = {
@@ -434,9 +496,9 @@ def preprocess_data(config_path='config/model.yaml'):
     try:
         with open(stats_file_path, 'w') as f_stats:
             json.dump(norm_stats, f_stats, indent=4)
-        logger.info(f"Normalization stats saved to %s", stats_file_path)
+        logger.info(f"Normalization stats saved to {stats_file_path}")
     except Exception as e:
-        logger.error(f"Error saving normalization stats: %s", e)
+        logger.error(f"Error saving normalization stats: {e}")
         # Continue processing, but warn user stats are not saved
         # Or decide to stop here? Let's stop for safety.
         raise
@@ -446,9 +508,10 @@ def preprocess_data(config_path='config/model.yaml'):
     all_unique_phones = set(["<PAD>"]) # Add padding symbol initially
     processed_data = {} # Store results temporarily before HDF5 write
     first_file_data_for_vis = None # Store unnormalized data for the first valid file
+    first_file_id_for_vis = None
 
     target_frames = math.ceil(audio_config['max_audio_length'] * audio_config['sample_rate'] / audio_config['hop_length'])
-    logger.info(f"Target frames per file: %d", target_frames)
+    logger.info(f"Target frames per file: {target_frames}")
 
     for pair in tqdm(file_pairs, desc="Pass 2: Processing & Normalizing"):
         base_filename = pair['id']
@@ -459,12 +522,12 @@ def preprocess_data(config_path='config/model.yaml'):
         if pair.get('failed_extraction', False):
             continue
 
-        logger.debug(f"Processing: %s", base_filename)
+        logger.debug(f"Processing: {base_filename}")
 
-        # 1. Re-extract Mel and F0 (or retrieve if stored - re-extracting is simpler here)
-        log_mel, log_f0, voiced_mask, midi_pitch = extract_features(wav_path, config)
-        if log_mel is None or midi_pitch is None: # Check again just in case, include midi_pitch
-            logger.warning(f"Skipping %s due to feature extraction error in Pass 2 (Mel or MIDI).", base_filename)
+        # 1. Re-extract all features including audio
+        log_mel, log_f0, voiced_mask, midi_pitch, raw_audio = extract_features(wav_path, config)
+        if log_mel is None or midi_pitch is None or raw_audio is None: # Check essential features for saving
+            logger.warning(f"Skipping {base_filename} due to feature extraction error in Pass 2 (Mel, MIDI, or Audio).")
             continue
 
         original_mel_frames = log_mel.shape[0] # Frames before padding/truncation
@@ -486,90 +549,77 @@ def preprocess_data(config_path='config/model.yaml'):
         unvoiced_flag = (~voiced_mask).astype(np.uint8)
         padded_unvoiced_flag = pad_or_truncate(unvoiced_flag, target_frames, pad_value=0)
 
-        # 4. Parse Labels (get timestamps and phones)
-        lab_entries, unique_phones_in_file, max_end_time = parse_lab_file(lab_path)
-        if not lab_entries:
-             logger.warning(f"Skipping %s due to empty or invalid lab file.", base_filename)
-             continue
+        # 4. Get actual audio duration and parse label file (.lab)
+        try: # Add try-except for robustness
+            # Get actual duration BEFORE parsing labels
+            actual_duration_sec = librosa.get_duration(path=wav_path)
+            logger.debug(f"Actual audio duration for {base_filename}: {actual_duration_sec:.4f}s")
+
+            # Parse lab file using the actual duration (returns 2 values now)
+            lab_entries, unique_phones_in_file = parse_lab_file(lab_path, actual_duration_sec)
+            if not lab_entries:
+                 logger.warning(f"Skipping {base_filename}: No valid entries parsed from lab file.")
+                 continue # Keep the continue
+        except Exception as e:
+            logger.error(f"Error getting duration or parsing lab for {base_filename}: {e}")
+            continue # Skip file on error
 
         # Check minimum number of phones
         if len(lab_entries) < min_phones_in_lab:
-             logger.warning(f"Skipping %s: Found %d phones, required minimum %d.", base_filename, len(lab_entries), min_phones_in_lab)
+             logger.warning(f"Skipping {base_filename}: Found {len(lab_entries)} phones, required minimum {min_phones_in_lab}.")
              continue
 
         all_unique_phones.update(unique_phones_in_file)
 
-        # 5. Calculate Initial Durations based on Scaled Timestamps
-        initial_phones = []
+        # 5. Calculate Initial Durations, handling truncation
+        initial_phones_filtered = []
         initial_durations = []
-        if max_end_time <= 0:
-             logging.warning(f"Max end time in lab file {lab_path} is 0 or negative. Cannot scale durations. Skipping {base_filename}.")
-             continue
-        if original_mel_frames <= 0:
-             logging.warning(f"Original mel frames for {wav_path} is 0. Cannot scale durations. Skipping {base_filename}.")
-             continue
+        sr = audio_config['sample_rate']
+        hop_length = audio_config['hop_length']
+        max_reasonable_frames = 10000 # Threshold for warning
 
-        scale_factor = original_mel_frames / max_end_time
-        logging.debug(f"{base_filename}: Original Frames={original_mel_frames}, Max Lab Time={max_end_time:.4f}, Scale Factor={scale_factor:.4f}")
+        for i, (start_sec, end_sec, phone) in enumerate(lab_entries):
+            # Calculate frame indices based on original times
+            start_frame = int(np.round(start_sec * sr / hop_length))
+            end_frame_orig = int(np.round(end_sec * sr / hop_length)) # End frame based on original time
 
-        # --- MODIFICATION START: Calculate, Round, and Borrow ---
-        phones_sequence = []
-        calculated_durations = []
-        last_calculated_end_frame = 0
+            # Ensure start_frame is non-negative
+            start_frame = max(0, start_frame)
 
-        # 1. Calculate scaled frames and durations for ALL phones
-        for start_sec, end_sec, phone in lab_entries:
-            start_frame = round(start_sec * scale_factor)
-            end_frame = round(end_sec * scale_factor)
-            # Ensure frames don't overlap due to rounding/tiny segments
-            start_frame = max(start_frame, last_calculated_end_frame)
-            end_frame = max(end_frame, start_frame)
+            # --- Check if phone starts after truncated audio ends ---
+            if start_frame >= original_mel_frames:
+                logger.warning(f"Skipping phone '{phone}' in {base_filename}: Start frame {start_frame} >= truncated mel frames {original_mel_frames}.")
+                continue # Skip this phone entirely, do not add to lists
 
-            duration = end_frame - start_frame
-            phones_sequence.append(phone)
-            calculated_durations.append(duration)
-            last_calculated_end_frame = end_frame
+            # Cap end_frame at the actual number of frames from the (truncated) mel
+            end_frame = min(original_mel_frames, end_frame_orig)
 
-        # 2. Apply borrowing logic
-        final_durations = list(calculated_durations) # Copy to modify
-        num_phones = len(final_durations)
-        for i in range(num_phones):
-            if final_durations[i] <= 0: # Check for <= 0 just in case
-                original_duration = final_durations[i]
-                borrowed = False
-                phone_symbol = phones_sequence[i]
-                # Try borrowing from next
-                if i + 1 < num_phones and final_durations[i+1] > 1:
-                    final_durations[i] = 1
-                    final_durations[i+1] -= 1
-                    borrowed = True
-                    logging.debug(f"Borrowing from next: Phone {i} ('{phone_symbol}') duration {original_duration} -> 1, Phone {i+1} ('{phones_sequence[i+1]}') duration {calculated_durations[i+1]} -> {final_durations[i+1]} in {base_filename}")
-                # Else, try borrowing from previous
-                elif i - 1 >= 0 and final_durations[i-1] > 1:
-                    final_durations[i] = 1
-                    final_durations[i-1] -= 1
-                    borrowed = True
-                    logging.debug(f"Borrowing from previous: Phone {i} ('{phone_symbol}') duration {original_duration} -> 1, Phone {i-1} ('{phones_sequence[i-1]}') duration {calculated_durations[i-1]} -> {final_durations[i-1]} in {base_filename}")
+            # Calculate duration based on potentially capped end_frame
+            duration = max(0, end_frame - start_frame)
 
-                # Else, force to 1
-                if not borrowed:
-                    final_durations[i] = 1
-                    logging.warning(f"Forcing duration to 1 for phone {i} ('{phone_symbol}') (original: {original_duration}) in {base_filename} as neighbours cannot lend.")
+            # Handle zero duration after calculation/rounding/capping
+            if duration <= 0:
+                 # Log only if start/end times were different
+                 if start_sec != end_sec:
+                      logger.warning(f"Phone '{phone}' in {base_filename} resulted in zero duration (start_frame: {start_frame}, capped_end_frame: {end_frame}). Setting to 1 frame.")
+                 duration = 1 # Ensure minimum duration of 1 frame
 
-        # 3. Populate initial_phones and initial_durations
-        initial_phones = phones_sequence
-        initial_durations = final_durations
+            # Add a warning for excessively long durations (can happen with bad labels)
+            if duration > max_reasonable_frames:
+                logger.warning(f"Excessively long duration calculated for phone '{phone}' in {base_filename}: "
+                               f"{duration} frames. Check input alignment.")
 
-        # Check if any durations are still invalid *after* borrowing (shouldn't happen)
-        if any(d <= 0 for d in initial_durations):
-             logging.error(f"Error: Found zero or negative duration after borrowing logic for {base_filename}. Durations: {initial_durations}. Skipping file.")
-             continue # Skip this file for safety
+            # Append the valid phone and its calculated duration
+            initial_phones_filtered.append(phone)
+            initial_durations.append(duration)
 
-        # Check if the list is empty (e.g., original lab file was empty)
+        # Use the filtered lists from now on
+        initial_phones = initial_phones_filtered
+
+        # Check if the list is empty after filtering
         if not initial_phones:
-             logging.warning(f"Skipping {base_filename} as no phones remained after processing (original lab might be empty or invalid).")
+             logger.warning(f"Skipping {base_filename} as no phones remained after processing and truncation checks.")
              continue
-        # --- MODIFICATION END ---
 
         # 6. Adjust Scaled Durations to Match Target Frames
         adjusted_durations = adjust_durations(initial_phones, initial_durations, target_frames)
@@ -584,21 +634,23 @@ def preprocess_data(config_path='config/model.yaml'):
             'mel': padded_norm_mel, # Store normalized mel
             'f0': padded_norm_f0,   # Store normalized f0
             'midi_pitch_estimated': padded_midi_pitch, # Store padded MIDI pitch
-            'phone_sequence': initial_phones,
-            'duration_sequence': np.array(adjusted_durations, dtype=np.int32),
-            'initial_duration_sequence': np.array(initial_durations, dtype=np.int32), # Keep for potential analysis/vis
+            'phone_sequence': initial_phones, # Store original phone sequence (before ID conversion)
+            'duration_sequence': np.array(adjusted_durations, dtype=np.int64), # Store adjusted durations
+            'initial_duration_sequence': np.array(initial_durations, dtype=np.int64), # Keep for potential analysis/vis
             'voiced_mask': padded_voiced_mask, # Store padded voiced mask (as uint8)
             'unvoiced_flag': padded_unvoiced_flag, # Store padded unvoiced flag (as uint8)
-            'original_unpadded_length': original_mel_frames # Store the original length
+            'original_unpadded_length': original_mel_frames, # Store the original length
+            'raw_audio': raw_audio # Store the raw audio waveform
         }
 
         # Store unnormalized data for the *first* successfully processed file for visualization
         if first_file_data_for_vis is None:
+             first_file_id_for_vis = base_filename # Store the ID too
              first_file_data_for_vis = {
                  'mel': pad_or_truncate(log_mel, target_frames, pad_value=0.0), # Pad original log_mel
                  'f0': pad_or_truncate(log_f0, target_frames, pad_value=0.0),   # Pad original log_f0
                  'midi_pitch': pad_or_truncate(midi_pitch, target_frames, pad_value=0), # Pad original midi_pitch
-                 'phone_sequence': initial_phones,
+                 'phone_sequence': initial_phones, # Use original phone sequence
                  'initial_duration_sequence': np.array(initial_durations, dtype=np.int32) # Use initial durations for vis
              }
 
@@ -702,52 +754,52 @@ def preprocess_data(config_path='config/model.yaml'):
                 else:
                     logging.warning(f"Key 'unvoiced_flag' not found in processed_data for {base_filename} during HDF5 saving.")
 
-                # Save original unpadded length (correctly indented)
-                if 'original_unpadded_length' in data:
-                    logging.debug(f"Attempting to create dataset 'original_unpadded_length' in group '{base_filename}'")
-                    group.create_dataset('original_unpadded_length', data=data['original_unpadded_length'], dtype='i4') # Save as integer
+                # Save raw audio
+                if 'raw_audio' in data:
+                     logging.debug(f"Attempting to create dataset 'raw_audio' in group '{base_filename}'")
+                     group.create_dataset('raw_audio', data=data['raw_audio'], compression="gzip")
                 else:
-                    # This warning should ideally not trigger if the previous step worked
-                    logging.warning(f"Key 'original_unpadded_length' not found in processed_data for {base_filename} during HDF5 saving.")
+                     logging.warning(f"Key 'raw_audio' not found in processed_data for {base_filename} during HDF5 saving.")
 
-        logging.info("HDF5 file saved successfully.")
+                # Save original unpadded length as scalar attribute or dataset
+                group.create_dataset('original_unpadded_length', data=data['original_unpadded_length']) # Save original length
+
 
     except Exception as e:
-        logging.error(f"Error saving HDF5 file: {e}")
+        logger.error(f"Error writing to HDF5 file {output_hdf5_path}: {e}", exc_info=True)
         raise
 
-    # 10. Visualization (using the first file's UNNORMALIZED data)
-    if first_file_data_for_vis:
-        first_filename = list(processed_data.keys())[0] # Get the ID of the first successfully processed file
-        logging.info(f"Generating visualization for example file: {first_filename}")
-        vis_save_path = os.path.join(bin_dir, f"{first_filename}_alignment_check.png")
+    # 10. Save Phone Map to JSON
+    phone_map_path = os.path.join(bin_dir, "phone_to_id.json")
+    try:
+        with open(phone_map_path, 'w') as f_map:
+            json.dump(phone_to_id, f_map, indent=4)
+        logger.info(f"Phone map saved to {phone_map_path}")
+    except Exception as e:
+        logger.error(f"Error saving phone map: {e}")
 
-        # Get phone IDs corresponding to the duration sequence for visualization
-        example_phone_ids = np.array([phone_to_id[p] for p in first_file_data_for_vis['phone_sequence']], dtype=np.int32)
-
+    # 11. Generate Visualization for the first file
+    if first_file_data_for_vis and first_file_id_for_vis:
+        vis_save_path = os.path.join(vis_dir, f"{first_file_id_for_vis}_alignment.png")
         visualize_alignment(
-            mel=first_file_data_for_vis['mel'], # Unnormalized log-mel
-            f0=first_file_data_for_vis['f0'],  # Unnormalized log-f0
-            midi_pitch=first_file_data_for_vis['midi_pitch'], # Pass MIDI pitch
-            phone_ids=example_phone_ids,
-            durations=first_file_data_for_vis['initial_duration_sequence'], # Use initial durations key from the vis dict
+            mel=first_file_data_for_vis['mel'],
+            f0=first_file_data_for_vis['f0'],
+            midi_pitch=first_file_data_for_vis['midi_pitch'],
+            phone_ids=[phone_to_id[p] for p in first_file_data_for_vis['phone_sequence']],
+            durations=first_file_data_for_vis['initial_duration_sequence'], # Use initial durations for vis
             id_to_phone=id_to_phone,
             save_path=vis_save_path
         )
     else:
-        logging.warning("Skipping visualization as no data was processed successfully.")
-
-    logging.info("Preprocessing finished.")
+        logger.warning("Could not generate visualization as no file was successfully processed or stored.")
 
 
+    logger.info("Preprocessing finished.")
+
+# --- Entry Point ---
 if __name__ == "__main__":
-    # Setup logging (can be called again, it's idempotent)
-    # Consider adding command-line args for log level/file later
-    setup_logging(level=logging.INFO)
-    logger.info("Starting preprocessing...")
-    # Example usage: Run preprocessing using the default config path
+    setup_logging() # Setup logging configuration
     try:
         preprocess_data()
-        logger.info("Preprocessing completed successfully.")
     except Exception as e:
-         logger.exception("Preprocessing failed with an error.") # Log full traceback
+        logger.critical(f"Preprocessing failed with critical error: {e}", exc_info=True)
