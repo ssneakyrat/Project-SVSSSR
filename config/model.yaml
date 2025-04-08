@@ -8,11 +8,11 @@ data:
   midi_pitch_key: midi_pitch_estimated # Key for estimated MIDI pitch
   lazy_load: true
   raw_dir: datasets/gin
+  raw_audio_key: raw_audio # Key for the raw audio waveform
   # max_samples: 100 # Set to null or remove to use full dataset
   sample_percentage: null
   variable_length: true
   min_phones_in_lab: 5 # Minimum number of phone entries required in a .lab file to process it
-  raw_audio_key: raw_audio # Key for the raw audio waveform
 
 audio:
   sample_rate: 22050
@@ -60,30 +60,18 @@ model:
 
 # Vocoder specific parameters
 vocoder:
-  name: TinyWaveRNN # Updated to match our implementation
+  name: UNetVocoder  # Changed from TinyWaveRNN
   
-  # TinyWaveRNN core parameters
-  gru_dims: 256     # Hidden dimensions for GRU
-  gru_sparsity: 0.8 # Sparsity ratio for GRU weights (80%)
-  gru_block_size: 16 # Block size for structured sparsity
-  bits: 8           # Bits for audio quantization (μ-law)
-  cond_dims: 64     # Conditioning dimensions
+  # U-Net architecture parameters
+  encoder_channels: [32, 64, 96, 128]
+  decoder_channels: [96, 64, 32, 16]
+  kernel_size: 5
   
-  # Feature embeddings
-  use_f0: true      # Whether to use F0 conditioning
-  f0_dims: 16       # Dimension for F0 embedding
-  use_unvoiced: true # Whether to use unvoiced flag conditioning
-  unvoiced_dims: 16 # Dimension for unvoiced flag embedding
+  # Audio generation parameters
+  noise_scale: 0.6  # Scale factor for noise during inference
   
-  # Training stages
-  teacher_forcing_ratio: 1.0 # Start with full teacher forcing
-  scheduled_sampling: true   # Enable scheduled sampling during training
-  
-  # Audio sample rate options
-  audio_rate_f0: true # Whether to predict F0 at audio rate (NEW)
-  
-  # Inference parameters
-  temperature: 0.6 # Temperature for sampling (lower = more deterministic)
+  # For different chunk-based processing
+  chunk_size_seconds: 2.5  # Process audio in chunks of this duration
 
 # Training Configuration
 train:
@@ -119,28 +107,20 @@ train:
   log_interval: 50        # Log training metrics every N steps
 
   # --- Vocoder Training Specific Params ---
-  vocoder_loss: 'CrossEntropy' # Primary loss function type
-  use_phase_loss: true    # Whether to use additional phase coherence loss for voiced regions
-  loss_lambda_phase: 0.1  # Weight for phase coherence loss component
+  vocoder_loss: 'L1'      # Primary loss function type (L1 for U-Net)
+  loss_lambda_td: 1.0     # Weight for time-domain loss component
+  
   # STFT loss parameters for audio reconstruction quality evaluation
   stft_loss_fft_sizes: [1024, 2048, 512] # FFT sizes for MR-STFT loss
   stft_loss_hop_sizes: [120, 240, 50]    # Hop sizes for MR-STFT loss
   stft_loss_win_lengths: [600, 1200, 240] # Window lengths for MR-STFT loss
   loss_lambda_sc: 0.5     # Weight for spectral convergence loss component
   loss_lambda_mag: 1.0    # Weight for log STFT magnitude loss component
-  loss_lambda_td: 1.0     # Weight for time-domain L1 loss component
-  loss_lambda_f0: 0.5     # Weight for audio-rate F0 prediction loss
-  vocoder_max_epochs: 100 # Maximum epochs for vocoder training
   
-  # --- Vocoder Training Schedule ---
-  teacher_forcing_schedule:
-    initial: 1.0          # Initial teacher forcing ratio
-    final: 0.5            # Final teacher forcing ratio
-    epochs: 50            # Epochs over which to decay teacher forcing
-    
+  vocoder_max_epochs: 1000 # Maximum epochs for vocoder training
+  vocoder_learning_rate: 0.0002 # 0.0001 Learning rate for vocoder training
+  
   # --- Vocoder Logging ---
   log_vocoder_audio_epoch_interval: 5 # Log audio every N validation epochs
-  log_n_vocoder_audio_samples: 1      # Number of audio samples to log from validation batch
+  log_n_vocoder_audio_samples: 2      # Number of audio samples to log from validation batch
   log_vocoder_spectrograms: true      # Whether to log spectrogram comparison plots
-  vocoder_learning_rate: 0.0001 #0.0001       # Learning rate for vocoder training
-  # --- End Vocoder Params ---

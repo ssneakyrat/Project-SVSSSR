@@ -277,7 +277,7 @@ def collate_fn_pad(batch):
     max_len = {} # Store max lengths for padding
     # Determine max lengths for frame-level and phoneme-level sequences
     frame_level_keys = ['mel', 'f0', 'midi_pitch_estimated', 'voiced_mask', 'unvoiced_flag'] # Add voiced_mask, unvoiced_flag
-    #sample_level_keys = ['raw_audio'] # NEW: Keys that are sample-level (audio waveform)
+    sample_level_keys = ['raw_audio'] # NEW: Keys that are sample-level (audio waveform)
     # 'phoneme' key holds frame-level IDs loaded from HDF5, remove it from here
     phoneme_level_keys = ['duration', 'phone_sequence_ids'] # Keys that are phoneme-level
     max_len_frame = 0
@@ -449,7 +449,7 @@ def collate_fn_pad(batch):
         'duration': 'phone_duration', # Rename original duration key
         'voiced_mask': 'voiced_mask', # Keep voiced_mask key
         'unvoiced_flag': 'unvoiced_flag', # Keep unvoiced_flag key
-        #'raw_audio': 'target_audio' # NEW: Rename raw_audio to target_audio
+        'raw_audio': 'target_audio' # NEW: Rename raw_audio to target_audio
         # 'phoneme' key (original phoneme sequence) is not explicitly renamed/included
         # unless needed later.
     }
@@ -494,7 +494,7 @@ class DataModule(pl.LightningDataModule):
             'midi_pitch_estimated': 'midi_pitch_estimated', # Key for estimated MIDI pitch
             'voiced_mask': 'voiced_mask', # Key for the voiced mask
             'unvoiced_flag': 'unvoiced_flag', # Key for the unvoiced flag
-            #'raw_audio': config['data']['raw_audio_key'] # Key for raw audio (NEW)
+            'raw_audio': config['data']['raw_audio_key'] # Key for raw audio (NEW)
         }
         self.lazy_load = config['data'].get('lazy_load', True)
         self.max_samples = config['data'].get('max_samples', None)
