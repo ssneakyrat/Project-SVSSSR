@@ -58,20 +58,35 @@ model:
   # Initial training stage (1, 2, or 3)
   current_stage: 1
 
-# Vocoder specific parameters
 vocoder:
-  name: UNetVocoder  # Changed from TinyWaveRNN
+  name: UNetVocoder  # Keep the same name for compatibility
   
-  # U-Net architecture parameters
+  # U-Net architecture parameters (existing)
   encoder_channels: [32, 64, 96, 128]
-  decoder_channels: [96, 64, 32, 32] #[96, 64, 32, 16]
+  decoder_channels: [96, 64, 32, 32]
   kernel_size: 5
   
-  # Audio generation parameters
-  noise_scale: 0.6  # Scale factor for noise during inference
-  use_f0_conditioning: true # NEW: Enable F0 conditioning for the vocoder
+  # Enhanced architecture parameters (new)
+  use_enhanced_unet: true  # Set to false to use original UNet
   
-  # For different chunk-based processing
+  # Normalization settings
+  norm_type: "instance"  # Options: "batch", "instance", "layer"
+  
+  # Residual connection settings
+  use_residual_connections: true  # Enable residual connections
+  
+  # Attention settings
+  use_attention: true  # Enable self-attention in bottleneck
+  attention_reduction: 8  # Reduction factor for attention (higher = less computation)
+  
+  # Non-adjacent skip connections
+  use_non_adjacent_skips: true  # Enable connections between distant layers
+  
+  # Audio generation parameters (existing)
+  noise_scale: 0.6  # Scale factor for noise during inference
+  use_f0_conditioning: true  # Enable F0 conditioning for the vocoder
+  
+  # For different chunk-based processing (existing)
   chunk_size_seconds: 2.5  # Process audio in chunks of this duration
 
 # Training Configuration

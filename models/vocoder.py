@@ -10,8 +10,9 @@ import torchvision
 import numpy as np
 import matplotlib.pyplot as plt
 
+# Import the enhanced UNet model instead of the original
 from models.unet_vocoder.model import UNetVocoder
-from models.unet_vocoder.utils import generate_noise, audio_to_mel # Assuming audio_to_mel is suitable
+from models.unet_vocoder.utils import generate_noise, audio_to_mel
 from utils.plotting import plot_spectrograms_to_figure
 
 # Helper function for STFT Loss
@@ -32,7 +33,7 @@ class VocoderModel(pl.LightningModule):
         self.config = config.copy()
         self.save_hyperparameters(self.config)
         
-        # Initialize the vocoder model
+        # Initialize the enhanced vocoder model
         self.vocoder = UNetVocoder(self.config)
         self.use_f0 = self.config['vocoder'].get('use_f0_conditioning', False)
         
@@ -90,6 +91,9 @@ class VocoderModel(pl.LightningModule):
             norm='slaney', # Common normalization
             mel_scale="slaney" # Common mel scale
         )
+    
+    # The rest of the class remains unchanged
+    
     def forward(self, mel_spec, f0=None):
         """
         Forward pass through the vocoder model.
