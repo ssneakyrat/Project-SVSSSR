@@ -32,12 +32,12 @@ def main(args):
     
     # Setup checkpoint directory and logging
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    run_name = f"vocoder_{args.name}_{current_time}" if args.name else f"vocoder_{current_time}"
+    run_name = f"version_{args.name}_{current_time}" if args.name else f"vocoder_{current_time}"
     
     # Logging directories
-    log_dir = os.path.join(config['train']['log_dir'], 'vocoder', run_name)
-    tensorboard_dir = os.path.join(config['train']['tensorboard_log_dir'], 'vocoder', run_name)
-    checkpoint_dir = os.path.join(config['train']['checkpoint_dir'], 'vocoder', run_name)
+    log_dir = os.path.join(config['train']['log_dir'], 'vocoder')
+    tensorboard_dir = os.path.join(config['train']['tensorboard_log_dir'], 'vocoder')
+    checkpoint_dir = os.path.join(config['train']['checkpoint_dir'], 'vocoder')
     
     # Create directories
     os.makedirs(log_dir, exist_ok=True)
@@ -98,11 +98,15 @@ def main(args):
             )
         )
     
-    # Initialize TensorBoard logger
+    # Determine experiment name for TensorBoard versioning
+    #tb_experiment_name = args.name if args.name else 'version_'
+
+    # Initialize TensorBoard logger with auto-versioning
     tb_logger = TensorBoardLogger(
-        save_dir=os.path.dirname(tensorboard_dir),
-        name=os.path.basename(tensorboard_dir),
-        default_hp_metric=False
+        save_dir=f"{config['train']['tensorboard_log_dir']}", # Base 'logs' directory
+        name=f"vocoder/",                       # 'version_' or args.name
+        default_hp_metric=False,                        # Keep this parameter
+        # version parameter is omitted to allow auto-versioning (version_0, version_1, ...)
     )
     
     # Training precision
