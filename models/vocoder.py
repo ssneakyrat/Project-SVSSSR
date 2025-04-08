@@ -10,12 +10,16 @@ import torchvision
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Import the enhanced UNet model instead of the original
+# Import the enhanced UNet model
 from models.unet_vocoder.model import UNetVocoder
 from models.unet_vocoder.utils import generate_noise, audio_to_mel
 from utils.plotting import plot_spectrograms_to_figure
 
-# Helper function for STFT Loss
+# Signal Processing Enhancements
+from torchaudio.functional import phase_vocoder
+from torchaudio.transforms import MelScale, Spectrogram
+
+# Helper functions for enhanced spectral loss
 def spectral_convergence_loss(x_mag, y_mag):
     """Spectral convergence loss."""
     return torch.norm(y_mag - x_mag, p="fro") / torch.norm(y_mag, p="fro")
@@ -25,6 +29,145 @@ def log_stft_magnitude_loss(x_mag, y_mag):
     # Add small epsilon to prevent log(0)
     eps = 1e-7
     return F.l1_loss(torch.log(x_mag + eps), torch.log(y_mag + eps))
+
+def phase_loss(x_phase, y_phase):
+    """Phase consistency loss."""
+    # Circular distance between phases
+    phase_diff = torch.abs(torch.angle(torch.exp(1j * (x_phase - y_phase))))
+    return torch.mean(phase_diff)
+
+def apply_perceptual_weighting(spec_mag, sample_rate, curve_type='a', is_mel=False):
+    """
+    Apply perceptual weighting to spectral magnitude (either STFT or mel).
+    
+    Args:
+        spec_mag: Magnitude spectrum [B, F, T] or mel spectrogram [B, M, T]
+        sample_rate: Audio sample rate
+        curve_type: Type of weighting curve ('a' for A-weighting)
+        is_mel: Flag indicating if input is mel spectrogram
+    
+    Returns:
+        Weighted spectrum with same shape as input
+    """
+    # Get frequency dimension directly from the input tensor
+    freq_dim = spec_mag.shape[1]
+    
+    if is_mel:
+        # For mel spectrograms, approximate mel band center frequencies
+        # This is an approximation - ideally we'd use the actual mel filter centers
+        mel_min = 0
+        mel_max = 2595 * np.log10(1 + (sample_rate/2) / 700)
+        mel_points = torch.linspace(mel_min, mel_max, freq_dim, device=spec_mag.device)
+        freqs = 700 * (10**(mel_points / 2595) - 1)
+    else:
+        # For STFT magnitudes, use linear frequency scale
+        freqs = torch.linspace(0, sample_rate/2, freq_dim, device=spec_mag.device)
+    
+    # Define various weighting curves
+    if curve_type == 'a':
+        # A-weighting approximation (simplified)
+        # Based on https://en.wikipedia.org/wiki/A-weighting
+        f2 = torch.pow(freqs, 2)
+        numerator = 12200**2 * f2**2
+        denominator = (f2 + 20.6**2) * torch.sqrt((f2 + 107.7**2) * (f2 + 737.9**2)) * (f2 + 12200**2)
+        weights = 2.0 + 20 * torch.log10(numerator / denominator + 1e-8)
+        # Normalize and convert to range [0, 1]
+        weights = (weights - weights.min()) / (weights.max() - weights.min() + 1e-8)
+    else:
+        # Default: equal weighting
+        weights = torch.ones_like(freqs)
+    
+    # Apply weighting to each frequency bin
+    weights = weights.view(1, -1, 1)  # [1, F, 1]
+    weighted_spec = spec_mag * weights
+    
+    return weighted_spec
+
+def extract_harmonics(audio, f0, sample_rate, harmonic_threshold=0.2):
+    """
+    Extract harmonic components using a comb filter based on F0.
+    
+    Args:
+        audio: Time-domain audio signal [B, T, 1]
+        f0: Fundamental frequency contour [B, T, 1]
+        sample_rate: Audio sample rate
+        harmonic_threshold: Threshold for harmonic band filters
+        
+    Returns:
+        harmonic_part: Harmonic component [B, T, 1]
+        noise_part: Noise residual [B, T, 1]
+    """
+    batch_size, time_len, _ = audio.shape
+    
+    # Flatten the audio for processing
+    audio_flat = audio.squeeze(-1)  # [B, T]
+    
+    # Get STFT
+    spec_transform = Spectrogram(
+        n_fft=2048,
+        hop_length=512,
+        power=None,  # Return complex STFT
+    )
+    
+    # Extract complex spectrum
+    stft = spec_transform(audio_flat)  # [B, F, T_stft, 2] (real, imag)
+    stft_complex = torch.complex(stft[..., 0], stft[..., 1])  # [B, F, T_stft]
+    
+    # Extract magnitudes and phases
+    magnitudes = torch.abs(stft_complex)  # [B, F, T_stft]
+    phases = torch.angle(stft_complex)  # [B, F, T_stft]
+    
+    # Prepare f0 to match STFT time resolution
+    t_stft = stft_complex.shape[2]
+    f0_downsampled = F.interpolate(f0.transpose(1, 2), size=t_stft, mode='linear', align_corners=False)
+    f0_downsampled = f0_downsampled.transpose(1, 2)  # [B, T_stft, 1]
+    
+    # For each frame, create a harmonic mask based on f0
+    harmonic_mask = torch.zeros_like(magnitudes)
+    
+    # Get frequency axis for bins
+    n_fft = stft_complex.shape[1]
+    freqs = torch.linspace(0, sample_rate/2, n_fft, device=audio.device)
+    
+    # For each batch and time step
+    for b in range(batch_size):
+        for t in range(t_stft):
+            # Get the fundamental frequency for this frame
+            f0_val = f0_downsampled[b, t, 0].item()
+            
+            if f0_val > 0:  # Only process for voiced frames
+                # For each harmonic up to Nyquist frequency
+                for h in range(1, int(sample_rate/2 / f0_val) + 1):
+                    harmonic_freq = h * f0_val
+                    
+                    # Find frequency bins close to this harmonic
+                    bin_dist = torch.abs(freqs - harmonic_freq)
+                    
+                    # Set mask to 1 for bins near harmonic
+                    harmonic_width = harmonic_freq * harmonic_threshold
+                    harmonic_mask[b, bin_dist < harmonic_width, t] = 1.0
+    
+    # Apply masks to get harmonic and noise components
+    harmonic_spec = stft_complex * harmonic_mask
+    noise_spec = stft_complex * (1 - harmonic_mask)
+    
+    # Convert back to time domain using inverse STFT
+    harmonic_part = torch.istft(
+        harmonic_spec,
+        n_fft=2048,
+        hop_length=512,
+        length=time_len
+    ).unsqueeze(-1)  # [B, T, 1]
+    
+    noise_part = torch.istft(
+        noise_spec,
+        n_fft=2048,
+        hop_length=512,
+        length=time_len
+    ).unsqueeze(-1)  # [B, T, 1]
+    
+    return harmonic_part, noise_part
+
 
 class VocoderModel(pl.LightningModule):
     def __init__(self, config):
@@ -39,7 +182,7 @@ class VocoderModel(pl.LightningModule):
         
         # Audio parameters
         self.sample_rate = self.config['audio']['sample_rate']
-        self.n_fft = self.config['audio']['n_fft'] # Use n_fft from config
+        self.n_fft = self.config['audio']['n_fft']
         self.hop_length = self.config['audio']['hop_length']
         self.win_length = self.config['audio']['win_length']
         self.n_mels = self.config['audio']['n_mels']
@@ -49,14 +192,30 @@ class VocoderModel(pl.LightningModule):
         # Store noise scale for inference
         self.noise_scale = self.config['vocoder'].get('noise_scale', 0.6)
         
+        # Signal Processing Enhancements
+        # 1. Phase reconstruction
+        self.use_phase_prediction = self.config['vocoder'].get('use_phase_prediction', False)
+        self.phase_loss_weight = self.config['vocoder'].get('phase_loss_weight', 0.5)
+        
+        # 2. Perceptual weighting
+        self.use_perceptual_weighting = self.config['vocoder'].get('use_perceptual_weighting', False)
+        self.perceptual_curve_type = self.config['vocoder'].get('perceptual_curve_type', 'a')
+        
+        # 3. Harmonic-plus-noise model
+        self.use_harmonic_plus_noise = self.config['vocoder'].get('use_harmonic_plus_noise', False)
+        self.harmonic_ratio = self.config['vocoder'].get('harmonic_ratio', 0.7)
+        self.harmonic_loss_weight = self.config['vocoder'].get('harmonic_loss_weight', 0.6)
+        self.noise_loss_weight = self.config['vocoder'].get('noise_loss_weight', 0.4)
+        self.harmonic_threshold = self.config['vocoder'].get('harmonic_threshold', 0.2)
+        
         # Loss configuration
-        self.loss_type = self.config['train'].get('vocoder_loss', 'Combined') # Default to combined
+        self.loss_type = self.config['train'].get('vocoder_loss', 'Combined')
         
         # Loss weights
         self.lambda_td = self.config['train'].get('loss_lambda_td', 1.0)
-        self.lambda_sc = self.config['train'].get('loss_lambda_sc', 0.0) # Default to 0 if not specified
-        self.lambda_mag = self.config['train'].get('loss_lambda_mag', 0.0) # Default to 0 if not specified
-        self.lambda_mel = self.config['train'].get('loss_lambda_mel', 0.0) # Default to 0 if not specified
+        self.lambda_sc = self.config['train'].get('loss_lambda_sc', 0.0)
+        self.lambda_mag = self.config['train'].get('loss_lambda_mag', 0.0)
+        self.lambda_mel = self.config['train'].get('loss_lambda_mel', 0.0)
 
         # STFT parameters for loss calculation
         self.stft_fft_size = self.config['train'].get('stft_fft_size', self.n_fft)
@@ -69,14 +228,13 @@ class VocoderModel(pl.LightningModule):
             hop_length=self.stft_hop_size,
             win_length=self.stft_win_length,
             window_fn=torch.hann_window,
-            power=None, # Return complex result
+            power=None,  # Return complex result
             center=True,
             pad_mode="reflect",
             normalized=False,
         )
         
         # Create Mel Spectrogram operator for reconstruction loss
-        # Ensure parameters match those used for input mel generation
         self.mel_spectrogram_transform = T.MelSpectrogram(
             sample_rate=self.sample_rate,
             n_fft=self.n_fft,
@@ -85,14 +243,35 @@ class VocoderModel(pl.LightningModule):
             f_min=self.fmin,
             f_max=self.fmax,
             n_mels=self.n_mels,
-            power=1.0, # Use power=1 for magnitude mels if input mels are magnitude based
+            power=1.0,
             center=True,
             pad_mode="reflect",
-            norm='slaney', # Common normalization
-            mel_scale="slaney" # Common mel scale
+            norm='slaney',
+            mel_scale="slaney"
         )
-    
-    # The rest of the class remains unchanged
+        
+        # Multi-resolution STFT parameters
+        self.use_multi_resolution_stft = self.config['vocoder'].get('use_multi_resolution_stft', False)
+        if self.use_multi_resolution_stft:
+            # Define multiple STFT resolutions
+            self.stft_resolutions = [
+                {"n_fft": 512, "hop_length": 128, "win_length": 512},
+                {"n_fft": 1024, "hop_length": 256, "win_length": 1024},
+                {"n_fft": 2048, "hop_length": 512, "win_length": 2048},
+            ]
+            # Create STFT operators for each resolution
+            self.stft_transforms = nn.ModuleList([
+                T.Spectrogram(
+                    n_fft=params["n_fft"],
+                    hop_length=params["hop_length"],
+                    win_length=params["win_length"],
+                    window_fn=torch.hann_window,
+                    power=None,
+                    center=True,
+                    pad_mode="reflect",
+                    normalized=False,
+                ) for params in self.stft_resolutions
+            ])
     
     def forward(self, mel_spec, f0=None):
         """
@@ -111,8 +290,6 @@ class VocoderModel(pl.LightningModule):
         noise = torch.randn(batch_size, time_steps, 1, device=mel_spec.device) * self.noise_scale
         
         # Generate waveform with the UNetVocoder
-        # The UNetVocoder now handles the internal upsampling to audio rate
-        # Pass f0 if conditioning is enabled
         if self.use_f0:
             if f0 is None:
                  raise ValueError("F0 conditioning is enabled, but f0 tensor was not provided.")
@@ -129,7 +306,7 @@ class VocoderModel(pl.LightningModule):
         mel_spec = batch.get('mel_spec')
         target_audio = batch.get('target_audio')
         lengths = batch.get('length')  # Original audio lengths before padding
-        f0 = batch.get(self.config['data'].get('f0_key', 'f0_contour'), None) # Get F0 using key from config
+        f0 = batch.get('f0', None)  # Get F0 using key from config
         
         # Reshape target audio if needed: [B, T_audio] -> [B, T_audio, 1]
         if target_audio is not None and target_audio.dim() == 2:
@@ -191,7 +368,6 @@ class VocoderModel(pl.LightningModule):
             # Pad prediction
             padding = target_len - pred_len
             # Pad the end of the last dimension
-            # F.pad expects pads for (last_dim_start, last_dim_end, second_last_dim_start, ...)
             pad_dims = [0] * (pred.dim() * 2)
             pad_dims[0] = 0 # No padding at the start of the last dim
             pad_dims[1] = padding # Pad end of last dim
@@ -205,7 +381,7 @@ class VocoderModel(pl.LightningModule):
         y_pred_adj, y_true_adj = self._ensure_same_time_domain_length(y_pred, y_true)
         return F.l1_loss(y_pred_adj, y_true_adj)
 
-    def stft_loss(self, y_pred, y_true):
+    def stft_loss(self, y_pred, y_true, apply_weighting=False):
         """ Compute Single-Resolution STFT loss (SC + Mag). """
         # Ensure inputs are flat [B, T_audio]
         y_pred_flat = y_pred.squeeze(-1)
@@ -221,12 +397,79 @@ class VocoderModel(pl.LightningModule):
         # Get magnitudes
         stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
         stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
+        
+        # Apply perceptual weighting if enabled
+        if apply_weighting and self.use_perceptual_weighting:
+            stft_pred_mag = apply_perceptual_weighting(
+                stft_pred_mag, self.sample_rate, self.perceptual_curve_type)
+            stft_true_mag = apply_perceptual_weighting(
+                stft_true_mag, self.sample_rate, self.perceptual_curve_type)
+
+        # Get phases if phase prediction is enabled
+        if self.use_phase_prediction:
+            # Extract phase information
+            stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
+            stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
+            # Calculate phase loss
+            phase_loss_val = phase_loss(stft_pred_phase, stft_true_phase)
+        else:
+            phase_loss_val = torch.tensor(0.0, device=y_pred.device)
 
         # Calculate loss components
         sc_loss = spectral_convergence_loss(stft_pred_mag, stft_true_mag)
         mag_loss = log_stft_magnitude_loss(stft_pred_mag, stft_true_mag)
         
-        return sc_loss, mag_loss
+        return sc_loss, mag_loss, phase_loss_val
+    
+    def multi_resolution_stft_loss(self, y_pred, y_true, apply_weighting=False):
+        """Compute Multi-Resolution STFT loss across different FFT sizes."""
+        # Ensure inputs are flat [B, T_audio]
+        y_pred_flat = y_pred.squeeze(-1)
+        y_true_flat = y_true.squeeze(-1)
+        
+        # Trim to same length before STFT
+        y_pred_flat, y_true_flat = self._ensure_same_time_domain_length(y_pred_flat, y_true_flat)
+        
+        sc_losses = []
+        mag_losses = []
+        phase_losses = []
+        
+        # Calculate STFT for each resolution
+        for stft_transform in self.stft_transforms:
+            stft_pred = stft_transform(y_pred_flat)
+            stft_true = stft_transform(y_true_flat)
+            
+            # Get magnitudes
+            stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9)
+            stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9)
+            
+            # Apply perceptual weighting if enabled
+            if apply_weighting and self.use_perceptual_weighting:
+                stft_pred_mag = apply_perceptual_weighting(
+                    stft_pred_mag, self.sample_rate, self.perceptual_curve_type, False)
+                stft_true_mag = apply_perceptual_weighting(
+                    stft_true_mag, self.sample_rate, self.perceptual_curve_type, False)
+            
+            # Calculate losses
+            sc_losses.append(spectral_convergence_loss(stft_pred_mag, stft_true_mag))
+            mag_losses.append(log_stft_magnitude_loss(stft_pred_mag, stft_true_mag))
+            
+            # Calculate phase loss if enabled
+            if self.use_phase_prediction:
+                stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
+                stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
+                phase_losses.append(phase_loss(stft_pred_phase, stft_true_phase))
+        
+        # Average losses across resolutions
+        sc_loss = torch.mean(torch.stack(sc_losses))
+        mag_loss = torch.mean(torch.stack(mag_losses))
+        
+        if self.use_phase_prediction:
+            phase_loss_val = torch.mean(torch.stack(phase_losses))
+        else:
+            phase_loss_val = torch.tensor(0.0, device=y_pred.device)
+            
+        return sc_loss, mag_loss, phase_loss_val
 
     def mel_reconstruction_loss(self, generated_audio, target_mel):
         """ Compute Mel Spectrogram Reconstruction Loss. """
@@ -234,23 +477,47 @@ class VocoderModel(pl.LightningModule):
         gen_audio_flat = generated_audio.squeeze(-1)
         
         # Generate mel from audio
-        # Need to handle potential length differences between input mel and mel from generated audio
-        # Option 1: Pad/trim audio before mel transform (might be inaccurate if lengths differ significantly)
-        # Option 2: Pad/trim mel spectrograms after transform (preferred)
-        
         gen_mel = self.mel_spectrogram_transform(gen_audio_flat) # [B, M, T_mel_gen]
         
         # Target mel is likely [B, T_mel_target, M], transpose it
         target_mel_transposed = target_mel.transpose(1, 2) # [B, M, T_mel_target]
         
-        # Ensure same time dimension (T_mel) by padding/trimming the shorter one
-        gen_mel_adj, target_mel_adj = self._ensure_same_mel_length(gen_mel, target_mel_transposed) # Adjusts gen_mel (dim 2) to match target_mel (dim 2) length
+        # Ensure same time dimension
+        gen_mel_adj, target_mel_adj = self._ensure_same_mel_length(gen_mel, target_mel_transposed)
+        
+        # Apply perceptual weighting if enabled
+        if self.use_perceptual_weighting:
+            gen_mel_adj = apply_perceptual_weighting(
+                gen_mel_adj, self.sample_rate, self.perceptual_curve_type, is_mel=True)
+            target_mel_adj = apply_perceptual_weighting(
+                target_mel_adj, self.sample_rate, self.perceptual_curve_type, is_mel=True)
         
         # Calculate L1 loss
         mel_loss = F.l1_loss(gen_mel_adj, target_mel_adj)
         return mel_loss
     
-    def _calculate_combined_loss(self, generated_audio, target_audio, mel_spec):
+    def harmonic_plus_noise_loss(self, generated_audio, target_audio, f0):
+        """
+        Compute harmonic and noise-specific losses using harmonic-plus-noise decomposition.
+        """
+        # Extract harmonic and noise components
+        gen_harmonic, gen_noise = extract_harmonics(
+            generated_audio, f0, self.sample_rate, self.harmonic_threshold)
+        
+        target_harmonic, target_noise = extract_harmonics(
+            target_audio, f0, self.sample_rate, self.harmonic_threshold)
+        
+        # Compute L1 losses for each component
+        harmonic_loss = F.l1_loss(gen_harmonic, target_harmonic)
+        noise_loss = F.l1_loss(gen_noise, target_noise)
+        
+        # Weight and combine
+        combined_loss = (self.harmonic_loss_weight * harmonic_loss + 
+                         self.noise_loss_weight * noise_loss)
+        
+        return combined_loss, harmonic_loss, noise_loss
+    
+    def _calculate_combined_loss(self, generated_audio, target_audio, mel_spec, f0=None):
         """ Calculates all loss components and combines them. """
         loss = 0
         losses = {}
@@ -263,22 +530,36 @@ class VocoderModel(pl.LightningModule):
         else:
              losses['td_loss'] = torch.tensor(0.0, device=generated_audio.device)
 
-        # 2. STFT Loss (SC + Mag)
+        # 2. STFT Loss (SC + Mag + Phase)
         if self.lambda_sc > 0 or self.lambda_mag > 0:
-            sc_loss, mag_loss = self.stft_loss(generated_audio, target_audio)
+            if self.use_multi_resolution_stft:
+                sc_loss, mag_loss, phase_loss_val = self.multi_resolution_stft_loss(
+                    generated_audio, target_audio, self.use_perceptual_weighting)
+            else:
+                sc_loss, mag_loss, phase_loss_val = self.stft_loss(
+                    generated_audio, target_audio, self.use_perceptual_weighting)
+            
             if self.lambda_sc > 0:
                 loss += self.lambda_sc * sc_loss
                 losses['sc_loss'] = sc_loss
             else:
                  losses['sc_loss'] = torch.tensor(0.0, device=generated_audio.device)
+                 
             if self.lambda_mag > 0:
                 loss += self.lambda_mag * mag_loss
                 losses['mag_loss'] = mag_loss
             else:
                  losses['mag_loss'] = torch.tensor(0.0, device=generated_audio.device)
+                 
+            if self.use_phase_prediction and self.phase_loss_weight > 0:
+                loss += self.phase_loss_weight * phase_loss_val
+                losses['phase_loss'] = phase_loss_val
+            else:
+                losses['phase_loss'] = torch.tensor(0.0, device=generated_audio.device)
         else:
              losses['sc_loss'] = torch.tensor(0.0, device=generated_audio.device)
              losses['mag_loss'] = torch.tensor(0.0, device=generated_audio.device)
+             losses['phase_loss'] = torch.tensor(0.0, device=generated_audio.device)
 
         # 3. Mel Reconstruction Loss
         if self.lambda_mel > 0:
@@ -287,6 +568,19 @@ class VocoderModel(pl.LightningModule):
             losses['mel_loss'] = mel_loss
         else:
              losses['mel_loss'] = torch.tensor(0.0, device=generated_audio.device)
+             
+        # 4. Harmonic-Plus-Noise Loss (if enabled and f0 is available)
+        if self.use_harmonic_plus_noise and f0 is not None:
+            hn_loss, h_loss, n_loss = self.harmonic_plus_noise_loss(
+                generated_audio, target_audio, f0)
+            loss += hn_loss
+            losses['harmonic_loss'] = h_loss
+            losses['noise_loss'] = n_loss
+            losses['hn_combined_loss'] = hn_loss
+        else:
+            losses['harmonic_loss'] = torch.tensor(0.0, device=generated_audio.device)
+            losses['noise_loss'] = torch.tensor(0.0, device=generated_audio.device)
+            losses['hn_combined_loss'] = torch.tensor(0.0, device=generated_audio.device)
              
         losses['total_loss'] = loss
         return losses
@@ -298,7 +592,7 @@ class VocoderModel(pl.LightningModule):
         generated_audio = self(mel_spec, f0=f0 if self.use_f0 else None)
         
         # Calculate losses
-        losses = self._calculate_combined_loss(generated_audio, target_audio, mel_spec)
+        losses = self._calculate_combined_loss(generated_audio, target_audio, mel_spec, f0)
         
         # Log losses
         self.log('train/loss', losses['total_loss'], on_step=True, on_epoch=True, prog_bar=True)
@@ -306,6 +600,13 @@ class VocoderModel(pl.LightningModule):
         self.log('train/sc_loss', losses['sc_loss'], on_step=True, on_epoch=True)
         self.log('train/mag_loss', losses['mag_loss'], on_step=True, on_epoch=True)
         self.log('train/mel_loss', losses['mel_loss'], on_step=True, on_epoch=True)
+        
+        if self.use_phase_prediction:
+            self.log('train/phase_loss', losses['phase_loss'], on_step=True, on_epoch=True)
+            
+        if self.use_harmonic_plus_noise:
+            self.log('train/harmonic_loss', losses['harmonic_loss'], on_step=True, on_epoch=True)
+            self.log('train/noise_loss', losses['noise_loss'], on_step=True, on_epoch=True)
         
         return losses['total_loss']
     
@@ -316,7 +617,7 @@ class VocoderModel(pl.LightningModule):
         generated_audio = self(mel_spec, f0=f0 if self.use_f0 else None)
         
         # Calculate losses
-        losses = self._calculate_combined_loss(generated_audio, target_audio, mel_spec)
+        losses = self._calculate_combined_loss(generated_audio, target_audio, mel_spec, f0)
         
         # Log losses
         self.log('val/loss', losses['total_loss'], on_step=False, on_epoch=True, prog_bar=True)
@@ -325,121 +626,115 @@ class VocoderModel(pl.LightningModule):
         self.log('val/mag_loss', losses['mag_loss'], on_step=False, on_epoch=True)
         self.log('val/mel_loss', losses['mel_loss'], on_step=False, on_epoch=True)
         
+        if self.use_phase_prediction:
+            self.log('val/phase_loss', losses['phase_loss'], on_step=False, on_epoch=True)
+            
+        if self.use_harmonic_plus_noise:
+            self.log('val/harmonic_loss', losses['harmonic_loss'], on_step=False, on_epoch=True)
+            self.log('val/noise_loss', losses['noise_loss'], on_step=False, on_epoch=True)
+        
         # Log audio samples every N epochs
         if batch_idx == 0 and self.current_epoch % self.config['train'].get('log_vocoder_audio_epoch_interval', 5) == 0:
             self._log_audio_samples(mel_spec, generated_audio, target_audio)
-            # Log mel comparison
             self._log_mel_comparison(mel_spec, generated_audio)
             
-        # Return the dictionary of losses for potential callbacks or further analysis
+            # If harmonic-plus-noise model is enabled, visualize components
+            if self.use_harmonic_plus_noise and f0 is not None:
+                self._log_harmonic_noise_components(generated_audio, target_audio, f0)
+            
         return losses
     
     def _log_audio_samples(self, mel_spec, generated_audio, target_audio):
-        """
-        Log audio samples and spectrograms for visualization
-        """
-        # Only log the first sample in the batch
-        idx = 0
+        """Log audio samples and spectrograms for visualization"""
+        # Only log the first few samples in the batch
+        num_samples = min(2, mel_spec.size(0))
         
-        # Get original mel spectrogram for visualization
-        mel_to_plot = mel_spec[idx].detach().cpu().numpy().T  # [M, T]
-        
-        # Plot the mel spectrogram
-        fig = plt.figure(figsize=(10, 4))
-        plt.imshow(mel_to_plot, aspect='auto', origin='lower')
-        plt.colorbar()
-        plt.title("Input Mel Spectrogram")
-        plt.tight_layout()
-        
-        # Convert to image and log to tensorboard
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png')
-        buf.seek(0)
-        plt.close(fig)
-        
-        # Convert to tensor and log
-        img = Image.open(buf)
-        img_tensor = torchvision.transforms.ToTensor()(img)
-        
-        # Log to tensorboard
-        if self.logger:
-            self.logger.experiment.add_image(
-                f'mel_spec/sample_{idx}',
-                img_tensor,
-                self.global_step
-            )
+        for idx in range(num_samples):
+            # Get original mel spectrogram for visualization
+            mel_to_plot = mel_spec[idx].detach().cpu().numpy().T  # [M, T]
             
-            # Log audio samples - now at full audio rate
-            if hasattr(self.logger.experiment, 'add_audio'):
-                # Get audio samples
-                gen_audio = generated_audio[idx, :, 0].detach().cpu()
-                tgt_audio = target_audio[idx, :, 0].detach().cpu()
-                
-                # Normalize for audio logging
-                gen_audio = gen_audio / (gen_audio.abs().max() + 1e-6)
-                tgt_audio = tgt_audio / (tgt_audio.abs().max() + 1e-6)
-                
-                # Ensure both have same length for comparison
-                min_len = min(gen_audio.size(0), tgt_audio.size(0))
-                gen_audio = gen_audio[:min_len]
-                tgt_audio = tgt_audio[:min_len]
-                
-                # Log audio at full sample rate since our model now outputs at audio rate
-                self.logger.experiment.add_audio(
-                    f'audio/generated_{idx}',
-                    gen_audio,
-                    self.global_step,
-                    sample_rate=self.sample_rate
+            # Plot the mel spectrogram
+            fig = plt.figure(figsize=(10, 4))
+            plt.imshow(mel_to_plot, aspect='auto', origin='lower')
+            plt.colorbar()
+            plt.title(f"Input Mel Spectrogram - Sample {idx}")
+            plt.tight_layout()
+            
+            # Convert to image and log to tensorboard
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            plt.close(fig)
+            
+            # Convert to tensor and log
+            img = Image.open(buf)
+            img_tensor = torchvision.transforms.ToTensor()(img)
+            
+            # Log to tensorboard
+            if self.logger:
+                self.logger.experiment.add_image(
+                    f'mel_spec/sample_{idx}',
+                    img_tensor,
+                    self.global_step
                 )
-                self.logger.experiment.add_audio(
-                    f'audio/target_{idx}',
-                    tgt_audio,
-                    self.global_step,
-                    sample_rate=self.sample_rate
-                )
+                
+                # Log audio samples
+                if hasattr(self.logger.experiment, 'add_audio'):
+                    # Get audio samples
+                    gen_audio = generated_audio[idx, :, 0].detach().cpu()
+                    tgt_audio = target_audio[idx, :, 0].detach().cpu()
+                    
+                    # Normalize for audio logging
+                    gen_audio = gen_audio / (gen_audio.abs().max() + 1e-6)
+                    tgt_audio = tgt_audio / (tgt_audio.abs().max() + 1e-6)
+                    
+                    # Ensure both have same length for comparison
+                    min_len = min(gen_audio.size(0), tgt_audio.size(0))
+                    gen_audio = gen_audio[:min_len]
+                    tgt_audio = tgt_audio[:min_len]
+                    
+                    # Log audio at full sample rate
+                    self.logger.experiment.add_audio(
+                        f'audio/generated_{idx}',
+                        gen_audio,
+                        self.global_step,
+                        sample_rate=self.sample_rate
+                    )
+                    self.logger.experiment.add_audio(
+                        f'audio/target_{idx}',
+                        tgt_audio,
+                        self.global_step,
+                        sample_rate=self.sample_rate
+                    )
     
     def _log_mel_comparison(self, input_mel, generated_audio):
-        """
-        Create and log a visualization comparing input mel spectrograms with 
-        mel spectrograms generated from the predicted audio
-        
-        Args:
-            input_mel (torch.Tensor): Input mel spectrogram [B, T, M]
-            generated_audio (torch.Tensor): Generated audio from the model [B, T*hop_length, 1]
-        """
-        # Only use the first sample from the batch for visualization
+        """Create and log a visualization comparing input mel spectrograms with 
+        mel spectrograms generated from the predicted audio"""
+        # Only use the first sample for visualization
         idx = 0
         
         # Get the input mel spectrogram
         input_mel_np = input_mel[idx].detach().cpu().numpy().T  # [M, T]
         
-        # Get the expected time dimension for the generated mel
-        expected_frames = input_mel_np.shape[1]
-        
-        # Convert generated audio back to mel spectrogram - now appropriately at full audio rate
+        # Convert generated audio back to mel spectrogram
         gen_audio_flat = generated_audio[idx, :, 0].detach().cpu().unsqueeze(0)  # [1, T*hop_length]
         
         # Use the initialized transform for consistency
         with torch.no_grad():
-             gen_mel = self.mel_spectrogram_transform(gen_audio_flat.to(self.device)) # Ensure device match
-             gen_mel_np = gen_mel[0].cpu().numpy() # Shape [M, T_mel_gen]
+             gen_mel = self.mel_spectrogram_transform(gen_audio_flat.to(self.device))
+             gen_mel_np = gen_mel[0].cpu().numpy()  # [M, T_mel_gen]
         
-        # Get shapes for comparison and potential resizing
-        input_shape = input_mel_np.shape # Should be [M, T_mel_target]
-        gen_shape = gen_mel_np.shape   # Should be [M, T_mel_gen]
-        # print(f"Input mel shape: {input_shape}, Generated mel shape: {gen_shape}") # Optional debug print
+        # Get shapes for comparison
+        input_shape = input_mel_np.shape
+        gen_shape = gen_mel_np.shape
         
-        # If lengths still don't match exactly, resize for visualization
+        # If lengths don't match, resize for visualization
         if gen_shape[1] != input_shape[1]:
             from scipy.ndimage import zoom
-            # Get the scaling factor
             scale_factor = input_shape[1] / gen_shape[1]
-            # Resize only the time dimension
             gen_mel_np = zoom(gen_mel_np, (1, scale_factor), order=1)
-            if self.global_step % 100 == 0: # Log resizing less frequently
-                 print(f"Resized generated mel from {gen_shape} to {gen_mel_np.shape} for visualization")
         
-        # Create figure with two subplots vertically stacked
+        # Create figure with two subplots
         fig, axes = plt.subplots(2, 1, figsize=(10, 8))
         
         # Plot input mel spectrogram on top
@@ -474,6 +769,111 @@ class VocoderModel(pl.LightningModule):
                 img_tensor,
                 self.global_step
             )
+    
+    def _log_harmonic_noise_components(self, generated_audio, target_audio, f0):
+        """Visualize and log harmonic and noise components"""
+        # Only use the first sample
+        idx = 0
+        
+        # Get components
+        with torch.no_grad():
+            gen_harmonic, gen_noise = extract_harmonics(
+                generated_audio[idx:idx+1], 
+                f0[idx:idx+1], 
+                self.sample_rate,
+                self.harmonic_threshold
+            )
+            
+            target_harmonic, target_noise = extract_harmonics(
+                target_audio[idx:idx+1],
+                f0[idx:idx+1],
+                self.sample_rate,
+                self.harmonic_threshold
+            )
+        
+        # Compute spectrograms for visualization
+        stft_transform = Spectrogram(
+            n_fft=1024,
+            hop_length=256,
+            power=2.0  # Power spectrogram
+        )
+        
+        # Convert to CPU and calculate spectrograms
+        gen_h_spec = stft_transform(gen_harmonic.squeeze(-1).cpu())[0]
+        gen_n_spec = stft_transform(gen_noise.squeeze(-1).cpu())[0]
+        tgt_h_spec = stft_transform(target_harmonic.squeeze(-1).cpu())[0]
+        tgt_n_spec = stft_transform(target_noise.squeeze(-1).cpu())[0]
+        
+        # Convert to dB scale for better visualization
+        def to_db(spec):
+            return 10 * torch.log10(spec + 1e-9)
+        
+        gen_h_spec_db = to_db(gen_h_spec).numpy()
+        gen_n_spec_db = to_db(gen_n_spec).numpy()
+        tgt_h_spec_db = to_db(tgt_h_spec).numpy()
+        tgt_n_spec_db = to_db(tgt_n_spec).numpy()
+        
+        # Create figure with four subplots
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+        
+        # Plot spectrograms
+        im0 = axes[0, 0].imshow(tgt_h_spec_db, aspect='auto', origin='lower')
+        axes[0, 0].set_title("Target Harmonic Component")
+        fig.colorbar(im0, ax=axes[0, 0])
+        
+        im1 = axes[0, 1].imshow(gen_h_spec_db, aspect='auto', origin='lower')
+        axes[0, 1].set_title("Generated Harmonic Component")
+        fig.colorbar(im1, ax=axes[0, 1])
+        
+        im2 = axes[1, 0].imshow(tgt_n_spec_db, aspect='auto', origin='lower')
+        axes[1, 0].set_title("Target Noise Component")
+        fig.colorbar(im2, ax=axes[1, 0])
+        
+        im3 = axes[1, 1].imshow(gen_n_spec_db, aspect='auto', origin='lower')
+        axes[1, 1].set_title("Generated Noise Component")
+        fig.colorbar(im3, ax=axes[1, 1])
+        
+        plt.tight_layout()
+        
+        # Convert to image and log to tensorboard
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+        
+        # Convert to tensor and log
+        img = Image.open(buf)
+        img_tensor = torchvision.transforms.ToTensor()(img)
+        
+        # Log to tensorboard
+        if self.logger:
+            self.logger.experiment.add_image(
+                f'harmonic_noise_decomposition/sample_{idx}',
+                img_tensor,
+                self.global_step
+            )
+            
+            # Log audio samples of components
+            if hasattr(self.logger.experiment, 'add_audio'):
+                # Normalize and prepare audio samples
+                components = {
+                    'harmonic/target': target_harmonic[0, :, 0].detach().cpu(),
+                    'harmonic/generated': gen_harmonic[0, :, 0].detach().cpu(),
+                    'noise/target': target_noise[0, :, 0].detach().cpu(),
+                    'noise/generated': gen_noise[0, :, 0].detach().cpu()
+                }
+                
+                # Log each component
+                for name, audio in components.items():
+                    # Normalize
+                    audio = audio / (audio.abs().max() + 1e-6)
+                    # Log
+                    self.logger.experiment.add_audio(
+                        f'components/{name}',
+                        audio,
+                        self.global_step,
+                        sample_rate=self.sample_rate
+                    )
     
     def configure_optimizers(self):
         # Get learning rate from config

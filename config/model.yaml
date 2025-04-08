@@ -61,12 +61,34 @@ model:
 vocoder:
   name: UNetVocoder  # Keep the same name for compatibility
   
+  # === SIGNAL PROCESSING ENHANCEMENTS ===
+  
+  # 1. Phase Reconstruction Improvement
+  use_phase_prediction: true  # Enable explicit phase modeling
+  phase_loss_weight: 0.5      # Weight for phase reconstruction loss
+  
+  # 2. Perceptual Weighting
+  use_perceptual_weighting: true   # Enable perceptual weighting
+  perceptual_curve_type: 'a'       # Use A-weighting curve ('a', flat, or custom)
+  
+  # 3. Harmonic-Plus-Noise Model
+  use_harmonic_plus_noise: true     # Enable harmonic + noise decomposition
+  harmonic_ratio: 0.7               # Balance between harmonic and noise components
+  harmonic_loss_weight: 0.6         # Weight for harmonic component loss
+  noise_loss_weight: 0.4            # Weight for noise component loss
+  harmonic_threshold: 0.2           # Threshold for harmonic band filters
+  
+  # 4. Multi-Resolution STFT Analysis
+  use_multi_resolution_stft: true   # Use multiple STFT resolutions for loss
+  
+  # === END SIGNAL PROCESSING ENHANCEMENTS ===
+  
   # U-Net architecture parameters (existing)
   encoder_channels: [32, 64, 96, 128]
   decoder_channels: [96, 64, 32, 32]
   kernel_size: 5
   
-  # Enhanced architecture parameters (new)
+  # Enhanced architecture parameters (existing)
   use_enhanced_unet: true  # Set to false to use original UNet
   
   # Normalization settings
@@ -123,19 +145,19 @@ train:
   log_interval: 50        # Log training metrics every N steps
 
   # --- Vocoder Training Specific Params ---
-  vocoder_loss: 'Combined' # UPDATED: Reflects L1 + STFT + Mel Recon
+  vocoder_loss: 'Combined' # UPDATED: Reflects all loss components
   loss_lambda_td: 0.7     # Weight for time-domain (L1) loss component
   
-  # Single-Resolution STFT loss parameters
-  stft_fft_size: 1024     # NEW: FFT size for Single-Res STFT loss
-  stft_hop_size: 120      # NEW: Hop size for Single-Res STFT loss
-  stft_win_length: 600    # NEW: Window length for Single-Res STFT loss
+  # STFT loss parameters (now used in multi-resolution framework)
+  stft_fft_size: 1024     # Base FFT size for STFT loss
+  stft_hop_size: 120      # Base hop size for STFT loss
+  stft_win_length: 600    # Base window length for STFT loss
   loss_lambda_sc: 0.7     # Weight for spectral convergence loss component
   loss_lambda_mag: 0.8    # Weight for log STFT magnitude loss component
-  loss_lambda_mel: 0.7    # NEW: Weight for Mel Spectrogram Reconstruction loss
+  loss_lambda_mel: 0.7    # Weight for Mel Spectrogram Reconstruction loss
   
   vocoder_max_epochs: 1000 # Maximum epochs for vocoder training
-  vocoder_learning_rate: 0.00001 # 0.0001 Learning rate for vocoder training
+  vocoder_learning_rate: 0.00001 # Learning rate for vocoder training
   
   # --- Vocoder Logging ---
   log_vocoder_audio_epoch_interval: 5 # Log audio every N validation epochs
