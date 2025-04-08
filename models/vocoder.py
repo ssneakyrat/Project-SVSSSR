@@ -10,20 +10,40 @@ import torchvision
 import numpy as np
 import matplotlib.pyplot as plt
 
-from models.unet_vocoder.model import UNetVocoder
-from models.unet_vocoder.utils import generate_noise, audio_to_mel # Assuming audio_to_mel is suitable
+import itertools
+from models.hifigan.generator import Generator
+from models.hifigan.discriminator import MultiPeriodDiscriminator, MultiScaleDiscriminator
+# from models.unet_vocoder.utils import audio_to_mel # Keep if needed for mel loss
 from utils.plotting import plot_spectrograms_to_figure
 
-# Helper function for STFT Loss
-def spectral_convergence_loss(x_mag, y_mag):
-    """Spectral convergence loss."""
-    return torch.norm(y_mag - x_mag, p="fro") / torch.norm(y_mag, p="fro")
+# GAN Loss Helper Functions (can be moved to a utils file later)
+def feature_loss(fmap_r, fmap_g):
+    loss = 0
+    for dr, dg in zip(fmap_r, fmap_g):
+        for rl, gl in zip(dr, dg):
+            loss += torch.mean(torch.abs(rl - gl))
+    return loss * 2 # Multiply by 2 as in the official HiFi-GAN implementation
 
-def log_stft_magnitude_loss(x_mag, y_mag):
-    """Log STFT magnitude loss."""
-    # Add small epsilon to prevent log(0)
-    eps = 1e-7
-    return F.l1_loss(torch.log(x_mag + eps), torch.log(y_mag + eps))
+def discriminator_loss(disc_real_outputs, disc_generated_outputs):
+    loss = 0
+    r_losses = []
+    g_losses = []
+    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+        r_loss = torch.mean((1 - dr)**2)
+        g_loss = torch.mean(dg**2)
+        loss += (r_loss + g_loss)
+        r_losses.append(r_loss.item())
+        g_losses.append(g_loss.item())
+    return loss, r_losses, g_losses
+
+def generator_loss(disc_outputs):
+    loss = 0
+    gen_losses = []
+    for dg in disc_outputs:
+        l = torch.mean((1 - dg)**2)
+        gen_losses.append(l)
+        loss += l
+    return loss, gen_losses
 
 class VocoderModel(pl.LightningModule):
     def __init__(self, config):
@@ -31,11 +51,13 @@ class VocoderModel(pl.LightningModule):
         # Detach config from graph to avoid issues with saving hyperparameters
         self.config = config.copy()
         self.save_hyperparameters(self.config)
+        self.automatic_optimization = False # Enable manual optimization
         
-        # Initialize the vocoder model
-        self.vocoder = UNetVocoder(self.config)
-        self.use_f0 = self.config['vocoder'].get('use_f0_conditioning', False)
-        
+        # Initialize HiFi-GAN Generator and Discriminators
+        self.generator = Generator(self.config)
+        self.mpd = MultiPeriodDiscriminator(self.config)
+        self.msd = MultiScaleDiscriminator(self.config)
+        self.use_f0 = self.config['vocoder'].get('use_f0_conditioning', False) # Keep f0 flag
         # Audio parameters
         self.sample_rate = self.config['audio']['sample_rate']
         self.n_fft = self.config['audio']['n_fft'] # Use n_fft from config
@@ -45,34 +67,16 @@ class VocoderModel(pl.LightningModule):
         self.fmin = self.config['audio'].get('fmin', 0)
         self.fmax = self.config['audio'].get('fmax', self.sample_rate // 2)
         
-        # Store noise scale for inference
-        self.noise_scale = self.config['vocoder'].get('noise_scale', 0.6)
+        # Remove noise scale if not used by Generator directly
+        # self.noise_scale = self.config['vocoder'].get('noise_scale', 0.6)
         
-        # Loss configuration
-        self.loss_type = self.config['train'].get('vocoder_loss', 'Combined') # Default to combined
+        # GAN Loss configuration (from config)
+        self.lambda_fm = self.config['train'].get('lambda_feature_match', 2.0) # Weight for feature matching loss
+        self.lambda_adv = self.config['train'].get('lambda_adversarial', 1.0) # Weight for adversarial loss (generator)
+        self.lambda_mel_gan = self.config['train'].get('lambda_mel_gan', 45.0) # Weight for Mel Spectrogram loss (generator)
         
-        # Loss weights
-        self.lambda_td = self.config['train'].get('loss_lambda_td', 1.0)
-        self.lambda_sc = self.config['train'].get('loss_lambda_sc', 0.0) # Default to 0 if not specified
-        self.lambda_mag = self.config['train'].get('loss_lambda_mag', 0.0) # Default to 0 if not specified
-        self.lambda_mel = self.config['train'].get('loss_lambda_mel', 0.0) # Default to 0 if not specified
-
-        # STFT parameters for loss calculation
-        self.stft_fft_size = self.config['train'].get('stft_fft_size', self.n_fft)
-        self.stft_hop_size = self.config['train'].get('stft_hop_size', self.hop_length)
-        self.stft_win_length = self.config['train'].get('stft_win_length', self.win_length)
-        
-        # Create STFT operator
-        self.stft = T.Spectrogram(
-            n_fft=self.stft_fft_size,
-            hop_length=self.stft_hop_size,
-            win_length=self.stft_win_length,
-            window_fn=torch.hann_window,
-            power=None, # Return complex result
-            center=True,
-            pad_mode="reflect",
-            normalized=False,
-        )
+        # Keep Mel Spectrogram transform for potential Mel loss in Generator
+        # (Ensure parameters match upstream model's mel generation)
         
         # Create Mel Spectrogram operator for reconstruction loss
         # Ensure parameters match those used for input mel generation
@@ -92,30 +96,26 @@ class VocoderModel(pl.LightningModule):
         )
     def forward(self, mel_spec, f0=None):
         """
-        Forward pass through the vocoder model.
+        Forward pass through the HiFi-GAN Generator.
 
         Args:
             mel_spec (torch.Tensor): Mel spectrogram [B, T_mel, M]
             f0 (torch.Tensor, optional): Aligned F0 contour [B, T_mel, 1]. Required if use_f0 is True.
 
         Returns:
-            torch.Tensor: Generated waveform [B, T_audio, 1] where T_audio is approx T_mel * hop_length
+            torch.Tensor: Generated waveform [B, 1, T_audio]
         """
-        batch_size, time_steps, _ = mel_spec.size()
+        # Reshape mel: [B, T_mel, M] -> [B, M, T_mel]
+        mel_spec = mel_spec.transpose(1, 2)
         
-        # Generate noise with the SAME time dimension as mel_spec
-        noise = torch.randn(batch_size, time_steps, 1, device=mel_spec.device) * self.noise_scale
-        
-        # Generate waveform with the UNetVocoder
-        # The UNetVocoder now handles the internal upsampling to audio rate
-        # Pass f0 if conditioning is enabled
-        if self.use_f0:
-            if f0 is None:
-                 raise ValueError("F0 conditioning is enabled, but f0 tensor was not provided.")
-            waveform = self.vocoder(mel_spec, noise, f0=f0)
-        else:
-            waveform = self.vocoder(mel_spec, noise)
+        # Reshape f0 if needed: [B, T_mel, 1] -> [B, 1, T_mel]
+        if f0 is not None:
+            f0 = f0.transpose(1, 2)
             
+        # Generate waveform with the HiFi-GAN Generator
+        waveform = self.generator(mel_spec, f0=f0 if self.use_f0 else None) # Generator handles f0 internally if configured
+
+        # Output shape: [B, 1, T_audio]
         return waveform
     
     def _process_batch(self, batch):
@@ -127,9 +127,12 @@ class VocoderModel(pl.LightningModule):
         lengths = batch.get('length')  # Original audio lengths before padding
         f0 = batch.get(self.config['data'].get('f0_key', 'f0_contour'), None) # Get F0 using key from config
         
-        # Reshape target audio if needed: [B, T_audio] -> [B, T_audio, 1]
+        # Reshape target audio if needed: [B, T_audio] -> [B, 1, T_audio]
         if target_audio is not None and target_audio.dim() == 2:
-            target_audio = target_audio.unsqueeze(-1)
+            target_audio = target_audio.unsqueeze(1)
+        elif target_audio is not None and target_audio.dim() == 3 and target_audio.shape[-1] == 1:
+             # If it's [B, T_audio, 1], transpose to [B, 1, T_audio]
+             target_audio = target_audio.transpose(1, 2)
             
         # Reshape f0 if needed: [B, T_mel] -> [B, T_mel, 1]
         if f0 is not None and f0.dim() == 2:
@@ -141,194 +144,185 @@ class VocoderModel(pl.LightningModule):
              
         return mel_spec, target_audio, f0, lengths
     
-    def _ensure_same_mel_length(self, pred, target):
-        """ Adjusts pred tensor length (dim 2) to match target tensor length (dim 2) for Mel Spectrograms.
-            Pads or truncates pred; target remains unchanged.
-        """
-        pred_len = pred.shape[2] # Use time dimension (index 2)
-        target_len = target.shape[2] # Use time dimension (index 2)
+    # --- GAN Loss Calculation Methods ---
 
-        if pred_len == target_len:
-            return pred, target
+    def _calculate_discriminator_loss(self, target_audio, generated_audio):
+        """ Calculates the loss for both MPD and MSD discriminators. """
+        # MPD
+        y_df_hat_r, y_df_hat_g, _, _ = self.mpd(target_audio, generated_audio.detach())
+        loss_disc_f, losses_f_r, losses_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
-        if self.training and hasattr(self, 'global_step') and self.global_step % 500 == 0: # Log less frequently
-             print(f"Warning: Mel length mismatch. Adjusting Pred: {pred_len} to Target: {target_len}.")
+        # MSD
+        y_ds_hat_r, y_ds_hat_g, _, _ = self.msd(target_audio, generated_audio.detach())
+        loss_disc_s, losses_s_r, losses_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
-        if pred_len > target_len:
-            # Truncate prediction
-            pred = pred[:, :, :target_len]
-        else: # pred_len < target_len
-            # Pad prediction
-            padding = target_len - pred_len
-            # Pad the end of the last dimension (time)
-            pad_dims = [0] * (pred.dim() * 2) # e.g., [0, 0, 0, 0, 0, 0] for 3D
-            pad_dims[1] = padding # Pad end of last dim
-            pred = F.pad(pred, pad_dims)
-
-        return pred, target # Return modified pred and original target
-
-    def _ensure_same_time_domain_length(self, pred, target):
-        """ Adjusts pred tensor length to match target tensor length along the time dimension (last dim).
-            Pads or truncates pred; target remains unchanged. Assumes input is [B, T] or [T].
-        """
-        pred_len = pred.shape[-1] # Use last dimension (time)
-        target_len = target.shape[-1] # Use last dimension (time)
-
-        if pred_len == target_len:
-            return pred, target
-
-        if self.training and hasattr(self, 'global_step') and self.global_step % 500 == 0: # Log less frequently
-             print(f"Warning: Time domain length mismatch. Adjusting Pred: {pred_len} to Target: {target_len}.")
-
-        if pred_len > target_len:
-            # Truncate prediction
-            pred = pred[..., :target_len] # Use ellipsis for flexibility with dims
-        else: # pred_len < target_len
-            # Pad prediction
-            padding = target_len - pred_len
-            # Pad the end of the last dimension
-            # F.pad expects pads for (last_dim_start, last_dim_end, second_last_dim_start, ...)
-            pad_dims = [0] * (pred.dim() * 2)
-            pad_dims[0] = 0 # No padding at the start of the last dim
-            pad_dims[1] = padding # Pad end of last dim
-            pred = F.pad(pred, pad_dims)
-
-        return pred, target # Return modified pred and original target
-
-
-    def time_domain_loss(self, y_pred, y_true):
-        """ Compute L1 time-domain loss. Handles length mismatch by trimming. """
-        y_pred_adj, y_true_adj = self._ensure_same_time_domain_length(y_pred, y_true)
-        return F.l1_loss(y_pred_adj, y_true_adj)
-
-    def stft_loss(self, y_pred, y_true):
-        """ Compute Single-Resolution STFT loss (SC + Mag). """
-        # Ensure inputs are flat [B, T_audio]
-        y_pred_flat = y_pred.squeeze(-1)
-        y_true_flat = y_true.squeeze(-1)
+        loss_disc_all = loss_disc_s + loss_disc_f
         
-        # Trim to same length before STFT
-        y_pred_flat, y_true_flat = self._ensure_same_time_domain_length(y_pred_flat, y_true_flat)
+        loss_dict = {
+            "loss_disc_all": loss_disc_all,
+            "mpd_loss": loss_disc_f,
+            "msd_loss": loss_disc_s,
+            "mpd_real_losses": losses_f_r,
+            "mpd_fake_losses": losses_f_g,
+            "msd_real_losses": losses_s_r,
+            "msd_fake_losses": losses_s_g,
+        }
+        return loss_dict
 
-        # Calculate STFT
-        stft_pred = self.stft(y_pred_flat) # [B, F, T_stft, 2] for complex
-        stft_true = self.stft(y_true_flat) # [B, F, T_stft, 2] for complex
-        
-        # Get magnitudes
-        stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
-        stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
-
-        # Calculate loss components
-        sc_loss = spectral_convergence_loss(stft_pred_mag, stft_true_mag)
-        mag_loss = log_stft_magnitude_loss(stft_pred_mag, stft_true_mag)
-        
-        return sc_loss, mag_loss
-
-    def mel_reconstruction_loss(self, generated_audio, target_mel):
-        """ Compute Mel Spectrogram Reconstruction Loss. """
-        # Ensure generated_audio is flat [B, T_audio]
-        gen_audio_flat = generated_audio.squeeze(-1)
-        
-        # Generate mel from audio
-        # Need to handle potential length differences between input mel and mel from generated audio
-        # Option 1: Pad/trim audio before mel transform (might be inaccurate if lengths differ significantly)
-        # Option 2: Pad/trim mel spectrograms after transform (preferred)
-        
-        gen_mel = self.mel_spectrogram_transform(gen_audio_flat) # [B, M, T_mel_gen]
-        
-        # Target mel is likely [B, T_mel_target, M], transpose it
-        target_mel_transposed = target_mel.transpose(1, 2) # [B, M, T_mel_target]
-        
-        # Ensure same time dimension (T_mel) by padding/trimming the shorter one
-        gen_mel_adj, target_mel_adj = self._ensure_same_mel_length(gen_mel, target_mel_transposed) # Adjusts gen_mel (dim 2) to match target_mel (dim 2) length
-        
-        # Calculate L1 loss
-        mel_loss = F.l1_loss(gen_mel_adj, target_mel_adj)
-        return mel_loss
-    
-    def _calculate_combined_loss(self, generated_audio, target_audio, mel_spec):
-        """ Calculates all loss components and combines them. """
-        loss = 0
-        losses = {}
-
-        # 1. Time Domain Loss (L1)
-        if self.lambda_td > 0:
-            td_loss = self.time_domain_loss(generated_audio, target_audio)
-            loss += self.lambda_td * td_loss
-            losses['td_loss'] = td_loss
+    def _calculate_generator_loss(self, target_audio, generated_audio):
+        """ Calculates the loss for the generator. """
+        # L1 Mel Loss
+        # Ensure target_audio is [B, 1, T]
+        if target_audio.dim() == 3 and target_audio.shape[1] != 1:
+             target_audio_mel = target_audio.transpose(1, 2) # Assume [B, T, 1] -> [B, 1, T]
         else:
-             losses['td_loss'] = torch.tensor(0.0, device=generated_audio.device)
-
-        # 2. STFT Loss (SC + Mag)
-        if self.lambda_sc > 0 or self.lambda_mag > 0:
-            sc_loss, mag_loss = self.stft_loss(generated_audio, target_audio)
-            if self.lambda_sc > 0:
-                loss += self.lambda_sc * sc_loss
-                losses['sc_loss'] = sc_loss
-            else:
-                 losses['sc_loss'] = torch.tensor(0.0, device=generated_audio.device)
-            if self.lambda_mag > 0:
-                loss += self.lambda_mag * mag_loss
-                losses['mag_loss'] = mag_loss
-            else:
-                 losses['mag_loss'] = torch.tensor(0.0, device=generated_audio.device)
-        else:
-             losses['sc_loss'] = torch.tensor(0.0, device=generated_audio.device)
-             losses['mag_loss'] = torch.tensor(0.0, device=generated_audio.device)
-
-        # 3. Mel Reconstruction Loss
-        if self.lambda_mel > 0:
-            mel_loss = self.mel_reconstruction_loss(generated_audio, mel_spec)
-            loss += self.lambda_mel * mel_loss
-            losses['mel_loss'] = mel_loss
-        else:
-             losses['mel_loss'] = torch.tensor(0.0, device=generated_audio.device)
+             target_audio_mel = target_audio
              
-        losses['total_loss'] = loss
-        return losses
+        # Ensure generated_audio is [B, 1, T]
+        if generated_audio.dim() == 3 and generated_audio.shape[1] != 1:
+             generated_audio_mel = generated_audio.transpose(1, 2)
+        else:
+             generated_audio_mel = generated_audio
+             
+        # Need to ensure lengths match before mel transform if they differ
+        # For simplicity here, assume lengths are compatible or handled upstream/downstream
+        # Trim target audio to match generated audio length for mel loss calculation
+        min_len = min(target_audio_mel.shape[-1], generated_audio_mel.shape[-1])
+        target_audio_mel = target_audio_mel[..., :min_len]
+        generated_audio_mel = generated_audio_mel[..., :min_len]
+
+        # Calculate mels - ensure transform is on the correct device
+        self.mel_spectrogram_transform = self.mel_spectrogram_transform.to(generated_audio_mel.device)
+        y_mel = self.mel_spectrogram_transform(target_audio_mel.squeeze(1)) # Input needs to be [B, T]
+        y_g_hat_mel = self.mel_spectrogram_transform(generated_audio_mel.squeeze(1)) # Input needs to be [B, T]
+        
+        # Mel loss expects [B, M, T]
+        loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * self.lambda_mel_gan
+
+        # GAN Loss (Adversarial + Feature Matching)
+        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mpd(target_audio, generated_audio)
+        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.msd(target_audio, generated_audio)
+        
+        # Feature Matching Loss
+        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+        loss_fm = (loss_fm_f + loss_fm_s) * self.lambda_fm
+
+        # Adversarial Loss
+        loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+        loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+        loss_gen_all = (loss_gen_s + loss_gen_f) * self.lambda_adv
+
+        # Total Generator Loss
+        loss_gen_total = loss_gen_all + loss_fm + loss_mel
+        
+        loss_dict = {
+            "loss_gen_total": loss_gen_total,
+            "loss_gen_adv": loss_gen_all,
+            "loss_gen_fm": loss_fm,
+            "loss_gen_mel": loss_mel,
+            "mpd_gen_losses": losses_gen_f,
+            "msd_gen_losses": losses_gen_s,
+        }
+        return loss_dict
 
     def training_step(self, batch, batch_idx):
         mel_spec, target_audio, f0, lengths = self._process_batch(batch)
+        opt_g, opt_d = self.optimizers() # Get optimizers for manual control
         
-        # Forward pass
+        # Ensure target_audio is [B, 1, T_audio]
+        if target_audio.dim() == 2:
+            target_audio = target_audio.unsqueeze(1)
+        elif target_audio.dim() == 3 and target_audio.shape[-1] == 1:
+            target_audio = target_audio.transpose(1, 2)
+
+        # Generate audio
+        # Input mel: [B, T_mel, M], f0: [B, T_mel, 1]
+        # Output audio: [B, 1, T_audio]
         generated_audio = self(mel_spec, f0=f0 if self.use_f0 else None)
+
+        # --- Train Discriminator ---
+        # Detach generator output to avoid backprop through generator
+        disc_losses = self._calculate_discriminator_loss(target_audio, generated_audio.detach())
         
-        # Calculate losses
-        losses = self._calculate_combined_loss(generated_audio, target_audio, mel_spec)
+        # Manual optimization for Discriminator
+        opt_d.zero_grad()
+        self.manual_backward(disc_losses['loss_disc_all'])
+        opt_d.step()
         
-        # Log losses
-        self.log('train/loss', losses['total_loss'], on_step=True, on_epoch=True, prog_bar=True)
-        self.log('train/td_loss', losses['td_loss'], on_step=True, on_epoch=True)
-        self.log('train/sc_loss', losses['sc_loss'], on_step=True, on_epoch=True)
-        self.log('train/mag_loss', losses['mag_loss'], on_step=True, on_epoch=True)
-        self.log('train/mel_loss', losses['mel_loss'], on_step=True, on_epoch=True)
+        # Log discriminator losses
+        self.log('train_disc/loss', disc_losses['loss_disc_all'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train_disc/mpd_loss', disc_losses['mpd_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train_disc/msd_loss', disc_losses['msd_loss'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        # Log individual period/scale losses if desired
+
+        # --- Train Generator ---
+        gen_losses = self._calculate_generator_loss(target_audio, generated_audio)
+
+        # Manual optimization for Generator
+        opt_g.zero_grad()
+        self.manual_backward(gen_losses['loss_gen_total'])
+        opt_g.step()
+
+        # Log generator losses
+        self.log('train_gen/loss', gen_losses['loss_gen_total'], on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log('train_gen/adv_loss', gen_losses['loss_gen_adv'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train_gen/fm_loss', gen_losses['loss_gen_fm'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log('train_gen/mel_loss', gen_losses['loss_gen_mel'], on_step=True, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        # Log individual generator adversarial losses if desired
         
-        return losses['total_loss']
+        # No return needed in manual optimization
     
     def validation_step(self, batch, batch_idx):
         mel_spec, target_audio, f0, lengths = self._process_batch(batch)
         
+        # Ensure target_audio is [B, 1, T_audio]
+        if target_audio.dim() == 2:
+            target_audio = target_audio.unsqueeze(1)
+        elif target_audio.dim() == 3 and target_audio.shape[-1] == 1:
+            target_audio = target_audio.transpose(1, 2)
+            
         # Forward pass
         generated_audio = self(mel_spec, f0=f0 if self.use_f0 else None)
         
-        # Calculate losses
-        losses = self._calculate_combined_loss(generated_audio, target_audio, mel_spec)
+        # Calculate Mel loss for validation
+        # Trim target audio to match generated audio length
+        min_len = min(target_audio.shape[-1], generated_audio.shape[-1])
+        target_audio_val = target_audio[..., :min_len]
+        generated_audio_val = generated_audio[..., :min_len]
         
-        # Log losses
-        self.log('val/loss', losses['total_loss'], on_step=False, on_epoch=True, prog_bar=True)
-        self.log('val/td_loss', losses['td_loss'], on_step=False, on_epoch=True)
-        self.log('val/sc_loss', losses['sc_loss'], on_step=False, on_epoch=True)
-        self.log('val/mag_loss', losses['mag_loss'], on_step=False, on_epoch=True)
-        self.log('val/mel_loss', losses['mel_loss'], on_step=False, on_epoch=True)
+        self.mel_spectrogram_transform = self.mel_spectrogram_transform.to(generated_audio_val.device)
+        y_mel = self.mel_spectrogram_transform(target_audio_val.squeeze(1))
+        y_g_hat_mel = self.mel_spectrogram_transform(generated_audio_val.squeeze(1))
+        val_mel_loss = F.l1_loss(y_mel, y_g_hat_mel)
+        
+        # Log validation loss (using Mel loss as primary metric)
+        self.log('val/mel_loss', val_mel_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # Store generated audio for logging if needed (use generated_audio, not generated_audio_val)
+        # Note: _log_audio_samples and _log_mel_comparison expect [B, T, 1] or [B, T] format
+        # Need to adjust them or the data passed to them.
+        # For now, pass the original generated_audio and target_audio
+        # Ensure target_audio is reshaped back if needed by logging functions
+        if target_audio.dim() == 3 and target_audio.shape[1] == 1:
+             target_audio_log = target_audio.transpose(1, 2) # [B, T, 1]
+        else:
+             target_audio_log = target_audio # Assume it's already correct or handled inside log func
+
+        if generated_audio.dim() == 3 and generated_audio.shape[1] == 1:
+             generated_audio_log = generated_audio.transpose(1, 2) # [B, T, 1]
+        else:
+             generated_audio_log = generated_audio
         
         # Log audio samples every N epochs
         if batch_idx == 0 and self.current_epoch % self.config['train'].get('log_vocoder_audio_epoch_interval', 5) == 0:
-            self._log_audio_samples(mel_spec, generated_audio, target_audio)
-            # Log mel comparison
-            self._log_mel_comparison(mel_spec, generated_audio)
+            self._log_audio_samples(mel_spec, generated_audio_log, target_audio_log)
+            # Log mel comparison - needs generated audio in [B, T*hop, 1] format
+            self._log_mel_comparison(mel_spec, generated_audio_log)
             
         # Return the dictionary of losses for potential callbacks or further analysis
-        return losses
+        # Return validation loss for potential callbacks
+        return {"val_mel_loss": val_mel_loss}
     
     def _log_audio_samples(self, mel_spec, generated_audio, target_audio):
         """
@@ -368,8 +362,9 @@ class VocoderModel(pl.LightningModule):
             # Log audio samples - now at full audio rate
             if hasattr(self.logger.experiment, 'add_audio'):
                 # Get audio samples
-                gen_audio = generated_audio[idx, :, 0].detach().cpu()
-                tgt_audio = target_audio[idx, :, 0].detach().cpu()
+                # Ensure audio is [T]
+                gen_audio = generated_audio[idx].squeeze().detach().cpu() # Remove channel dim
+                tgt_audio = target_audio[idx].squeeze().detach().cpu() # Remove channel dim
                 
                 # Normalize for audio logging
                 gen_audio = gen_audio / (gen_audio.abs().max() + 1e-6)
@@ -401,7 +396,7 @@ class VocoderModel(pl.LightningModule):
         
         Args:
             input_mel (torch.Tensor): Input mel spectrogram [B, T, M]
-            generated_audio (torch.Tensor): Generated audio from the model [B, T*hop_length, 1]
+            generated_audio (torch.Tensor): Generated audio from the model [B, T_audio, 1] or [B, 1, T_audio]
         """
         # Only use the first sample from the batch for visualization
         idx = 0
@@ -413,27 +408,53 @@ class VocoderModel(pl.LightningModule):
         expected_frames = input_mel_np.shape[1]
         
         # Convert generated audio back to mel spectrogram - now appropriately at full audio rate
-        gen_audio_flat = generated_audio[idx, :, 0].detach().cpu().unsqueeze(0)  # [1, T*hop_length]
+        # Ensure input is [1, T_audio]
+        if generated_audio.dim() == 3:
+            gen_audio_flat = generated_audio[idx].squeeze(1).detach().cpu() # [1, T_audio] if [B, 1, T]
+            if gen_audio_flat.dim() == 2 and gen_audio_flat.shape[0] != 1: # Check if it was [B, T, 1] -> [T, 1]
+                gen_audio_flat = generated_audio[idx].squeeze().detach().cpu().unsqueeze(0) # [1, T_audio]
+        else: # Assume [B, T]
+            gen_audio_flat = generated_audio[idx].detach().cpu().unsqueeze(0)
         
         # Use the initialized transform for consistency
         with torch.no_grad():
-             gen_mel = self.mel_spectrogram_transform(gen_audio_flat.to(self.device)) # Ensure device match
-             gen_mel_np = gen_mel[0].cpu().numpy() # Shape [M, T_mel_gen]
+            gen_mel = self.mel_spectrogram_transform(gen_audio_flat.to(self.device)) # Ensure device match
+            gen_mel_np = gen_mel[0].cpu().numpy() # Shape should be [M, T_mel_gen]
+            
+            # Check if gen_mel_np is 1D and needs reshaping
+            if len(gen_mel_np.shape) == 1:
+                # Reshape 1D array into 2D - using n_mels from config
+                num_mel_bins = self.n_mels
+                # Calculate expected time frames
+                time_frames = gen_mel_np.shape[0] // num_mel_bins
+                if time_frames > 0:
+                    # Reshape to (mel_bins, time_frames)
+                    gen_mel_np = gen_mel_np[:num_mel_bins * time_frames].reshape(num_mel_bins, time_frames)
+                else:
+                    # If we can't determine the time frames, use the original mel shape as reference
+                    time_frames = max(1, gen_mel_np.shape[0] // num_mel_bins)
+                    gen_mel_np = gen_mel_np[:num_mel_bins * time_frames].reshape(num_mel_bins, time_frames)
+                
+                if self.global_step % 10 == 0:  # Log occasionally
+                    print(f"Reshaped 1D mel spectrogram with shape {gen_mel_np.shape[0]} to 2D shape: {gen_mel_np.shape}")
         
         # Get shapes for comparison and potential resizing
         input_shape = input_mel_np.shape # Should be [M, T_mel_target]
         gen_shape = gen_mel_np.shape   # Should be [M, T_mel_gen]
-        # print(f"Input mel shape: {input_shape}, Generated mel shape: {gen_shape}") # Optional debug print
         
-        # If lengths still don't match exactly, resize for visualization
-        if gen_shape[1] != input_shape[1]:
-            from scipy.ndimage import zoom
-            # Get the scaling factor
-            scale_factor = input_shape[1] / gen_shape[1]
-            # Resize only the time dimension
-            gen_mel_np = zoom(gen_mel_np, (1, scale_factor), order=1)
-            if self.global_step % 100 == 0: # Log resizing less frequently
-                 print(f"Resized generated mel from {gen_shape} to {gen_mel_np.shape} for visualization")
+        # Check if both shapes are valid (at least 2 dimensions) before comparing time dimension
+        if len(gen_shape) >= 2 and len(input_shape) >= 2:
+            # If lengths still don't match exactly, resize for visualization
+            if gen_shape[1] != input_shape[1]:
+                from scipy.ndimage import zoom
+                # Get the scaling factor
+                scale_factor = input_shape[1] / gen_shape[1]
+                # Resize only the time dimension
+                gen_mel_np = zoom(gen_mel_np, (1, scale_factor), order=1)
+                if self.global_step % 100 == 0: # Log resizing less frequently
+                    print(f"Resized generated mel from {gen_shape} to {gen_mel_np.shape} for visualization")
+        elif self.global_step % 10 == 0: # Log error more frequently if shapes are wrong
+            print(f"Warning: Mel shapes are incompatible for comparison/resizing. Input: {input_shape}, Generated: {gen_shape}. Skipping resizing.")
         
         # Create figure with two subplots vertically stacked
         fig, axes = plt.subplots(2, 1, figsize=(10, 8))
@@ -472,31 +493,36 @@ class VocoderModel(pl.LightningModule):
             )
     
     def configure_optimizers(self):
-        # Get learning rate from config
-        lr = self.config['train'].get('vocoder_learning_rate', 0.0002)
+        # Get learning rates and betas from config
+        lr_g = self.config['train'].get('generator_learning_rate', 0.0002)
+        lr_d = self.config['train'].get('discriminator_learning_rate', 0.0002)
+        betas_g = tuple(self.config['train'].get('generator_betas', [0.8, 0.99]))
+        betas_d = tuple(self.config['train'].get('discriminator_betas', [0.8, 0.99]))
+        weight_decay_g = self.config['train'].get('generator_weight_decay', 0.0)
+        weight_decay_d = self.config['train'].get('discriminator_weight_decay', 0.0)
         
-        # Set up optimizer
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=lr,
-            betas=(0.9, 0.999)
+        # Optimizer for Generator
+        optimizer_g = torch.optim.AdamW(
+            self.generator.parameters(),
+            lr=lr_g,
+            betas=betas_g,
+            weight_decay=weight_decay_g
         )
         
-        # Set up scheduler
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            verbose=True
+        # Optimizer for Discriminators (MPD + MSD)
+        optimizer_d = torch.optim.AdamW(
+            itertools.chain(self.msd.parameters(), self.mpd.parameters()),
+            lr=lr_d,
+            betas=betas_d,
+            weight_decay=weight_decay_d
         )
-        
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val/loss',
-                'interval': 'epoch',
-                'frequency': 1
-            }
-        }
+
+        # Schedulers (Example: ExponentialLR, common for HiFi-GAN)
+        scheduler_gamma = self.config['train'].get('lr_scheduler_gamma', 0.999)
+        scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optimizer_g, gamma=scheduler_gamma)
+        scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optimizer_d, gamma=scheduler_gamma)
+
+        return (
+            {'optimizer': optimizer_g, 'lr_scheduler': {'scheduler': scheduler_g, 'interval': 'epoch'}},
+            {'optimizer': optimizer_d, 'lr_scheduler': {'scheduler': scheduler_d, 'interval': 'epoch'}}
+        )
