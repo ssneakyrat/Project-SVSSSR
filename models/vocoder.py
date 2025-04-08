@@ -49,35 +49,36 @@ def apply_perceptual_weighting(spec_mag, sample_rate, curve_type='a', is_mel=Fal
     Returns:
         Weighted spectrum with same shape as input
     """
-    # Create weights tensor with same shape as spec_mag first (guarantees correct shape)
+    # Get frequency dimension directly from the input tensor
     freq_dim = spec_mag.shape[1]
-    weights = torch.ones(1, freq_dim, 1, device=spec_mag.device)
     
-    # Then generate the perceptual curve if needed
+    if is_mel:
+        # For mel spectrograms, approximate mel band center frequencies
+        # This is an approximation - ideally we'd use the actual mel filter centers
+        mel_min = 0
+        mel_max = 2595 * np.log10(1 + (sample_rate/2) / 700)
+        mel_points = torch.linspace(mel_min, mel_max, freq_dim, device=spec_mag.device)
+        freqs = 700 * (10**(mel_points / 2595) - 1)
+    else:
+        # For STFT magnitudes, use linear frequency scale
+        freqs = torch.linspace(0, sample_rate/2, freq_dim, device=spec_mag.device)
+    
+    # Define various weighting curves
     if curve_type == 'a':
-        # Generate frequencies based on input type
-        if is_mel:
-            mel_min = 0
-            mel_max = 2595 * np.log10(1 + (sample_rate/2) / 700)
-            mel_points = torch.linspace(mel_min, mel_max, freq_dim, device=spec_mag.device)
-            freqs = 700 * (10**(mel_points / 2595) - 1)
-        else:
-            freqs = torch.linspace(0, sample_rate/2, freq_dim, device=spec_mag.device)
-        
-        # Calculate A-weighting
+        # A-weighting approximation (simplified)
+        # Based on https://en.wikipedia.org/wiki/A-weighting
         f2 = torch.pow(freqs, 2)
         numerator = 12200**2 * f2**2
         denominator = (f2 + 20.6**2) * torch.sqrt((f2 + 107.7**2) * (f2 + 737.9**2)) * (f2 + 12200**2)
-        curve = 2.0 + 20 * torch.log10(numerator / denominator + 1e-8)
-        
-        # Normalize to [0, 1]
-        curve = (curve - curve.min()) / (curve.max() - curve.min() + 1e-8)
-        
-        # Apply the curve to our pre-sized weights
-        for i in range(freq_dim):
-            weights[0, i, 0] = curve[i]
+        weights = 2.0 + 20 * torch.log10(numerator / denominator + 1e-8)
+        # Normalize and convert to range [0, 1]
+        weights = (weights - weights.min()) / (weights.max() - weights.min() + 1e-8)
+    else:
+        # Default: equal weighting
+        weights = torch.ones_like(freqs)
     
-    # Apply weighting (guaranteed to match dimensions)
+    # Apply weighting to each frequency bin
+    weights = weights.view(1, -1, 1)  # [1, F, 1]
     weighted_spec = spec_mag * weights
     
     return weighted_spec
@@ -101,26 +102,23 @@ def extract_harmonics(audio, f0, sample_rate, harmonic_threshold=0.2):
     # Flatten the audio for processing
     audio_flat = audio.squeeze(-1)  # [B, T]
     
-    # Get device from input audio
-    device = audio.device
-    
-    # Get STFT - make sure to create it on the same device as the audio
+    # Get STFT
     spec_transform = Spectrogram(
         n_fft=2048,
         hop_length=512,
         power=None,  # Return complex STFT
-        window_fn=lambda win_length: torch.hann_window(win_length, device=device)
     )
     
     # Extract complex spectrum
-    stft = spec_transform(audio_flat)  # Complex tensor [B, F, T_stft]
+    stft = spec_transform(audio_flat)  # [B, F, T_stft, 2] (real, imag)
+    stft_complex = torch.complex(stft[..., 0], stft[..., 1])  # [B, F, T_stft]
     
     # Extract magnitudes and phases
-    magnitudes = torch.abs(stft)  # [B, F, T_stft]
-    phases = torch.angle(stft)  # [B, F, T_stft]
+    magnitudes = torch.abs(stft_complex)  # [B, F, T_stft]
+    phases = torch.angle(stft_complex)  # [B, F, T_stft]
     
     # Prepare f0 to match STFT time resolution
-    t_stft = stft.shape[2]
+    t_stft = stft_complex.shape[2]
     f0_downsampled = F.interpolate(f0.transpose(1, 2), size=t_stft, mode='linear', align_corners=False)
     f0_downsampled = f0_downsampled.transpose(1, 2)  # [B, T_stft, 1]
     
@@ -128,7 +126,7 @@ def extract_harmonics(audio, f0, sample_rate, harmonic_threshold=0.2):
     harmonic_mask = torch.zeros_like(magnitudes)
     
     # Get frequency axis for bins
-    n_fft = stft.shape[1]
+    n_fft = stft_complex.shape[1]
     freqs = torch.linspace(0, sample_rate/2, n_fft, device=audio.device)
     
     # For each batch and time step
@@ -150,8 +148,8 @@ def extract_harmonics(audio, f0, sample_rate, harmonic_threshold=0.2):
                     harmonic_mask[b, bin_dist < harmonic_width, t] = 1.0
     
     # Apply masks to get harmonic and noise components
-    harmonic_spec = stft * harmonic_mask
-    noise_spec = stft * (1 - harmonic_mask)
+    harmonic_spec = stft_complex * harmonic_mask
+    noise_spec = stft_complex * (1 - harmonic_mask)
     
     # Convert back to time domain using inverse STFT
     harmonic_part = torch.istft(
@@ -224,12 +222,12 @@ class VocoderModel(pl.LightningModule):
         self.stft_hop_size = self.config['train'].get('stft_hop_size', self.hop_length)
         self.stft_win_length = self.config['train'].get('stft_win_length', self.win_length)
         
-        # Create STFT operator - will be properly initialized on device when first used
+        # Create STFT operator
         self.stft = T.Spectrogram(
             n_fft=self.stft_fft_size,
             hop_length=self.stft_hop_size,
             win_length=self.stft_win_length,
-            window_fn=lambda win_length: torch.hann_window(win_length),  # Device will be set when first used
+            window_fn=torch.hann_window,
             power=None,  # Return complex result
             center=True,
             pad_mode="reflect",
@@ -261,13 +259,13 @@ class VocoderModel(pl.LightningModule):
                 {"n_fft": 1024, "hop_length": 256, "win_length": 1024},
                 {"n_fft": 2048, "hop_length": 512, "win_length": 2048},
             ]
-            # Create STFT operators for each resolution - will properly handle device when used
+            # Create STFT operators for each resolution
             self.stft_transforms = nn.ModuleList([
                 T.Spectrogram(
                     n_fft=params["n_fft"],
                     hop_length=params["hop_length"],
                     win_length=params["win_length"],
-                    window_fn=lambda win_length: torch.hann_window(win_length),  # Device will be set when first used
+                    window_fn=torch.hann_window,
                     power=None,
                     center=True,
                     pad_mode="reflect",
@@ -392,19 +390,13 @@ class VocoderModel(pl.LightningModule):
         # Trim to same length before STFT
         y_pred_flat, y_true_flat = self._ensure_same_time_domain_length(y_pred_flat, y_true_flat)
 
-        # Get device for processing
-        device = y_pred_flat.device
+        # Calculate STFT
+        stft_pred = self.stft(y_pred_flat) # [B, F, T_stft, 2] for complex
+        stft_true = self.stft(y_true_flat) # [B, F, T_stft, 2] for complex
         
-        # Make sure window is on the right device
-        self.stft.window_fn = lambda win_length: torch.hann_window(win_length, device=device)
-        
-        # Calculate STFT - returns complex tensor
-        stft_pred = self.stft(y_pred_flat)  # Complex tensor [B, F, T_stft]
-        stft_true = self.stft(y_true_flat)  # Complex tensor [B, F, T_stft]
-        
-        # Get magnitudes using abs() for complex tensors
-        stft_pred_mag = torch.abs(stft_pred)  # [B, F, T_stft]
-        stft_true_mag = torch.abs(stft_true)  # [B, F, T_stft]
+        # Get magnitudes
+        stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
+        stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
         
         # Apply perceptual weighting if enabled
         if apply_weighting and self.use_perceptual_weighting:
@@ -415,9 +407,9 @@ class VocoderModel(pl.LightningModule):
 
         # Get phases if phase prediction is enabled
         if self.use_phase_prediction:
-            # Extract phase information using angle() for complex tensors
-            stft_pred_phase = torch.angle(stft_pred)
-            stft_true_phase = torch.angle(stft_true)
+            # Extract phase information
+            stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
+            stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
             # Calculate phase loss
             phase_loss_val = phase_loss(stft_pred_phase, stft_true_phase)
         else:
@@ -438,29 +430,21 @@ class VocoderModel(pl.LightningModule):
         # Trim to same length before STFT
         y_pred_flat, y_true_flat = self._ensure_same_time_domain_length(y_pred_flat, y_true_flat)
         
-        # Get device for processing
-        device = y_pred_flat.device
-        
         sc_losses = []
         mag_losses = []
         phase_losses = []
         
         # Calculate STFT for each resolution
-        for i, stft_transform in enumerate(self.stft_transforms):
-            # Update window function to use correct device
-            stft_transform.window_fn = lambda win_length: torch.hann_window(win_length, device=device)
+        for stft_transform in self.stft_transforms:
+            stft_pred = stft_transform(y_pred_flat)
+            stft_true = stft_transform(y_true_flat)
             
-            # Get complex STFT tensors directly
-            stft_pred = stft_transform(y_pred_flat)  # Complex tensor
-            stft_true = stft_transform(y_true_flat)  # Complex tensor
-            
-            # Get magnitudes using abs() for complex tensors
-            stft_pred_mag = torch.abs(stft_pred)
-            stft_true_mag = torch.abs(stft_true)
+            # Get magnitudes
+            stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9)
+            stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9)
             
             # Apply perceptual weighting if enabled
             if apply_weighting and self.use_perceptual_weighting:
-                # Call with the right parameters for this resolution
                 stft_pred_mag = apply_perceptual_weighting(
                     stft_pred_mag, self.sample_rate, self.perceptual_curve_type, False)
                 stft_true_mag = apply_perceptual_weighting(
@@ -472,9 +456,8 @@ class VocoderModel(pl.LightningModule):
             
             # Calculate phase loss if enabled
             if self.use_phase_prediction:
-                # Use torch.angle to extract phase from complex tensor
-                stft_pred_phase = torch.angle(stft_pred)
-                stft_true_phase = torch.angle(stft_true)
+                stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
+                stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
                 phase_losses.append(phase_loss(stft_pred_phase, stft_true_phase))
         
         # Average losses across resolutions
@@ -808,12 +791,11 @@ class VocoderModel(pl.LightningModule):
                 self.harmonic_threshold
             )
         
-        # Compute spectrograms for visualization - make sure to use CPU device for visualization
+        # Compute spectrograms for visualization
         stft_transform = Spectrogram(
             n_fft=1024,
             hop_length=256,
-            power=2.0,  # Power spectrogram
-            window_fn=lambda win_length: torch.hann_window(win_length, device="cpu")
+            power=2.0  # Power spectrogram
         )
         
         # Convert to CPU and calculate spectrograms

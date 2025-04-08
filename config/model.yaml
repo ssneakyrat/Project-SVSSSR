@@ -68,11 +68,11 @@ vocoder:
   phase_loss_weight: 0.5      # Weight for phase reconstruction loss
   
   # 2. Perceptual Weighting
-  use_perceptual_weighting: false   # Enable perceptual weighting
+  use_perceptual_weighting: true   # Enable perceptual weighting
   perceptual_curve_type: 'a'       # Use A-weighting curve ('a', flat, or custom)
   
   # 3. Harmonic-Plus-Noise Model
-  use_harmonic_plus_noise: false     # Enable harmonic + noise decomposition
+  use_harmonic_plus_noise: true     # Enable harmonic + noise decomposition
   harmonic_ratio: 0.7               # Balance between harmonic and noise components
   harmonic_loss_weight: 0.6         # Weight for harmonic component loss
   noise_loss_weight: 0.4            # Weight for noise component loss
