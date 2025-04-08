@@ -469,7 +469,7 @@ def preprocess_data(config_path='config/model.yaml'):
             continue
 
         original_mel_frames = log_mel.shape[0] # Frames before padding/truncation
-
+        
         # 1.5 Load Raw Audio
         try:
             raw_audio, _ = librosa.load(wav_path, sr=audio_config['sample_rate'])
@@ -601,7 +601,7 @@ def preprocess_data(config_path='config/model.yaml'):
             'voiced_mask': padded_voiced_mask, # Store padded voiced mask (as uint8)
             'unvoiced_flag': padded_unvoiced_flag, # Store padded unvoiced flag (as uint8)
             'original_unpadded_length': original_mel_frames, # Store the original length
-            'raw_audio': padded_raw_audio # Store padded/truncated raw audio
+            #'raw_audio': padded_raw_audio # Store padded/truncated raw audio
         }
 
         # Store unnormalized data for the *first* successfully processed file for visualization
@@ -679,7 +679,7 @@ def preprocess_data(config_path='config/model.yaml'):
                     'f0': data_config.get('f0_key', 'f0'),
                     'duration_sequence': data_config.get('duration_key', 'duration_sequence'),
                     'midi_pitch_estimated': data_config.get('midi_pitch_key', 'midi_pitch_estimated'),
-                    'raw_audio': data_config.get('raw_audio_key', 'raw_audio'),
+                    #'raw_audio': data_config.get('raw_audio_key', 'raw_audio'),
                     'voiced_mask': 'voiced_mask', # Assuming internal key matches desired HDF5 name
                     'unvoiced_flag': 'unvoiced_flag', # Assuming internal key matches desired HDF5 name
                     'initial_duration_sequence': 'initial_duration_sequence', # Assuming internal key matches desired HDF5 name
