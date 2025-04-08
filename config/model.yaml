@@ -4,7 +4,7 @@ data:
   mel_key: mel_spectrogram # Key for target mel spectrograms 
   phoneme_key: phone_sequence # Key for input phoneme sequences
   duration_key: adjusted_durations # Key for input duration sequences
-  f0_key: f0_contour # Key for input F0 sequences
+  f0_key: f0 # Key for input F0 sequences
   midi_pitch_key: midi_pitch_estimated # Key for estimated MIDI pitch
   lazy_load: true
   raw_dir: datasets/gin
@@ -69,6 +69,7 @@ vocoder:
   
   # Audio generation parameters
   noise_scale: 0.6  # Scale factor for noise during inference
+  use_f0_conditioning: true # NEW: Enable F0 conditioning for the vocoder
   
   # For different chunk-based processing
   chunk_size_seconds: 2.5  # Process audio in chunks of this duration
@@ -107,15 +108,16 @@ train:
   log_interval: 50        # Log training metrics every N steps
 
   # --- Vocoder Training Specific Params ---
-  vocoder_loss: 'L1'      # Primary loss function type (L1 for U-Net)
-  loss_lambda_td: 1.0     # Weight for time-domain loss component
+  vocoder_loss: 'Combined' # UPDATED: Reflects L1 + STFT + Mel Recon
+  loss_lambda_td: 1.0     # Weight for time-domain (L1) loss component
   
-  # STFT loss parameters for audio reconstruction quality evaluation
-  stft_loss_fft_sizes: [1024, 2048, 512] # FFT sizes for MR-STFT loss
-  stft_loss_hop_sizes: [120, 240, 50]    # Hop sizes for MR-STFT loss
-  stft_loss_win_lengths: [600, 1200, 240] # Window lengths for MR-STFT loss
+  # Single-Resolution STFT loss parameters
+  stft_fft_size: 1024     # NEW: FFT size for Single-Res STFT loss
+  stft_hop_size: 120      # NEW: Hop size for Single-Res STFT loss
+  stft_win_length: 600    # NEW: Window length for Single-Res STFT loss
   loss_lambda_sc: 0.5     # Weight for spectral convergence loss component
   loss_lambda_mag: 1.0    # Weight for log STFT magnitude loss component
+  loss_lambda_mel: 0.5    # NEW: Weight for Mel Spectrogram Reconstruction loss
   
   vocoder_max_epochs: 1000 # Maximum epochs for vocoder training
   vocoder_learning_rate: 0.0002 # 0.0001 Learning rate for vocoder training

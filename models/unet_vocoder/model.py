@@ -10,14 +10,19 @@ class UNetVocoder(nn.Module):
         vocoder_config = config['vocoder']
         self.mel_bins = config['model']['mel_bins']
         self.hop_length = config['audio']['hop_length']
+        self.use_f0 = vocoder_config.get('use_f0_conditioning', False) # Check if F0 conditioning is enabled
         
         # Determine encoder and decoder channel configurations
         encoder_channels = vocoder_config.get('encoder_channels', [32, 64, 96, 128])
         decoder_channels = vocoder_config.get('decoder_channels', [96, 64, 32, 16])
         kernel_size = vocoder_config.get('kernel_size', 5)
         
-        # Initial input projection (mel + noise)
-        self.input_proj = nn.Conv1d(self.mel_bins + 1, encoder_channels[0], 
+        # Initial input projection (mel + noise + optional f0)
+        input_channels = self.mel_bins + 1 # Mel + Noise
+        if self.use_f0:
+            input_channels += 1 # Add channel for F0
+            
+        self.input_proj = nn.Conv1d(input_channels, encoder_channels[0],
                                    kernel_size=kernel_size, padding=kernel_size//2)
         
         # Encoder blocks (downsampling path)
@@ -53,13 +58,14 @@ class UNetVocoder(nn.Module):
         # Final activation
         self.output_activation = nn.Tanh()
     
-    def forward(self, mel, noise):
+    def forward(self, mel, noise, f0=None):
         """
         Forward pass through the U-Net vocoder
         
         Args:
-            mel: Mel spectrogram [B, T, M]
-            noise: Random noise [B, T, 1]
+            mel (torch.Tensor): Mel spectrogram [B, T, M]
+            noise (torch.Tensor): Random noise [B, T, 1]
+            f0 (torch.Tensor, optional): Aligned F0 contour [B, T, 1]. Defaults to None.
             
         Returns:
             waveform: Generated audio waveform [B, T*hop_length, 1]
@@ -88,7 +94,22 @@ class UNetVocoder(nn.Module):
         noise = noise.transpose(1, 2)
         
         # Concatenate along channel dimension
-        x = torch.cat([mel, noise], dim=1)
+        inputs_to_cat = [mel, noise]
+        if self.use_f0:
+            if f0 is None:
+                raise ValueError("F0 conditioning is enabled ('use_f0_conditioning: true' in config), but f0 tensor was not provided to forward method.")
+            # Ensure f0 has shape [B, T, 1] before transpose
+            if f0.dim() != 3 or f0.shape[0] != B or f0.shape[1] != T or f0.shape[2] != 1:
+                 # Attempt to reshape if possible (e.g., from [B, T])
+                 if f0.dim() == 2 and f0.shape[0] == B and f0.shape[1] == T:
+                     print(f"Warning: Reshaping f0 from {f0.shape} to {[B, T, 1]}")
+                     f0 = f0.unsqueeze(-1)
+                 else:
+                    raise ValueError(f"Expected f0 shape {[B, T, 1]}, but got {f0.shape}")
+            f0 = f0.transpose(1, 2) # [B, 1, T]
+            inputs_to_cat.append(f0)
+            
+        x = torch.cat(inputs_to_cat, dim=1)
         
         # Initial projection
         x = self.input_proj(x)
