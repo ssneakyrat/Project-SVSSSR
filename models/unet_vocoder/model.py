@@ -42,6 +42,9 @@ class UNetVocoder(nn.Module):
                 ResidualUpBlock(encoder_channels[-i-1], decoder_channels[i], kernel_size)
             )
         
+        # Store encoder channels for reference during forward pass
+        self.encoder_channels = encoder_channels
+        
         # Non-adjacent skip connections (connecting encoder to decoder at different levels)
         # Implemented as 1x1 convs to adapt feature dimensions
         self.non_adjacent_skips = nn.ModuleList()
@@ -49,10 +52,14 @@ class UNetVocoder(nn.Module):
             # Add connections between non-adjacent levels
             # e.g., skip from 1st encoder to 3rd decoder
             num_skip_connections = min(len(encoder_channels) - 2, len(decoder_channels) - 2)
-            for i in range(num_skip_connections):
-                self.non_adjacent_skips.append(
-                    nn.Conv1d(encoder_channels[i], decoder_channels[i+2], kernel_size=1)
-                )
+            
+            # We'll create these in the forward pass instead, since we need to know
+            # the actual dimensions of the features
+            self.use_non_adjacent_skips = True
+            self.num_skip_connections = num_skip_connections
+            self.decoder_channels = decoder_channels
+        else:
+            self.use_non_adjacent_skips = False
         
         # Output convolution before upsampling
         self.pre_output_conv = nn.Sequential(
@@ -138,18 +145,30 @@ class UNetVocoder(nn.Module):
             skip_connections.append(skip)
             
             # Store features for non-adjacent skip connections
-            if hasattr(self, 'non_adjacent_skips') and i < len(self.non_adjacent_skips):
+            if self.use_non_adjacent_skips and i < self.num_skip_connections:
                 non_adjacent_features.append(skip)
         
         # Bottleneck with attention
         x = self.bottleneck(x)
+        
+        # Create dynamic non-adjacent skip connections based on actual feature dimensions
+        if self.use_non_adjacent_skips and len(self.non_adjacent_skips) == 0 and len(non_adjacent_features) > 0:
+            for i in range(self.num_skip_connections):
+                # Get the actual input channel dimension from the stored features
+                in_channels = non_adjacent_features[i].size(1)
+                out_channels = self.decoder_channels[i+2]
+                
+                # Create the 1x1 conv with the correct dimensions
+                self.non_adjacent_skips.append(
+                    nn.Conv1d(in_channels, out_channels, kernel_size=1).to(x.device)
+                )
         
         # Decoder path using skip connections
         for i, (block, skip) in enumerate(zip(self.up_blocks, reversed(skip_connections))):
             x = block(x, skip)
             
             # Add non-adjacent skip connection features if available
-            if hasattr(self, 'non_adjacent_skips') and i >= 2 and i-2 < len(non_adjacent_features):
+            if self.use_non_adjacent_skips and i >= 2 and i-2 < len(non_adjacent_features):
                 # Project features from encoder to match decoder dimensions
                 na_skip = self.non_adjacent_skips[i-2](non_adjacent_features[i-2])
                 
