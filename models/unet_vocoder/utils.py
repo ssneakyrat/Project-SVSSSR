@@ -11,10 +11,11 @@ def generate_noise(mel_spec, hop_length=256):
         hop_length: Number of audio samples per mel frame
         
     Returns:
-        noise: Random noise [B, T*hop_length, 1]
+        noise: Random noise [B, T, 1] (at mel frame rate)
     """
     batch_size, time_steps, _ = mel_spec.size()
-    noise = torch.randn(batch_size, time_steps * hop_length, 1, device=mel_spec.device)
+    # Generate noise at mel frame rate instead of audio sample rate
+    noise = torch.randn(batch_size, time_steps, 1, device=mel_spec.device)
     return noise
 
 def audio_to_mel(audio, config):
@@ -34,8 +35,8 @@ def audio_to_mel(audio, config):
     hop_length = config['audio']['hop_length']
     win_length = config['audio']['win_length']
     n_mels = config['audio']['n_mels']
-    fmin = config['audio']['fmin']
-    fmax = config['audio']['fmax']
+    fmin = config['audio'].get('fmin', 0)
+    fmax = config['audio'].get('fmax', sample_rate//2)
     
     # Process each audio sample in the batch
     mel_batch = []
@@ -72,3 +73,16 @@ def normalize_mel(mel, mean, std):
         normalized_mel: Normalized mel spectrogram [B, T, M]
     """
     return (mel - mean) / std
+
+def calculate_expected_audio_length(mel_frame_count, hop_length):
+    """
+    Calculate expected audio length based on mel frame count
+    
+    Args:
+        mel_frame_count: Number of frames in mel spectrogram
+        hop_length: Hop length used for STFT
+        
+    Returns:
+        expected_audio_length: Expected audio length in samples
+    """
+    return mel_frame_count * hop_length

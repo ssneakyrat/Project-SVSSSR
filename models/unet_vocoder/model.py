@@ -9,6 +9,7 @@ class UNetVocoder(nn.Module):
         # Extract config parameters
         vocoder_config = config['vocoder']
         self.mel_bins = config['model']['mel_bins']
+        self.hop_length = config['audio']['hop_length']
         
         # Determine encoder and decoder channel configurations
         encoder_channels = vocoder_config.get('encoder_channels', [32, 64, 96, 128])
@@ -36,11 +37,21 @@ class UNetVocoder(nn.Module):
                 UpBlock(encoder_channels[-i-1], decoder_channels[i], kernel_size)
             )
         
-        # Output layer
-        self.output_conv = nn.Sequential(
-            nn.Conv1d(decoder_channels[-1], 1, kernel_size=1),
-            nn.Tanh()
+        # Output convolution before upsampling
+        self.pre_output_conv = nn.Conv1d(decoder_channels[-1], decoder_channels[-1], kernel_size=1)
+        
+        # Final audio upsampling layer - NEW!
+        # This is the key change: explicit upsampling from mel frame rate to audio sample rate
+        self.audio_upsampler = nn.ConvTranspose1d(
+            decoder_channels[-1], 
+            1, 
+            kernel_size=self.hop_length * 2,  # Wider kernel for smoother upsampling
+            stride=self.hop_length,
+            padding=self.hop_length // 2
         )
+        
+        # Final activation
+        self.output_activation = nn.Tanh()
     
     def forward(self, mel, noise):
         """
@@ -51,8 +62,25 @@ class UNetVocoder(nn.Module):
             noise: Random noise [B, T, 1]
             
         Returns:
-            waveform: Generated audio waveform [B, T, 1]
+            waveform: Generated audio waveform [B, T*hop_length, 1]
         """
+        # Check the shapes
+        B, T, M = mel.shape
+        B_noise, T_noise, C_noise = noise.shape
+        
+        # Ensure time dimensions match
+        if T_noise != T:
+            if T_noise % T == 0:
+                # If noise time dimension is a multiple of mel time dimension
+                factor = T_noise // T
+                # Downsample by averaging over windows
+                noise = noise.reshape(B_noise, T, factor, C_noise).mean(dim=2)
+            else:
+                # Otherwise, use interpolation
+                noise = noise.transpose(1, 2)  # [B, 1, T_noise]
+                noise = F.interpolate(noise, size=T, mode='linear', align_corners=False)
+                noise = noise.transpose(1, 2)  # [B, T, 1]
+                
         # Process inputs
         # Reshape mel: [B, T, M] → [B, M, T]
         mel = mel.transpose(1, 2)
@@ -78,10 +106,32 @@ class UNetVocoder(nn.Module):
         for block, skip in zip(self.up_blocks, reversed(skip_connections)):
             x = block(x, skip)
         
-        # Output layer
-        waveform = self.output_conv(x)
+        # Pre-output convolution
+        x = self.pre_output_conv(x)
         
-        # Reshape output: [B, 1, T] → [B, T, 1]
+        # NEW: Audio upsampling from mel frame rate to audio sample rate
+        # Input: [B, C, T] at mel frame rate
+        # Output: [B, 1, T*hop_length] at audio sample rate
+        waveform = self.audio_upsampler(x)
+        
+        # Apply final activation
+        waveform = self.output_activation(waveform)
+        
+        # Reshape output: [B, 1, T*hop_length] → [B, T*hop_length, 1]
         waveform = waveform.transpose(1, 2)
+        
+        # Verify dimensions
+        expected_length = T * self.hop_length
+        actual_length = waveform.size(1)
+        
+        # If there's still a small mismatch, adjust the waveform length
+        if actual_length != expected_length:
+            if actual_length < expected_length:
+                # Pad if too short
+                padding = expected_length - actual_length
+                waveform = F.pad(waveform, (0, 0, 0, padding))
+            else:
+                # Trim if too long
+                waveform = waveform[:, :expected_length, :]
         
         return waveform

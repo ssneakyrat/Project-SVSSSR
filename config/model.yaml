@@ -64,7 +64,7 @@ vocoder:
   
   # U-Net architecture parameters
   encoder_channels: [32, 64, 96, 128]
-  decoder_channels: [96, 64, 32, 16]
+  decoder_channels: [96, 64, 32, 32] #[96, 64, 32, 16]
   kernel_size: 5
   
   # Audio generation parameters
