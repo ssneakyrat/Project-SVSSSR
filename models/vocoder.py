@@ -391,12 +391,28 @@ class VocoderModel(pl.LightningModule):
         y_pred_flat, y_true_flat = self._ensure_same_time_domain_length(y_pred_flat, y_true_flat)
 
         # Calculate STFT
-        stft_pred = self.stft(y_pred_flat) # [B, F, T_stft, 2] for complex
-        stft_true = self.stft(y_true_flat) # [B, F, T_stft, 2] for complex
+        stft_pred = self.stft(y_pred_flat)
+        stft_true = self.stft(y_true_flat)
         
-        # Get magnitudes
-        stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
-        stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9) # [B, F, T_stft]
+        # Check if the result is a complex tensor or a real tensor with last dim of size 2
+        if torch.is_complex(stft_pred):
+            # Handle complex tensor
+            stft_pred_mag = torch.abs(stft_pred)
+            stft_true_mag = torch.abs(stft_true)
+            
+            # Get phases if phase prediction is enabled
+            if self.use_phase_prediction:
+                stft_pred_phase = torch.angle(stft_pred)
+                stft_true_phase = torch.angle(stft_true)
+        else:
+            # Handle real tensor with last dim of size 2 (real, imag)
+            stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9)
+            stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9)
+            
+            # Get phases if phase prediction is enabled
+            if self.use_phase_prediction:
+                stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
+                stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
         
         # Apply perceptual weighting if enabled
         if apply_weighting and self.use_perceptual_weighting:
@@ -405,12 +421,8 @@ class VocoderModel(pl.LightningModule):
             stft_true_mag = apply_perceptual_weighting(
                 stft_true_mag, self.sample_rate, self.perceptual_curve_type)
 
-        # Get phases if phase prediction is enabled
+        # Calculate phase loss
         if self.use_phase_prediction:
-            # Extract phase information
-            stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
-            stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
-            # Calculate phase loss
             phase_loss_val = phase_loss(stft_pred_phase, stft_true_phase)
         else:
             phase_loss_val = torch.tensor(0.0, device=y_pred.device)
@@ -439,9 +451,25 @@ class VocoderModel(pl.LightningModule):
             stft_pred = stft_transform(y_pred_flat)
             stft_true = stft_transform(y_true_flat)
             
-            # Get magnitudes
-            stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9)
-            stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9)
+            # Check if the result is a complex tensor or a real tensor with last dim of size 2
+            if torch.is_complex(stft_pred):
+                # Handle complex tensor
+                stft_pred_mag = torch.abs(stft_pred)
+                stft_true_mag = torch.abs(stft_true)
+                
+                # Get phases if phase prediction is enabled
+                if self.use_phase_prediction:
+                    stft_pred_phase = torch.angle(stft_pred)
+                    stft_true_phase = torch.angle(stft_true)
+            else:
+                # Handle real tensor with last dim of size 2 (real, imag)
+                stft_pred_mag = torch.sqrt(stft_pred.pow(2).sum(-1) + 1e-9)
+                stft_true_mag = torch.sqrt(stft_true.pow(2).sum(-1) + 1e-9)
+                
+                # Get phases if phase prediction is enabled
+                if self.use_phase_prediction:
+                    stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
+                    stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
             
             # Apply perceptual weighting if enabled
             if apply_weighting and self.use_perceptual_weighting:
@@ -456,8 +484,6 @@ class VocoderModel(pl.LightningModule):
             
             # Calculate phase loss if enabled
             if self.use_phase_prediction:
-                stft_pred_phase = torch.atan2(stft_pred[..., 1], stft_pred[..., 0])
-                stft_true_phase = torch.atan2(stft_true[..., 1], stft_true[..., 0])
                 phase_losses.append(phase_loss(stft_pred_phase, stft_true_phase))
         
         # Average losses across resolutions
