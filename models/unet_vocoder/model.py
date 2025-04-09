@@ -79,22 +79,78 @@ class UNetVocoder(nn.Module):
         
         # Final activation
         self.output_activation = nn.Tanh()
+        
+        # NEW: Autoregressive state handling
+        self.use_autoregressive = vocoder_config.get('use_autoregressive', False)
+        
+        if self.use_autoregressive:
+            # Define recurrent units for maintaining state across chunks
+            # We need one for each level of the U-Net
+            self.encoder_gru_layers = nn.ModuleList()
+            for ch in encoder_channels:
+                self.encoder_gru_layers.append(
+                    nn.GRU(ch, ch, batch_first=True, bidirectional=False)
+                )
+            
+            self.bottleneck_gru = nn.GRU(
+                encoder_channels[-1], 
+                encoder_channels[-1], 
+                batch_first=True, 
+                bidirectional=False
+            )
+            
+            self.decoder_gru_layers = nn.ModuleList()
+            for ch in decoder_channels:
+                self.decoder_gru_layers.append(
+                    nn.GRU(ch, ch, batch_first=True, bidirectional=False)
+                )
     
-    def forward(self, mel, noise, f0=None):
+    def _init_state(self, batch_size, device):
+        """Initialize state for autoregressive generation"""
+        encoder_states = []
+        for i, layer in enumerate(self.encoder_gru_layers):
+            # Hidden state shape: [num_layers * num_directions, batch_size, hidden_size]
+            hidden_size = self.encoder_channels[i] if i < len(self.encoder_channels) else self.encoder_channels[-1]
+            h = torch.zeros(1, batch_size, hidden_size, device=device)
+            encoder_states.append(h)
+        
+        # Bottleneck state
+        bottleneck_state = torch.zeros(1, batch_size, self.encoder_channels[-1], device=device)
+        
+        # Decoder states
+        decoder_states = []
+        for i, layer in enumerate(self.decoder_gru_layers):
+            hidden_size = self.decoder_channels[i]
+            h = torch.zeros(1, batch_size, hidden_size, device=device)
+            decoder_states.append(h)
+        
+        return {
+            'encoder_states': encoder_states,
+            'bottleneck_state': bottleneck_state,
+            'decoder_states': decoder_states
+        }
+    
+    def forward(self, mel, noise, f0=None, state=None):
         """
-        Forward pass through the Enhanced U-Net vocoder
+        Forward pass through the Enhanced U-Net vocoder with autoregressive capabilities
         
         Args:
             mel (torch.Tensor): Mel spectrogram [B, T, M]
             noise (torch.Tensor): Random noise [B, T, 1]
             f0 (torch.Tensor, optional): Aligned F0 contour [B, T, 1]. Defaults to None.
+            state (dict, optional): Autoregressive state from previous chunk. Defaults to None.
             
         Returns:
             waveform: Generated audio waveform [B, T*hop_length, 1]
+            new_state (optional): Updated autoregressive state for next chunk
         """
         # Check the shapes
         B, T, M = mel.shape
         B_noise, T_noise, C_noise = noise.shape
+        
+        # Initialize state if not provided and autoregressive mode is enabled
+        if self.use_autoregressive and state is None:
+            state = self._init_state(B, mel.device)
         
         # Ensure time dimensions match
         if T_noise != T:
@@ -136,20 +192,45 @@ class UNetVocoder(nn.Module):
         # Initial projection
         x = self.input_proj(x)
         
-        # Encoder path with skip connections
+        # Encoder path with skip connections and optional autoregressive state
         skip_connections = []
         non_adjacent_features = []
+        new_encoder_states = []
         
         for i, block in enumerate(self.down_blocks):
             x, skip = block(x)
             skip_connections.append(skip)
             
+            # Apply autoregressive update if enabled
+            if self.use_autoregressive:
+                # Reshape for GRU: [B, C, T] -> [B, T, C]
+                x_reshaped = x.transpose(1, 2)
+                
+                # Get previous state
+                prev_state = state['encoder_states'][i]
+                
+                # Apply GRU
+                x_recurrent, new_state_i = self.encoder_gru_layers[i](x_reshaped, prev_state)
+                
+                # Reshape back: [B, T, C] -> [B, C, T]
+                x = x_recurrent.transpose(1, 2)
+                
+                # Store new state
+                new_encoder_states.append(new_state_i)
+            
             # Store features for non-adjacent skip connections
             if self.use_non_adjacent_skips and i < self.num_skip_connections:
                 non_adjacent_features.append(skip)
         
-        # Bottleneck with attention
+        # Bottleneck with attention and optional autoregressive state
         x = self.bottleneck(x)
+        
+        if self.use_autoregressive:
+            # Apply recurrent bottleneck
+            x_reshaped = x.transpose(1, 2)
+            prev_bottleneck_state = state['bottleneck_state']
+            x_recurrent, new_bottleneck_state = self.bottleneck_gru(x_reshaped, prev_bottleneck_state)
+            x = x_recurrent.transpose(1, 2)
         
         # Create dynamic non-adjacent skip connections based on actual feature dimensions
         if self.use_non_adjacent_skips and len(self.non_adjacent_skips) == 0 and len(non_adjacent_features) > 0:
@@ -163,9 +244,28 @@ class UNetVocoder(nn.Module):
                     nn.Conv1d(in_channels, out_channels, kernel_size=1).to(x.device)
                 )
         
-        # Decoder path using skip connections
+        # Decoder path using skip connections and optional autoregressive state
+        new_decoder_states = []
+        
         for i, (block, skip) in enumerate(zip(self.up_blocks, reversed(skip_connections))):
             x = block(x, skip)
+            
+            # Apply autoregressive update if enabled
+            if self.use_autoregressive:
+                # Reshape for GRU: [B, C, T] -> [B, T, C]
+                x_reshaped = x.transpose(1, 2)
+                
+                # Get previous state
+                prev_state = state['decoder_states'][i]
+                
+                # Apply GRU
+                x_recurrent, new_state_i = self.decoder_gru_layers[i](x_reshaped, prev_state)
+                
+                # Reshape back: [B, T, C] -> [B, C, T]
+                x = x_recurrent.transpose(1, 2)
+                
+                # Store new state
+                new_decoder_states.append(new_state_i)
             
             # Add non-adjacent skip connection features if available
             if self.use_non_adjacent_skips and i >= 2 and i-2 < len(non_adjacent_features):
@@ -205,4 +305,13 @@ class UNetVocoder(nn.Module):
                 # Trim if too long
                 waveform = waveform[:, :expected_length, :]
         
-        return waveform
+        # Return waveform with state if autoregressive mode is enabled
+        if self.use_autoregressive:
+            new_state = {
+                'encoder_states': new_encoder_states,
+                'bottleneck_state': new_bottleneck_state,
+                'decoder_states': new_decoder_states
+            }
+            return waveform, new_state
+        else:
+            return waveform

@@ -275,7 +275,7 @@ class VocoderModel(pl.LightningModule):
     
     def forward(self, mel_spec, f0=None):
         """
-        Forward pass through the vocoder model.
+        Forward pass through the vocoder model with autoregressive generation.
 
         Args:
             mel_spec (torch.Tensor): Mel spectrogram [B, T_mel, M]
@@ -289,15 +289,82 @@ class VocoderModel(pl.LightningModule):
         # Generate noise with the SAME time dimension as mel_spec
         noise = torch.randn(batch_size, time_steps, 1, device=mel_spec.device) * self.noise_scale
         
-        # Generate waveform with the UNetVocoder
-        if self.use_f0:
-            if f0 is None:
-                 raise ValueError("F0 conditioning is enabled, but f0 tensor was not provided.")
-            waveform = self.vocoder(mel_spec, noise, f0=f0)
-        else:
-            waveform = self.vocoder(mel_spec, noise)
+        # Check if we're using autoregressive generation
+        use_autoregressive = self.config['vocoder'].get('use_autoregressive', False)
+        
+        if use_autoregressive:
+            # For autoregressive generation, we need to process the input chunk by chunk
+            # Get chunk size from config (default to a reasonable size)
+            chunk_size = self.config['vocoder'].get('autoregressive_chunk_size', 32)
+            overlap = self.config['vocoder'].get('autoregressive_overlap', 8)
             
-        return waveform
+            # Initialize state
+            state = None
+            
+            # Initialize output waveform
+            total_frames = time_steps
+            total_samples = total_frames * self.hop_length
+            output_waveform = torch.zeros(batch_size, total_samples, 1, device=mel_spec.device)
+            
+            # Process in chunks with overlap
+            for start_idx in range(0, total_frames, chunk_size - overlap):
+                end_idx = min(start_idx + chunk_size, total_frames)
+                
+                # Get current chunk
+                mel_chunk = mel_spec[:, start_idx:end_idx, :]
+                noise_chunk = noise[:, start_idx:end_idx, :]
+                
+                # Get f0 chunk if available
+                f0_chunk = None
+                if self.use_f0 and f0 is not None:
+                    f0_chunk = f0[:, start_idx:end_idx, :]
+                
+                # Generate waveform and update state
+                chunk_output, state = self.vocoder(mel_chunk, noise_chunk, f0=f0_chunk, state=state)
+                
+                # Calculate output indices for this chunk
+                out_start = start_idx * self.hop_length
+                out_end = end_idx * self.hop_length
+                
+                # If not the first chunk, apply cross-fade for overlap
+                if start_idx > 0:
+                    # Calculate overlap region
+                    overlap_samples = overlap * self.hop_length
+                    fade_in = torch.linspace(0, 1, overlap_samples, device=mel_spec.device)
+                    fade_out = 1 - fade_in
+                    
+                    # Get overlap region indices
+                    overlap_start = out_start
+                    overlap_end = overlap_start + overlap_samples
+                    
+                    # Apply cross-fade
+                    fade_in = fade_in.view(1, -1, 1)
+                    fade_out = fade_out.view(1, -1, 1)
+                    
+                    output_waveform[:, overlap_start:overlap_end, :] = (
+                        output_waveform[:, overlap_start:overlap_end, :] * fade_out +
+                        chunk_output[:, :overlap_samples, :] * fade_in
+                    )
+                    
+                    # Copy non-overlap region
+                    output_waveform[:, overlap_end:out_end, :] = chunk_output[:, overlap_samples:, :]
+                else:
+                    # First chunk, just copy
+                    output_waveform[:, out_start:out_end, :] = chunk_output
+            
+            return output_waveform
+        
+        else:
+            # Non-autoregressive mode, use normal forward pass
+            # Generate waveform with the UNetVocoder
+            if self.use_f0:
+                if f0 is None:
+                    raise ValueError("F0 conditioning is enabled, but f0 tensor was not provided.")
+                waveform = self.vocoder(mel_spec, noise, f0=f0)
+            else:
+                waveform = self.vocoder(mel_spec, noise)
+                
+            return waveform
     
     def _process_batch(self, batch):
         """
